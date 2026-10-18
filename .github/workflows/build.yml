@@ -86,3 +86,22 @@ jobs:
             build/libs/*.jar
           if-no-files-found: error
           retention-days: 30
+
+      - name: Attach jar to 'latest' release
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          TAG="latest"
+          ARTIFACT="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}.jar"
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "No artifact at $ARTIFACT"; ls -la build/libs/; exit 1
+          fi
+          # Delete the tag and release if they exist so the new jar replaces cleanly
+          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          # Create new release pointing at the current commit
+          gh release create "$TAG" "$ARTIFACT" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.props.outputs.name }} ${{ steps.props.outputs.version }} (latest)" \
+            --notes "Automatically published jar from commit ${GITHUB_SHA:0:7}."
