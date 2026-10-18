@@ -116,7 +116,7 @@ jobs:
           tail -n 400 gradle.log || true
 
       - name: Push gradle log into repo (readable via Contents API)
-        if: failure()
+        if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
