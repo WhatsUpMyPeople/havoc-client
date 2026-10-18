@@ -9,9 +9,13 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - name: Checkout
@@ -26,22 +30,19 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x ./gradlew
-
       - name: Read mod version
         id: props
         run: |
           VERSION=$(grep '^mod_version=' gradle.properties | cut -d'=' -f2)
           BASE=$(grep '^archives_base_name=' gradle.properties | cut -d'=' -f2)
-          echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
-          echo "base=$BASE"             >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"       >> "$GITHUB_OUTPUT"
 
       - name: Build jar
         id: gradle
         run: |
           set -o pipefail
-          ./gradlew --no-daemon --stacktrace --info build 2>&1 | tee gradle.log
+          ./gradlew.bat --no-daemon --stacktrace --info build 2>&1 | tee gradle.log
 
       - name: List build output
         if: always()
@@ -63,12 +64,10 @@ jobs:
             echo "no gradle.log to push"
             exit 0
           fi
-          # Keep it small enough for Contents API (hard cap ~100MB; we tail aggressively)
           tail -n 2000 gradle.log > gradle.tail.log
           B64=$(base64 -w0 gradle.tail.log)
           RUN="${GITHUB_RUN_ID}"
           PATH_IN_REPO="_ci/gradle-${RUN}.log"
-          # Get current sha if file exists on main
           SHA=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${PATH_IN_REPO}" --jq .sha 2>/dev/null || true)
           BODY=$(jq -nc --arg msg "ci: log for run ${RUN}" --arg c "$B64" --arg s "${SHA:-}" \
             '{message:$msg, content:$c} + (if $s != "" then {sha:$s} else {} end)')
