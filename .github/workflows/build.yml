@@ -38,11 +38,29 @@ jobs:
           echo "base=$BASE"             >> "$GITHUB_OUTPUT"
 
       - name: Build jar
-        run: ./gradlew --no-daemon build
+        id: gradle
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon --stacktrace --info build 2>&1 | tee gradle.log
 
       - name: List build output
         if: always()
         run: ls -lh build/libs || true
+
+      - name: Tail gradle log on failure
+        if: failure()
+        run: |
+          echo "=== gradle.log (tail 400) ==="
+          tail -n 400 gradle.log || true
+
+      - name: Upload gradle log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-log
+          path: gradle.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload jar artifact
         if: success()
