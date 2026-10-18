@@ -115,31 +115,14 @@ jobs:
           echo "=== gradle.log (tail 400) ==="
           tail -n 400 gradle.log || true
 
-      - name: Push gradle log into repo (via git)
+      - name: Prepare gradle log for release attachment
         if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
         run: |
-          set -eu
-          if [ ! -f gradle.log ]; then
-            echo "no gradle.log to push"; exit 0
+          if [ -f gradle.log ]; then
+            tail -n 3000 gradle.log > "gradle-${GITHUB_RUN_ID}.log"
+            ls -lh "gradle-${GITHUB_RUN_ID}.log"
           fi
-          mkdir -p _ci
-          # Trim to last 3000 lines so the repo doesn't balloon
-          tail -n 3000 gradle.log > "_ci/gradle-${GITHUB_RUN_ID}.log"
-
-          git config user.email "actions@github.com"
-          git config user.name  "github-actions[bot]"
-          git add "_ci/gradle-${GITHUB_RUN_ID}.log"
-          if git diff --cached --quiet; then
-            echo "no changes to log"; exit 0
-          fi
-          git commit -m "ci: log for run ${GITHUB_RUN_ID}" -m "[skip ci]"
-          # Rebase on top of any concurrent main movement, then push
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin HEAD:main && break
-            echo "retry push ($i)"; sleep 2
-          done
 
       - name: Upload jar artifact
         if: success()
@@ -152,8 +135,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Attach jars to 'latest' release
-        if: success() && github.ref == 'refs/heads/main'
+      - name: Attach jars + gradle log to 'latest' release
+        if: always() && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -161,20 +144,19 @@ jobs:
           TAG="latest"
           CLEAN="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}.jar"
           OBF="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}-obf.jar"
+          LOG="gradle-${GITHUB_RUN_ID}.log"
           if [ ! -f "$CLEAN" ]; then
-            echo "No artifact at $CLEAN"; ls -la build/libs/; exit 1
+            echo "No clean jar at $CLEAN — nothing to release"
+            ls -la build/libs/ || true
+            exit 0
           fi
-          # Delete the tag and release if they exist so the new jars replace cleanly
           gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
-          # Create new release pointing at the current commit
           ASSETS=("$CLEAN")
-          if [ -f "$OBF" ]; then
-            ASSETS+=("$OBF")
-            NOTES="Automatically published build from commit ${GITHUB_SHA:0:7}. Clean + ProGuard-obfuscated jars."
-          else
-            NOTES="Automatically published build from commit ${GITHUB_SHA:0:7}. Obfuscation step skipped or failed."
-          fi
+          [ -f "$OBF" ] && ASSETS+=("$OBF")
+          [ -f "$LOG" ] && ASSETS+=("$LOG")
+          STATE="clean"
+          [ -f "$OBF" ] && STATE="clean + ProGuard-obfuscated"
           gh release create "$TAG" "${ASSETS[@]}" \
             --target "$GITHUB_SHA" \
             --title "${{ steps.props.outputs.name }} ${{ steps.props.outputs.version }} (latest)" \
-            --notes "$NOTES"
+            --notes "Build from commit ${GITHUB_SHA:0:7}. Includes ${STATE} jar(s) and the gradle log for this run."
