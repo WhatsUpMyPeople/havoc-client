@@ -269,9 +269,10 @@ You'll get the jar + install instructions in that DM thread. If you don't hear b
 # ---------------------------------------------------------------------------
 # BOT
 # ---------------------------------------------------------------------------
+# This script only creates roles, categories, channels, and pins — no member
+# or message events are consumed, so default intents are enough and no
+# privileged-intent toggle in the Developer Portal is required.
 intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
 client = discord.Client(intents=intents)
 
 
