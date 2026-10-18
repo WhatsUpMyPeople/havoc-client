@@ -1,6 +1,6 @@
 param(
-    [string]$InputRoot = "src/main/resources/assets/combatant/svg",
-    [string]$OutRoot = "build/generated/resources/svgMsdf/assets/combatant/svg/msdf",
+    [string]$InputRoot = "src/main/resources/assets/havoc/svg",
+    [string]$OutRoot = "build/generated/resources/svgMsdf/assets/havoc/svg/msdf",
     [int]$Dimension = 64,
     [int]$PxRange = 4,
     [string]$Type = "mtsdf",
@@ -32,7 +32,7 @@ function Get-Msdfgen {
     if (Test-Path $msdfgenPath) { return $msdfgenPath }
 
     $api = "https://api.github.com/repos/Chlumsky/msdfgen/releases/latest"
-    $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "CombatantSvgMsdfGen" }
+    $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "HavocSvgMsdfGen" }
     $asset = $release.assets |
             Where-Object { $_.name -match "win64" -and $_.name -match "\.zip$" -and $_.name -notmatch "openmp" } |
             Select-Object -First 1
@@ -45,7 +45,7 @@ function Get-Msdfgen {
 
     New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
     $archivePath = Join-Path $toolDir $asset.name
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath -Headers @{ "User-Agent" = "CombatantSvgMsdfGen" }
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath -Headers @{ "User-Agent" = "HavocSvgMsdfGen" }
 
     $extractDir = Join-Path $toolDir ([System.IO.Path]::GetFileNameWithoutExtension($asset.name))
     Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force
@@ -95,8 +95,8 @@ function Write-Metadata {
         height = $Dimension
         pxRange = $PxRange
         yOrigin = "top"
-        source = "combatant:svg/$SourceRelative"
-        texture = "combatant:svg/msdf/$TextureRelative"
+        source = "havoc:svg/$SourceRelative"
+        texture = "havoc:svg/msdf/$TextureRelative"
         viewBox = @($ViewBox.X, $ViewBox.Y, $ViewBox.W, $ViewBox.H)
     }
     $json = $metadata | ConvertTo-Json -Depth 4
@@ -144,7 +144,7 @@ foreach ($svg in $svgs) {
         $viewBox = Read-ViewBox $svg.FullName
         if ($viewBox.W -le 0 -or $viewBox.H -le 0) { throw "invalid viewBox" }
 
-        $preprocessOutput = & $JavaExe -cp $PreprocessorClasspath combatant.client.render.engine.svg.SvgMsdfPreprocessor $svg.FullName $outlineSvg 2>&1
+        $preprocessOutput = & $JavaExe -cp $PreprocessorClasspath havoc.client.render.engine.svg.SvgMsdfPreprocessor $svg.FullName $outlineSvg 2>&1
         if ($LASTEXITCODE -ne 0) { throw "svg preprocessor failed: $preprocessOutput" }
         if (-not (Test-Path $outlineSvg)) { throw "outline svg was not produced" }
 

@@ -1,6 +1,6 @@
 param(
-    [string]$FontRoot = "src/main/resources/assets/combatant/font",
-    [string]$OutputRoot = "src/main/resources/assets/combatant/font/msdf"
+    [string]$FontRoot = "src/main/resources/assets/havoc/font",
+    [string]$OutputRoot = "src/main/resources/assets/havoc/font/msdf"
 )
 
 $ErrorActionPreference = "Stop"

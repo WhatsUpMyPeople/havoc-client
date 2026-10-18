@@ -1,4 +1,4 @@
-// Modified native MediaPlayerInfo bridge for Combatant by pivosos2007.
+// Modified native MediaPlayerInfo bridge for Havoc by pivosos2007.
 // Based on Redstonecrafter0/MediaPlayerInfo.
 #include "main.h"
 
@@ -161,7 +161,7 @@ static GlobalSystemMediaTransportControlsSession sessionFromObject(JNIEnv* env, 
     return findSessionById(sessionId);
 }
 
-jint Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_fillSessionSnapshotBuffer(JNIEnv* env, jobject obj, jobject buffer, jint maxSessions) {
+jint Java_havoc_client_util_media_impl_win_WindowsMediaPlayerInfo_fillSessionSnapshotBuffer(JNIEnv* env, jobject obj, jobject buffer, jint maxSessions) {
     if (buffer == nullptr || maxSessions <= 0) return 0;
     auto* base = static_cast<char*>(env->GetDirectBufferAddress(buffer));
     if (base == nullptr) return 0;
@@ -266,7 +266,7 @@ jint Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_fillSessio
     return count;
 }
 
-jbyteArray Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_getArtworkPng(JNIEnv* env, jobject obj, jstring sessionId) {
+jbyteArray Java_havoc_client_util_media_impl_win_WindowsMediaPlayerInfo_getArtworkPng(JNIEnv* env, jobject obj, jstring sessionId) {
     if (sessionId == nullptr) return env->NewByteArray(0);
     const char* raw = env->GetStringUTFChars(sessionId, nullptr);
     std::string id = raw == nullptr ? std::string() : std::string(raw);
@@ -298,17 +298,17 @@ jbyteArray Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_getA
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_nativeShutdown(JNIEnv*, jobject) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaPlayerInfo_nativeShutdown(JNIEnv*, jobject) {
     shutdownManager();
 }
 
-jobject Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_getMediaSessions(JNIEnv* env, jobject obj) {
+jobject Java_havoc_client_util_media_impl_win_WindowsMediaPlayerInfo_getMediaSessions(JNIEnv* env, jobject obj) {
     jclass listClass = env->FindClass("java/util/ArrayList");
     jmethodID listConstructor = env->GetMethodID(listClass, "<init>", "(I)V");
     jmethodID listAdd = env->GetMethodID(listClass, "add", "(Ljava/lang/Object;)Z");
-    jclass mediaSessionClass = env->FindClass("combatant/client/util/media/impl/win/WindowsMediaSession");
-    jmethodID mediaSessionConstructor = env->GetMethodID(mediaSessionClass, "<init>", "(Lcombatant/client/util/media/MediaInfo;Ljava/lang/String;Ljava/lang/String;ZZZIZ)V");
-    jclass mediaInfoClass = env->FindClass("combatant/client/util/media/MediaInfo");
+    jclass mediaSessionClass = env->FindClass("havoc/client/util/media/impl/win/WindowsMediaSession");
+    jmethodID mediaSessionConstructor = env->GetMethodID(mediaSessionClass, "<init>", "(Lhavoc/client/util/media/MediaInfo;Ljava/lang/String;Ljava/lang/String;ZZZIZ)V");
+    jclass mediaInfoClass = env->FindClass("havoc/client/util/media/MediaInfo");
     jmethodID mediaInfoConstructor = env->GetMethodID(mediaInfoClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;[BJJZ)V");
 
     auto sessions = getManager().GetSessions();
@@ -426,49 +426,49 @@ jobject Java_combatant_client_util_media_impl_win_WindowsMediaPlayerInfo_getMedi
     return list;
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_play(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_play(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TryPlayAsync();
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_pause(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_pause(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TryPauseAsync();
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_playPause(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_playPause(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TryTogglePlayPauseAsync();
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_stop(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_stop(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TryStopAsync();
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_next(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_next(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TrySkipNextAsync();
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_previous(JNIEnv* env, jobject obj) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_previous(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session != nullptr) {
         session.TrySkipPreviousAsync();
     }
 }
 
-jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSupportsShuffle(JNIEnv* env, jobject obj) {
+jboolean Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSupportsShuffle(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return JNI_FALSE;
     try {
@@ -479,7 +479,7 @@ jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSup
     }
 }
 
-jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeIsShuffleActive(JNIEnv* env, jobject obj) {
+jboolean Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeIsShuffleActive(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return JNI_FALSE;
     try {
@@ -491,7 +491,7 @@ jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeIsS
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSetShuffle(JNIEnv* env, jobject obj, jboolean active) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSetShuffle(JNIEnv* env, jobject obj, jboolean active) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return;
     try {
@@ -500,7 +500,7 @@ void Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSetShuf
     }
 }
 
-jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSupportsRepeat(JNIEnv* env, jobject obj) {
+jboolean Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSupportsRepeat(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return JNI_FALSE;
     try {
@@ -511,7 +511,7 @@ jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSup
     }
 }
 
-jint Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeGetRepeatMode(JNIEnv* env, jobject obj) {
+jint Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeGetRepeatMode(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return 0;
     try {
@@ -531,7 +531,7 @@ jint Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeGetRepe
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSetRepeatMode(JNIEnv* env, jobject obj, jint mode) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSetRepeatMode(JNIEnv* env, jobject obj, jint mode) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return;
     try {
@@ -547,7 +547,7 @@ void Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSetRepe
     }
 }
 
-jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSupportsSeek(JNIEnv* env, jobject obj) {
+jboolean Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSupportsSeek(JNIEnv* env, jobject obj) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return JNI_FALSE;
     try {
@@ -558,7 +558,7 @@ jboolean Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSup
     }
 }
 
-void Java_combatant_client_util_media_impl_win_WindowsMediaSession_nativeSeekTo(JNIEnv* env, jobject obj, jlong positionSeconds) {
+void Java_havoc_client_util_media_impl_win_WindowsMediaSession_nativeSeekTo(JNIEnv* env, jobject obj, jlong positionSeconds) {
     auto session = sessionFromObject(env, obj);
     if (session == nullptr) return;
     try {

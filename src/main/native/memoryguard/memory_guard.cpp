@@ -1,5 +1,5 @@
 /*
- * This file is part of the Combatant Client distribution.
+ * This file is part of the Havoc Client distribution.
  * Copyright (c) 2026 pivosos2007.
  *
  * Licensed under the GNU General Public License v3.0.
@@ -321,18 +321,18 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM*, void*) {
 }
 
 extern "C" JNIEXPORT jint JNICALL
-Java_combatant_client_runtime_nativeguard_NativeMemoryGuard_nativeApply(JNIEnv*, jclass) {
+Java_havoc_client_runtime_nativeguard_NativeMemoryGuard_nativeApply(JNIEnv*, jclass) {
     apply_hardening();
     return applied_mask;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_combatant_client_runtime_nativeguard_NativeMemoryGuard_nativeLastError(JNIEnv* env, jclass) {
+Java_havoc_client_runtime_nativeguard_NativeMemoryGuard_nativeLastError(JNIEnv* env, jclass) {
     std::lock_guard<std::mutex> lock(state_mutex);
     return env->NewStringUTF(last_error.c_str());
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_combatant_client_runtime_nativeguard_NativeMemoryGuard_nativeShutdown(JNIEnv*, jclass) {
+Java_havoc_client_runtime_nativeguard_NativeMemoryGuard_nativeShutdown(JNIEnv*, jclass) {
     shutdown_hardening();
 }
