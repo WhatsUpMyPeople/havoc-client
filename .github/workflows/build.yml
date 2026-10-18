@@ -55,7 +55,8 @@ jobs:
           tail -n 400 gradle.log || true
 
       - name: Push gradle log into repo (readable via Contents API)
-        if: always()
+        if: failure()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -65,7 +66,8 @@ jobs:
             exit 0
           fi
           tail -n 2000 gradle.log > gradle.tail.log
-          B64=$(base64 -w0 gradle.tail.log)
+          # base64: Windows coreutils doesn't accept -w0; the file is a single stream, so plain base64 and tr suffices.
+          B64=$(base64 gradle.tail.log | tr -d '\r\n')
           RUN="${GITHUB_RUN_ID}"
           PATH_IN_REPO="_ci/gradle-${RUN}.log"
           SHA=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${PATH_IN_REPO}" --jq .sha 2>/dev/null || true)
