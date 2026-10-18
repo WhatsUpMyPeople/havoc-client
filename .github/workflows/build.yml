@@ -50,6 +50,8 @@ jobs:
         env:
           PROGUARD_VERSION: "7.6.1"
           PROGUARD_CORE_VERSION: "9.1.10"
+          LOG4J_VERSION: "2.24.3"
+          GSON_VERSION: "2.11.0"
         run: |
           set -o pipefail
           VERSION="${{ steps.props.outputs.version }}"
@@ -60,11 +62,23 @@ jobs:
             echo "Clean jar missing; cannot obfuscate."; exit 1
           fi
 
-          # Download ProGuard CLI jars from Maven Central
+          # Download ProGuard + its runtime deps from Maven Central
           mkdir -p .proguard
-          BASEURL="https://repo1.maven.org/maven2/com/guardsquare"
-          curl -sSLf -o ".proguard/proguard-base-${PROGUARD_VERSION}.jar"      "${BASEURL}/proguard-base/${PROGUARD_VERSION}/proguard-base-${PROGUARD_VERSION}.jar"
-          curl -sSLf -o ".proguard/proguard-core-${PROGUARD_CORE_VERSION}.jar" "${BASEURL}/proguard-core/${PROGUARD_CORE_VERSION}/proguard-core-${PROGUARD_CORE_VERSION}.jar"
+          dl() {
+            local url="$1" dest="$2"
+            [ -f "$dest" ] && return 0
+            echo "fetch $url"
+            curl -sSLf -o "$dest" "$url"
+          }
+          GS="https://repo1.maven.org/maven2/com/guardsquare"
+          L4="https://repo1.maven.org/maven2/org/apache/logging/log4j"
+          GS2="https://repo1.maven.org/maven2/com/google/code/gson"
+          dl "${GS}/proguard-base/${PROGUARD_VERSION}/proguard-base-${PROGUARD_VERSION}.jar"       ".proguard/proguard-base.jar"
+          dl "${GS}/proguard-core/${PROGUARD_CORE_VERSION}/proguard-core-${PROGUARD_CORE_VERSION}.jar" ".proguard/proguard-core.jar"
+          dl "${L4}/log4j-api/${LOG4J_VERSION}/log4j-api-${LOG4J_VERSION}.jar"                     ".proguard/log4j-api.jar"
+          dl "${L4}/log4j-core/${LOG4J_VERSION}/log4j-core-${LOG4J_VERSION}.jar"                   ".proguard/log4j-core.jar"
+          dl "${GS2}/gson/${GSON_VERSION}/gson-${GSON_VERSION}.jar"                                ".proguard/gson.jar"
+          ls -lh .proguard/
 
           # Dump runtime classpath via a committed init script
           ./gradlew.bat --no-daemon --init-script .ci/print-runtime-classpath.gradle -q printRuntimeClasspath \
@@ -94,7 +108,7 @@ jobs:
           echo "libraryjars entries: $(wc -l < pg.libs)"
 
           # Classpath separator on Windows is ';'
-          PG_CP=".proguard/proguard-base-${PROGUARD_VERSION}.jar;.proguard/proguard-core-${PROGUARD_CORE_VERSION}.jar"
+          PG_CP=".proguard/proguard-base.jar;.proguard/proguard-core.jar;.proguard/log4j-api.jar;.proguard/log4j-core.jar;.proguard/gson.jar"
 
           java -cp "$PG_CP" proguard.ProGuard \
               @proguard.pro \
