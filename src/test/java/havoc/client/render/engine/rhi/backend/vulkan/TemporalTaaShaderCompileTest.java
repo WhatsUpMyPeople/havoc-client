@@ -1,0 +1,33 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+package havoc.client.render.engine.rhi.backend.vulkan;
+
+import org.junit.jupiter.api.Test;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.lwjgl.util.shaderc.Shaderc.shaderc_compute_shader;
+
+final class TemporalTaaShaderCompileTest {
+    @Test
+    void compilesForVulkan() throws Exception {
+        try (VulkanNativeShaderCompiler compiler = new VulkanNativeShaderCompiler()) {
+            assertCompiles(compiler, "taa_resolve");
+            assertCompiles(compiler, "taa_resolve_hdr");
+            assertCompiles(compiler, "taa_present");
+            assertCompiles(compiler, "taa_present_hdr");
+        }
+    }
+
+    private static void assertCompiles(VulkanNativeShaderCompiler compiler, String name) throws Exception {
+        String source = Files.readString(Path.of(
+                "src/main/resources/assets/havoc/shaders/temporal/" + name + ".comp"));
+        assertTrue(compiler.compile("temporal/" + name, source, shaderc_compute_shader).hasRemaining());
+    }
+}

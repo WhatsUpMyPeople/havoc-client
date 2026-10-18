@@ -1,0 +1,5336 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.renderer;
+
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.textures.GpuSampler;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import havoc.client.render.engine.command.*;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
+import net.minecraft.world.item.ItemStack;
+import org.jetbrains.annotations.Nullable;
+import havoc.client.render.engine.color.RenderColor;
+import havoc.client.render.engine.core.ViewportContext;
+import havoc.client.render.engine.pipeline.UiRenderPipelines;
+import havoc.client.render.engine.renderer.ui.BlurSource;
+import havoc.client.render.engine.renderer.ui.DrawBatch;
+import havoc.client.render.engine.renderer.ui.ItemBatchRenderer;
+import havoc.client.render.engine.renderer.ui.OrderedUiBatcher;
+import havoc.client.render.engine.renderer.ui.UiBatchStats;
+import havoc.client.render.engine.renderer.ui.UiBatchType;
+import havoc.client.render.engine.renderer.ui.UiDeferredScheduler;
+import havoc.client.render.engine.renderer.ui.UiDirectTexturedRenderer;
+import havoc.client.render.engine.renderer.ui.UiItemSubmission;
+import havoc.client.render.engine.renderer.ui.UiRenderDispatcher;
+import havoc.client.render.engine.renderer.ui.blend.UiBackdropBlendSpec;
+import havoc.client.render.engine.postprocess.PostProcessManager;
+import havoc.client.render.engine.renderer.ui.draw.*;
+import havoc.client.render.engine.svg.SvgMeshBackend;
+import havoc.client.render.engine.svg.SvgRegistry;
+import havoc.client.render.engine.svg.SvgRenderOptions;
+import havoc.client.render.engine.text.GlyphFont;
+import havoc.client.render.engine.text.backend.TextPlacementMode;
+import havoc.client.render.engine.uniform.MeshBuilder;
+
+import java.awt.Color;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.function.Consumer;
+
+import static havoc.client.render.engine.renderer.ui.draw.UiMeshGeometry.*;
+
+/** Public API for 2D rendering. */
+public final class Renderer2D {
+    public static final int ITEM_OVERLAY_NONE = 0;
+    public static final int ITEM_OVERLAY_COUNT = 1;
+    public static final int ITEM_OVERLAY_DURABILITY = 1 << 1;
+    public static final int ITEM_OVERLAY_COOLDOWN = 1 << 2;
+    public static final int ITEM_OVERLAY_DURABILITY_TEXT = 1 << 3;
+    public static final int ITEM_OVERLAY_ALL = ITEM_OVERLAY_COUNT | ITEM_OVERLAY_DURABILITY | ITEM_OVERLAY_COOLDOWN;
+    private static final int DEFAULT_ITEM_DURABILITY_THRESHOLD = 100;
+    private static final int DEFAULT_ITEM_DURABILITY_TEXT_COLOR_THRESHOLD = 70;
+    public static OrderedUiBatcher UI_BATCHER = new OrderedUiBatcher();
+    public static final BatchStats BATCH_STATS = new BatchStats();
+    private static int backdropContributionDepth;
+
+    public enum Deferred2DLayer {
+        /** 2D work without a concrete HUD slot; drained before vanilla GuiRenderer.render(). */
+        BEFORE_VANILLA_GUI,
+
+        HUD_FIRST,
+        HUD_BEFORE_MISC_OVERLAYS,
+        HUD_AFTER_MISC_OVERLAYS,
+        HUD_AFTER_BOSS_BAR,
+        HUD_BEFORE_DEMO_TIMER,
+        HUD_BEFORE_CHAT,
+        HUD_AFTER_SUBTITLES,
+        HUD_LAST,
+
+        /**
+         * Explicit top screen bucket. This is intentionally not used by normal HudPhase slots.
+         */
+        AFTER_VANILLA_GUI,
+
+        /**
+         * Absolute client UI top layer. Reserved for overlays that must remain above screen-top
+         * owners, addon callbacks and other AFTER_VANILLA_GUI work.
+         */
+        SCREEN_ABSOLUTE_TOP
+    }
+
+    public enum BlurQuality {
+        LOW(0, 2),
+        MEDIUM(1, 3),
+        HIGH(2, 3),
+        ULTRA(3, 5),
+        LIQUID_GLASS(4, 4);
+
+        public final int id;
+        public final int iterations;
+
+        BlurQuality(int id, int iterations) {
+            this.id = id;
+            this.iterations = iterations;
+        }
+    }
+
+    public static final BlurQuality DEFAULT_BLUR_QUALITY = BlurQuality.MEDIUM;
+    public static final BlurQuality DEFAULT_LIQUID_GLASS_BLUR_QUALITY = BlurQuality.LIQUID_GLASS;
+    public static final float DEFAULT_KAWASE_OFFSET_PX = 1.0f;
+    public static final float LIQUID_GLASS_KAWASE_OFFSET_PX = 1.15f;
+
+    public static Renderer2D COLOR;
+    public static Renderer2D TEXTURE;
+    private final boolean textured;
+    private final MeshBuilder texturedTriangles;
+    private final int[] gradientTmp = new int[4];
+    private final float[] cornerRadiiTmp = new float[4];
+    private final float[] primitivePointsTmp = new float[16];
+    private final double[] rectShapeTmp = new double[256];
+    private final double[] connectorTmp = new double[64];
+    private final double[] connectorAnchorTmp = new double[4];
+    private final UiPathDrawApi pathDrawApi = new UiPathDrawApi();
+    private final int[] polygonIndexTmp = new int[64];
+    private final int[] polygonVertexTmp = new int[64];
+    private final int[] warpedShapeVertexTmp = new int[81];
+    private final double[] progressShapeTmp = new double[256];
+    private double alpha = 1.0;
+    private @Nullable UiBackdropRequest.SceneSource liquidGlassSceneSourceOverride;
+    private @Nullable UiBackdropRequest.UiUnderlayMode liquidGlassUiUnderlayOverride;
+    private UiBlurQuality liquidGlassUiBlurQuality = UiBlurQuality.LOW;
+    private float liquidGlassUiBlurOffsetPx = 0.85f;
+    private float liquidGlassUiMix = 1.0f;
+    private UiLiquidGlassMaterial liquidGlassMaterial = UiLiquidGlassMaterial.DEFAULT;
+    private UiBackdropBlendSpec backdropBlend = UiBackdropBlendSpec.NORMAL;
+    private @Nullable BlurQuality liquidGlassBlurQualityOverride;
+    private float liquidGlassBlurOffsetOverridePx = Float.NaN;
+
+    public Renderer2D(boolean textured) {
+        this.textured = textured;
+        this.texturedTriangles = textured ? new MeshBuilder(UiRenderPipelines.UI_TEXTURED) : null;
+    }
+
+    public static void init() {
+        COLOR = new Renderer2D(false);
+        TEXTURE = new Renderer2D(true);
+        if (TEXTURE.texturedTriangles != null) TEXTURE.texturedTriangles.prewarmDefaultCapacity();
+        UI_BATCHER.prewarmMeshPools();
+        ItemBatchRenderer.init();
+    }
+
+    // ---- Public drawing facade -------------------------------------------------
+
+    public void setAlpha(double alpha) {
+        this.alpha = Mth.clamp(alpha, 0.0, 1.0);
+    }
+
+    public double getAlpha() {
+        return alpha;
+    }
+
+    /** Records a module batch both to the visible HUD target and to the HUD backdrop source. */
+    public static void withHudBackdropContribution(Runnable draw) {
+        if (draw == null) return;
+        backdropContributionDepth++;
+        try {
+            draw.run();
+        } finally {
+            backdropContributionDepth = Math.max(0, backdropContributionDepth - 1);
+        }
+    }
+
+    public static boolean isHudBackdropContributionRecording() {
+        return backdropContributionDepth > 0;
+    }
+
+    /**
+     * Overrides the phase default for liquid-glass calls made by {@code draw}. NONE is useful for
+     * analytically isolated surfaces; PASS_THROUGH adds no blur passes; BLUR uses its own profile.
+     */
+    public void withLiquidGlassMaterial(UiLiquidGlassMaterial material, Runnable draw) {
+        if (draw == null) return;
+        UiLiquidGlassMaterial previous = liquidGlassMaterial;
+        liquidGlassMaterial = material != null ? material : UiLiquidGlassMaterial.DEFAULT;
+        try {
+            draw.run();
+        } finally {
+            liquidGlassMaterial = previous;
+        }
+    }
+
+    /**
+     * Applies a reusable destination-aware blend material to blend-capable UI primitives/effects
+     * emitted by {@code draw}. The material contract is intentionally primitive-agnostic: text and
+     * liquid glass consume it today, and future shape/effect shaders can bind the same UIBlend block.
+     */
+    public void withBackdropBlend(UiBackdropBlendSpec blend, Runnable draw) {
+        if (draw == null) return;
+        UiBackdropBlendSpec previous = backdropBlend;
+        backdropBlend = blend != null ? blend : UiBackdropBlendSpec.NORMAL;
+        try {
+            draw.run();
+        } finally {
+            backdropBlend = previous;
+        }
+    }
+
+    /** Compatibility alias for callers that scope the material specifically around liquid glass. */
+    public void withLiquidGlassBackdropBlend(UiBackdropBlendSpec blend, Runnable draw) {
+        withBackdropBlend(blend, draw);
+    }
+
+    /**
+     * Temporarily overrides the prepared Kawase profile used by ordinary liquid-glass rects.
+     * This is intended for UI skins that need a slightly wider backdrop blur without changing
+     * the global liquid-glass material or adding a second blur pass.
+     */
+    public void withLiquidGlassBlurProfile(BlurQuality quality, float offsetPx, Runnable draw) {
+        if (draw == null) return;
+        BlurQuality previousQuality = liquidGlassBlurQualityOverride;
+        float previousOffset = liquidGlassBlurOffsetOverridePx;
+        liquidGlassBlurQualityOverride = quality != null ? quality : DEFAULT_LIQUID_GLASS_BLUR_QUALITY;
+        liquidGlassBlurOffsetOverridePx = Float.isFinite(offsetPx)
+                ? Math.max(0.0f, offsetPx)
+                : LIQUID_GLASS_KAWASE_OFFSET_PX;
+        try {
+            draw.run();
+        } finally {
+            liquidGlassBlurQualityOverride = previousQuality;
+            liquidGlassBlurOffsetOverridePx = previousOffset;
+        }
+    }
+
+    /**
+     * Overrides the optical scene sampled by liquid glass emitted inside {@code draw}.
+     * UI_UNDERLAY is intended for glass that sits on top of custom-rendered UI surfaces (map,
+     * previews, editors) and must refract that UI instead of the pre-HUD world capture.
+     */
+    public void withLiquidGlassSceneSource(UiBackdropRequest.SceneSource source, Runnable draw) {
+        if (draw == null) return;
+        UiBackdropRequest.SceneSource previous = liquidGlassSceneSourceOverride;
+        liquidGlassSceneSourceOverride = source;
+        try {
+            draw.run();
+        } finally {
+            liquidGlassSceneSourceOverride = previous;
+        }
+    }
+
+    public void withLiquidGlassUiUnderlay(UiBackdropRequest.UiUnderlayMode mode,
+                                          UiBlurQuality blurQuality,
+                                          float blurOffsetPx,
+                                          float mix,
+                                          Runnable draw) {
+        if (draw == null) return;
+        UiBackdropRequest.UiUnderlayMode previousMode = liquidGlassUiUnderlayOverride;
+        UiBlurQuality previousQuality = liquidGlassUiBlurQuality;
+        float previousOffset = liquidGlassUiBlurOffsetPx;
+        float previousMix = liquidGlassUiMix;
+        liquidGlassUiUnderlayOverride = mode != null ? mode : UiBackdropRequest.UiUnderlayMode.NONE;
+        liquidGlassUiBlurQuality = blurQuality != null ? blurQuality : UiBlurQuality.LOW;
+        liquidGlassUiBlurOffsetPx = Float.isFinite(blurOffsetPx) ? Math.max(0.0f, blurOffsetPx) : 0.85f;
+        liquidGlassUiMix = clamp01(mix);
+        try {
+            draw.run();
+        } finally {
+            liquidGlassUiUnderlayOverride = previousMode;
+            liquidGlassUiBlurQuality = previousQuality;
+            liquidGlassUiBlurOffsetPx = previousOffset;
+            liquidGlassUiMix = previousMix;
+        }
+    }
+
+
+    public void shape(UiShape shape, UiPaint paint) {
+        shape(shape, paint, UiStroke.NONE, true);
+    }
+
+    private void shapeStroke(UiShape shape, UiPaint paint, UiStroke stroke) {
+        shape(shape, paint, stroke, false);
+    }
+
+    public void box(UiBoxShape box, UiPaint paint) {
+        box(box, paint, UiStroke.NONE, true);
+    }
+
+    public void boxStroke(UiBoxShape box, UiPaint paint, UiStroke stroke) {
+        box(box, paint, stroke, false);
+    }
+
+    public void box(UiBoxShape box, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (box == null || paint == null) return;
+        UiStroke safeStroke = stroke == null ? UiStroke.NONE : stroke;
+        recordUi(new UiShapeCommand(UiShape.box(box), paint, safeStroke, fill));
+        if (box.isSquircle()) {
+            renderSquircleSdf(box, paint, safeStroke, fill);
+        } else {
+            renderFlexibleBoxFallback(box, paint, safeStroke, fill);
+        }
+    }
+
+    public void primitive(UiPrimitive primitive, UiPaint paint) {
+        primitive(primitive, paint, UiStroke.NONE, true);
+    }
+
+    public void primitiveStroke(UiPrimitive primitive, UiPaint paint, UiStroke stroke) {
+        primitive(primitive, paint, stroke, false);
+    }
+
+    public void materialPrimitive(UiPrimitive primitive, UiPaint paint, UiSurfaceMaterialSpec material) {
+        if (primitive == null || paint == null || material == null || primitive.pointCount() < 3) return;
+        recordUi(new UiShapeCommand(
+                UiShape.polyline(primitive.points(), primitive.pointCount(), true),
+                paint,
+                UiStroke.NONE,
+                true
+        ));
+        if (primitive.shaderEligible()) {
+            renderMaterialPrimitiveSdf(primitive, paint, material);
+        } else {
+            renderPrimitiveFallback(primitive, paint, UiStroke.NONE, true);
+        }
+    }
+
+    /**
+     * Draws a preset/custom panel primitive. Convex shapes of up to eight points
+     * stay as one analytic GPU quad; larger or concave authoring results use the
+     * established polygon fallback without changing the caller-facing API.
+     */
+    private void primitive(UiPrimitive primitive, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (primitive == null || paint == null || primitive.pointCount() < 3) return;
+        UiStroke safeStroke = stroke != null ? stroke : UiStroke.NONE;
+        UiShape semanticShape = UiShape.polyline(primitive.points(), primitive.pointCount(), true);
+        recordUi(new UiShapeCommand(semanticShape, paint, safeStroke, fill));
+        if (primitive.shaderEligible()) {
+            renderPrimitiveSdf(primitive, paint, safeStroke, fill);
+        } else {
+            renderPrimitiveFallback(primitive, paint, safeStroke, fill);
+        }
+    }
+
+    /** Draws a bounded implicit/compound SDF through the existing UI primitive batch. */
+    public void compoundSdf(UiCompoundSdf compound, UiPaint paint) {
+        compoundSdf(compound, paint, UiStroke.NONE, true);
+    }
+
+    public void compoundSdfStroke(UiCompoundSdf compound, UiPaint paint, UiStroke stroke) {
+        compoundSdf(compound, paint, stroke, false);
+    }
+
+    public void compoundSdf(UiCompoundSdf compound, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (compound == null || paint == null) return;
+        UiStroke safeStroke = stroke != null ? stroke : UiStroke.NONE;
+        if (!fill && !safeStroke.enabled()) return;
+        renderCompoundSdf(compound, paint, safeStroke, fill);
+    }
+
+    public void shape(UiShape shape, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (shape == null || paint == null) return;
+        recordUi(new UiShapeCommand(shape, paint, stroke == null ? UiStroke.NONE : stroke, fill));
+    }
+
+    public void path(UiShape path, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (path == null || paint == null) return;
+        recordUi(new UiPathCommand(path, paint, stroke == null ? UiStroke.NONE : stroke, fill));
+    }
+
+    /**
+     * Draws one logical vector path with optional area, glow and primary stroke layers. All layers
+     * share one resolved geometry in {@link UiPathDrawApi}; this is the preferred path for charts
+     * and other multi-layer vector UI.
+     */
+    public void path(double[] points,
+                     int pointCount,
+                     UiPathCurve curve,
+                     boolean closed,
+                     @Nullable UiPathAreaFill area,
+                     @Nullable UiPathStrokeLayer glow,
+                     @Nullable UiPathStrokeLayer stroke) {
+        if (textured) throw new IllegalStateException("Path drawing is supported only on Renderer2D.COLOR.");
+        if (points == null || pointCount < 2) return;
+        UiPathCurve safeCurve = curve != null ? curve : UiPathCurve.LINEAR;
+        UiShape semantic = safeCurve == UiPathCurve.SPLINE
+                ? UiShape.spline(points, pointCount, closed)
+                : UiShape.polyline(points, pointCount, closed);
+        if (area != null && area.enabled() && !closed) {
+            path(semantic, UiPaint.corners(area.topStartArgb(), area.topEndArgb(),
+                    area.bottomEndArgb(), area.bottomStartArgb()), UiStroke.NONE, true);
+        }
+        if (glow != null && glow.enabled()) {
+            path(semantic, UiPaint.corners(glow.startArgb(), glow.endArgb(), glow.endArgb(), glow.startArgb()),
+                    new UiStroke((float) glow.width(), glow.cap(), glow.join()), false);
+        }
+        if (stroke != null && stroke.enabled()) {
+            path(semantic, UiPaint.corners(stroke.startArgb(), stroke.endArgb(), stroke.endArgb(), stroke.startArgb()),
+                    new UiStroke((float) stroke.width(), stroke.cap(), stroke.join()), false);
+        }
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, safeCurve, closed, area, glow, stroke);
+    }
+
+    public void effect(UiEffectSpec effect) {
+        if (effect == null) return;
+        recordUi(new UiEffectRegionCommand(effect));
+    }
+
+    // Use this path when the current projection is already the target space
+    // (for example UNSCALED_LOGICAL HUD / ClickGUI coordinates).
+    public void item(ItemStack stack, double x, double y) {
+        item(stack, x, y, 1.0f, 0, ITEM_OVERLAY_NONE, null);
+    }
+
+    public void item(ItemStack stack, double x, double y, float scale) {
+        item(stack, x, y, scale, 0, ITEM_OVERLAY_NONE, null);
+    }
+
+    public void item(ItemStack stack, double x, double y, float scale, int seed) {
+        item(stack, x, y, scale, seed, ITEM_OVERLAY_NONE, null);
+    }
+
+    public void item(ItemStack stack, double x, double y, float scale, int seed, boolean overlay) {
+        item(stack, x, y, scale, seed, overlay ? ITEM_OVERLAY_ALL : ITEM_OVERLAY_NONE, null);
+    }
+
+    public void item(ItemStack stack, double x, double y, float scale, int seed, int overlayFlags) {
+        item(stack, x, y, scale, seed, overlayFlags, null);
+    }
+
+    public void item(ItemStack stack,
+                     double x,
+                     double y,
+                     float scale,
+                     int seed,
+                     int overlayFlags,
+                     @Nullable String stackCountText) {
+        item(null, stack, x, y, scale, seed, overlayFlags, stackCountText);
+    }
+
+    public void item(ItemStack stack,
+                     double x,
+                     double y,
+                     float scale,
+                     int seed,
+                     int overlayFlags,
+                     @Nullable String stackCountText,
+                     int durabilityThresholdPercent,
+                     int durabilityTextColorThresholdPercent) {
+        item(null, stack, x, y, scale, seed, overlayFlags, stackCountText,
+                durabilityThresholdPercent, durabilityTextColorThresholdPercent);
+    }
+
+    public void item(@Nullable LocalPlayer player,
+                     ItemStack stack,
+                     double x,
+                     double y,
+                     float scale,
+                     int seed,
+                     int overlayFlags,
+                     @Nullable String stackCountText) {
+        item(player, stack, x, y, scale, seed, overlayFlags, stackCountText,
+                DEFAULT_ITEM_DURABILITY_THRESHOLD, DEFAULT_ITEM_DURABILITY_TEXT_COLOR_THRESHOLD);
+    }
+
+    public void item(@Nullable LocalPlayer player,
+                     ItemStack stack,
+                     double x,
+                     double y,
+                     float scale,
+                     int seed,
+                     int overlayFlags,
+                     @Nullable String stackCountText,
+                     int durabilityThresholdPercent,
+                     int durabilityTextColorThresholdPercent) {
+        item(player, stack, x, y, scale, scale, 0.0f, 0.0f, false, seed, true, overlayFlags, stackCountText,
+                durabilityThresholdPercent, durabilityTextColorThresholdPercent);
+    }
+
+    public void itemPivot(ItemStack stack,
+                          double x,
+                          double y,
+                          float scaleX,
+                          float scaleY,
+                          float pivotX,
+                          float pivotY,
+                          int seed,
+                          int overlayFlags,
+                          @Nullable String stackCountText) {
+        item(null, stack, x, y, scaleX, scaleY, pivotX, pivotY, true, seed, true, overlayFlags, stackCountText,
+                DEFAULT_ITEM_DURABILITY_THRESHOLD, DEFAULT_ITEM_DURABILITY_TEXT_COLOR_THRESHOLD);
+    }
+
+    public void itemOverlay(ItemStack stack,
+                            double x,
+                            double y,
+                            float scale,
+                            int overlayFlags,
+                            @Nullable String stackCountText) {
+        item(null, stack, x, y, scale, scale, 0.0f, 0.0f, false, 0, false, overlayFlags, stackCountText,
+                DEFAULT_ITEM_DURABILITY_THRESHOLD, DEFAULT_ITEM_DURABILITY_TEXT_COLOR_THRESHOLD);
+    }
+
+    // Use this only when call-site coordinates are in raw framebuffer/unscaled space
+    // and must be converted into the currently active Renderer2D projection.
+    public void itemUnscaled(ItemStack stack,
+                             double x,
+                             double y,
+                             float scale,
+                             int seed,
+                             int overlayFlags,
+                             @Nullable String stackCountText) {
+        float ratio = getUnscaledItemRatio();
+        item(stack, x * ratio, y * ratio, scale * ratio, seed, overlayFlags, stackCountText);
+    }
+
+    public void item(@Nullable LocalPlayer player,
+                     ItemStack stack,
+                     double x,
+                     double y,
+                     float scaleX,
+                     float scaleY,
+                     float pivotX,
+                     float pivotY,
+                     boolean pivoted,
+                     int seed,
+                     boolean drawItem,
+                     int overlayFlags,
+                     @Nullable String stackCountText) {
+        item(player, stack, x, y, scaleX, scaleY, pivotX, pivotY, pivoted, seed, drawItem, overlayFlags, stackCountText,
+                DEFAULT_ITEM_DURABILITY_THRESHOLD, DEFAULT_ITEM_DURABILITY_TEXT_COLOR_THRESHOLD);
+    }
+
+    public void item(@Nullable LocalPlayer player,
+                     ItemStack stack,
+                     double x,
+                     double y,
+                     float scaleX,
+                     float scaleY,
+                     float pivotX,
+                     float pivotY,
+                     boolean pivoted,
+                     int seed,
+                     boolean drawItem,
+                     int overlayFlags,
+                     @Nullable String stackCountText,
+                     int durabilityThresholdPercent,
+                     int durabilityTextColorThresholdPercent) {
+        UiItemSubmission.submit(
+                textured,
+                alpha,
+                player,
+                stack,
+                x,
+                y,
+                scaleX,
+                scaleY,
+                pivotX,
+                pivotY,
+                pivoted,
+                seed,
+                drawItem,
+                overlayFlags,
+                stackCountText,
+                durabilityThresholdPercent,
+                durabilityTextColorThresholdPercent
+        );
+    }
+
+    public void begin() {
+        beginUiLayer();
+        if (textured) {
+            texturedTriangles.begin();
+        } else {
+            UI_BATCHER.begin();
+        }
+    }
+
+    public void end() {
+        if (textured && texturedTriangles.isBuilding()) {
+            texturedTriangles.end();
+        }
+    }
+
+    public void render() {
+        if (textured) {
+            render(null, null, null);
+            return;
+        }
+        if (UI_BATCHER.hasPendingWork() || UiRenderDispatcher.hasPendingCommands()) {
+            BATCH_STATS.noteFlushReason(FlushReason.RENDER_END);
+        }
+        UI_BATCHER.flush(true);
+        flushUiLayer();
+    }
+
+    public void render(GpuTextureView textureView, GpuSampler sampler) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        render("u_Texture", textureView, sampler);
+    }
+
+    public void render(Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        boolean submitted = false;
+        try {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc == null || textureId == null) return;
+            AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+            if (tex == null) return;
+            GpuTextureView view = tex.getTextureView();
+            GpuSampler sampler = tex.getSampler();
+            if (view == null || sampler == null) return;
+            submitted = true;
+            render("u_Texture", view, sampler);
+        } finally {
+            if (!submitted) {
+                flushUiLayer();
+            }
+        }
+    }
+
+    public void render(String samplerName, GpuTextureView samplerView, GpuSampler sampler) {
+        UiDirectTexturedRenderer.submit(texturedTriangles, samplerName, samplerView, sampler);
+    }
+
+    public void svg(Identifier svgId, double x, double y, double width, double height) {
+        svg(svgId, x, y, width, height, SvgRenderOptions.DEFAULT);
+    }
+
+    public void svg(String svgName, double x, double y, double width, double height) {
+        svg(svgName, x, y, width, height, SvgRenderOptions.DEFAULT);
+    }
+
+    public void svg(String svgName,
+                    double x,
+                    double y,
+                    double width,
+                    double height,
+                    SvgRenderOptions options) {
+        if (textured) {
+            throw new IllegalStateException("SVG mesh drawing is supported only on Renderer2D.COLOR.");
+        }
+        Identifier id = SvgRegistry.resolve(svgName);
+        if (id == null) return;
+        SvgMeshBackend.draw(this, id, x, y, width, height, options);
+    }
+
+    public void svg(Identifier svgId,
+                    double x,
+                    double y,
+                    double width,
+                    double height,
+                    SvgRenderOptions options) {
+        if (textured) {
+            throw new IllegalStateException("SVG mesh drawing is supported only on Renderer2D.COLOR.");
+        }
+        SvgMeshBackend.draw(this, svgId, x, y, width, height, options);
+    }
+
+    public void svg(Path svgPath, double x, double y, double width, double height) {
+        svg(svgPath, x, y, width, height, SvgRenderOptions.DEFAULT);
+    }
+
+    public void svg(Path svgPath,
+                    double x,
+                    double y,
+                    double width,
+                    double height,
+                    SvgRenderOptions options) {
+        if (textured) {
+            throw new IllegalStateException("SVG mesh drawing is supported only on Renderer2D.COLOR.");
+        }
+        SvgMeshBackend.draw(this, svgPath, x, y, width, height, options);
+    }
+
+    public void textureQuad(GpuTextureView samplerView,
+                            GpuSampler sampler,
+                            double x,
+                            double y,
+                            double w,
+                            double h) {
+        textureQuad(samplerView, sampler, x, y, w, h, 0xFFFFFFFF);
+    }
+
+    public void textureQuad(GpuTextureView samplerView,
+                            GpuSampler sampler,
+                            double x,
+                            double y,
+                            double w,
+                            double h,
+                            int argb) {
+        if (textured) {
+            throw new IllegalStateException("Batched texture quad drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (samplerView == null || sampler == null) return;
+        if (w == 0.0 || h == 0.0) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.rect(x, y, w, h), UiPaint.solid(argb), 0f, 0f, 1f, 1f, false));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+
+        int i1 = mesh.vec2(x, y).raw2(0.0, 0.0).color(r, g, b, a).next();
+        int i2 = mesh.vec2(x, y + h).raw2(0.0, 1.0).color(r, g, b, a).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(1.0, 1.0).color(r, g, b, a).next();
+        int i4 = mesh.vec2(x + w, y).raw2(1.0, 0.0).color(r, g, b, a).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void textureQuad(GpuTextureView samplerView,
+                            GpuSampler sampler,
+                            double x,
+                            double y,
+                            double w,
+                            double h,
+                            double u0,
+                            double v0,
+                            double u1,
+                            double v1,
+                            int argb) {
+        if (textured) {
+            throw new IllegalStateException("Batched texture quad drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (samplerView == null || sampler == null) return;
+        if (w == 0.0 || h == 0.0) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.rect(x, y, w, h), UiPaint.solid(argb),
+                (float) u0, (float) v0, (float) u1, (float) v1, false));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int i1 = mesh.vec2(x, y).raw2(u0, v0).color(r, g, b, a).next();
+        int i2 = mesh.vec2(x, y + h).raw2(u0, v1).color(r, g, b, a).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(u1, v1).color(r, g, b, a).next();
+        int i4 = mesh.vec2(x + w, y).raw2(u1, v0).color(r, g, b, a).next();
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    /** Draws an atlas sub-rect rotated around an explicit pivot inside the quad. */
+    public void textureQuadRotated(GpuTextureView samplerView,
+                                   GpuSampler sampler,
+                                   double pivotScreenX,
+                                   double pivotScreenY,
+                                   double width,
+                                   double height,
+                                   double pivotX,
+                                   double pivotY,
+                                   double degrees,
+                                   double u0,
+                                   double v0,
+                                   double u1,
+                                   double v1,
+                                   int argb) {
+        if (textured) {
+            throw new IllegalStateException("Batched texture quad drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (samplerView == null || sampler == null || width == 0.0 || height == 0.0) return;
+
+        double radians = Math.toRadians(degrees);
+        double cos = Math.cos(radians);
+        double sin = Math.sin(radians);
+        double[] localX = {-pivotX, -pivotX, width - pivotX, width - pivotX};
+        double[] localY = {-pivotY, height - pivotY, height - pivotY, -pivotY};
+        double[] px = new double[4];
+        double[] py = new double[4];
+        for (int i = 0; i < 4; i++) {
+            px[i] = pivotScreenX + localX[i] * cos - localY[i] * sin;
+            py[i] = pivotScreenY + localX[i] * sin + localY[i] * cos;
+        }
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int i1 = mesh.vec2(px[0], py[0]).raw2(u0, v0).color(r, g, b, a).next();
+        int i2 = mesh.vec2(px[1], py[1]).raw2(u0, v1).color(r, g, b, a).next();
+        int i3 = mesh.vec2(px[2], py[2]).raw2(u1, v1).color(r, g, b, a).next();
+        int i4 = mesh.vec2(px[3], py[3]).raw2(u1, v0).color(r, g, b, a).next();
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    public void msdfTextureQuad(GpuTextureView samplerView,
+                                GpuSampler sampler,
+                                double x,
+                                double y,
+                                double w,
+                                double h,
+                                int argb,
+                                float pxRange,
+                                int atlasWidth,
+                                int atlasHeight) {
+        msdfTextureQuad(samplerView, sampler, x, y, w, h, argb, argb, argb, argb, pxRange, atlasWidth, atlasHeight);
+    }
+
+    public void msdfTextureQuad(GpuTextureView samplerView,
+                                GpuSampler sampler,
+                                double x,
+                                double y,
+                                double w,
+                                double h,
+                                int topLeft,
+                                int topRight,
+                                int bottomRight,
+                                int bottomLeft,
+                                float pxRange,
+                                int atlasWidth,
+                                int atlasHeight) {
+        if (textured) {
+            throw new IllegalStateException("Batched MSDF texture quad drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (samplerView == null || sampler == null) return;
+        if (w == 0.0 || h == 0.0) return;
+        if (pxRange <= 0.0f || atlasWidth <= 0 || atlasHeight <= 0) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.rect(x, y, w, h), UiPaint.solid(topLeft), 0f, 0f, 1f, 1f, false));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateMsdf(samplerView, sampler, pxRange, atlasWidth, atlasHeight);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int i1 = mesh.vec2(x, y).raw2(0.0, 0.0).color((topLeft >>> 16) & 0xFF, (topLeft >>> 8) & 0xFF, topLeft & 0xFF, (topLeft >>> 24) & 0xFF).next();
+        int i2 = mesh.vec2(x, y + h).raw2(0.0, 1.0).color((bottomLeft >>> 16) & 0xFF, (bottomLeft >>> 8) & 0xFF, bottomLeft & 0xFF, (bottomLeft >>> 24) & 0xFF).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(1.0, 1.0).color((bottomRight >>> 16) & 0xFF, (bottomRight >>> 8) & 0xFF, bottomRight & 0xFF, (bottomRight >>> 24) & 0xFF).next();
+        int i4 = mesh.vec2(x + w, y).raw2(1.0, 0.0).color((topRight >>> 16) & 0xFF, (topRight >>> 8) & 0xFF, topRight & 0xFF, (topRight >>> 24) & 0xFF).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void quadBatch(Consumer<QuadBatch> consumer) {
+        if (textured) {
+            throw new IllegalStateException("Quad batching is supported only on Renderer2D.COLOR.");
+        }
+        if (consumer == null) return;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        QuadBatch quadBatch = new QuadBatch(mesh);
+        try {
+            consumer.accept(quadBatch);
+        } finally {
+            endAutoBatch(auto);
+        }
+    }
+
+    public void line(double x1, double y1, double x2, double y2, int argb) {
+        double[] p = {x1, y1, x2, y2};
+        path(UiShape.polyline(p, 2, false), UiPaint.solid(argb), UiStroke.of(1.0), false);
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.LINES, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureLineCapacity();
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int i1 = mesh.vec2(x1, y1).color(r, g, b, a).next();
+        int i2 = mesh.vec2(x2, y2).color(r, g, b, a).next();
+        mesh.line(i1, i2);
+
+        endAutoBatch(auto);
+    }
+
+    public void line(double x1, double y1, double x2, double y2, Color color) {
+        line(x1, y1, x2, y2, color != null ? color.getRGB() : 0);
+    }
+
+    public void line(double x1, double y1, double x2, double y2, RenderColor color) {
+        double[] p = {x1, y1, x2, y2};
+        path(UiShape.polyline(p, 2, false), UiPaint.solid(color.argb()), UiStroke.of(1.0), false);
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.LINES, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureLineCapacity();
+        int i1 = mesh.vec2(x1, y1).color(color.r, color.g, color.b, color.a).next();
+        int i2 = mesh.vec2(x2, y2).color(color.r, color.g, color.b, color.a).next();
+        mesh.line(i1, i2);
+
+        endAutoBatch(auto);
+    }
+
+    public void boxLines(double x, double y, double width, double height, int argb) {
+        shapeStroke(UiShape.rect(x, y, width, height), UiPaint.solid(argb), UiStroke.of(1.0));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.LINES, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureCapacity(4, 8);
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int i1 = mesh.vec2(x, y).color(r, g, b, a).next();
+        int i2 = mesh.vec2(x, y + height).color(r, g, b, a).next();
+        int i3 = mesh.vec2(x + width, y + height).color(r, g, b, a).next();
+        int i4 = mesh.vec2(x + width, y).color(r, g, b, a).next();
+
+        mesh.line(i1, i2);
+        mesh.line(i2, i3);
+        mesh.line(i3, i4);
+        mesh.line(i4, i1);
+
+        endAutoBatch(auto);
+    }
+
+    public void quad(double x, double y, double width, double height, int argb) {
+        quad(x, y, width, height, argb, argb, argb, argb);
+    }
+
+    public void quad(double x, double y, double width, double height, Color color) {
+        quad(x, y, width, height, color != null ? color.getRGB() : 0);
+    }
+
+    public void quad(double x, double y, double width, double height, int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shape(UiShape.rect(x, y, width, height), UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        appendGeometryQuad(mesh, x, y, width, height,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRect(double x, double y, double w, double h,
+                            float radius, float softness, int argb) {
+        roundedRectMasked(x, y, w, h, x, y, w, h, radius, softness, argb);
+    }
+
+    public void roundedRect(double x, double y, double w, double h,
+                            float radius, int argb) {
+        roundedRect(x, y, w, h, radius, 0.0f, argb);
+    }
+
+    public void roundedRect(double x, double y, double w, double h, float radius, Color color) {
+        roundedRect(x, y, w, h, radius, color != null ? color.getRGB() : 0);
+    }
+
+    public void circle(double cx, double cy, double radius, int argb) {
+        circle(cx, cy, radius, 1.1f, argb);
+    }
+
+    public void circle(double cx, double cy, double radius, Color color) {
+        circle(cx, cy, radius, color != null ? color.getRGB() : 0);
+    }
+
+    public void circle(double cx, double cy, double radius, float softness, int argb) {
+        shape(UiShape.circle(cx, cy, radius), UiPaint.solid(argb));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+
+        double outerRadius = radius + Math.max(0.0f, softness);
+        double x = cx - outerRadius;
+        double y = cy - outerRadius;
+        double w = outerRadius * 2.0;
+        double h = outerRadius * 2.0;
+
+        if (RenderWarpStack.active()) {
+            appendWarpedSdfGrid(mesh, x, y, w, h, argb, argb, argb, argb,
+                    UiRect.of(x, y, w, h), UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, 0.0f);
+        } else {
+            mesh.ensureQuadCapacity();
+            int i1 = appendGeometryVertex(mesh, x, y, argb, UiRect.of(x, y, w, h),
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, 0f);
+            int i2 = appendGeometryVertex(mesh, x, y + h, argb, UiRect.of(x, y, w, h),
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, 0f);
+            int i3 = appendGeometryVertex(mesh, x + w, y + h, argb, UiRect.of(x, y, w, h),
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, 0f);
+            int i4 = appendGeometryVertex(mesh, x + w, y, argb, UiRect.of(x, y, w, h),
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, 0f);
+            mesh.quad(i1, i2, i3, i4);
+        }
+
+        endAutoBatch(auto);
+    }
+
+    public void circleSoftShadow(double cx, double cy, double radius, float blur, float innerAlpha, int argb) {
+        if (radius <= 0.0) return;
+        double size = radius * 2.0;
+        roundedRectSoftShadow(cx - radius, cy - radius, size, size, (float) radius, blur, innerAlpha, argb);
+    }
+
+    public void circleStroke(double cx, double cy, double radius, double thickness, int argb) {
+        circleStroke(cx, cy, radius, thickness, 1.1f, argb);
+    }
+
+    public void circleStroke(double cx, double cy, double radius, double thickness, float softness, int argb) {
+        shapeStroke(UiShape.circle(cx, cy, radius), UiPaint.solid(argb), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+
+        float stroke = (float) Math.max(0.0, thickness);
+        double outerRadius = radius + stroke * 0.5 + softness;
+        double x = cx - outerRadius;
+        double y = cy - outerRadius;
+        double w = outerRadius * 2.0;
+        double h = outerRadius * 2.0;
+
+        if (RenderWarpStack.active()) {
+            appendWarpedSdfGrid(mesh, x, y, w, h, argb, argb, argb, argb,
+                    UiRect.of(x, y, w, h), UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, stroke);
+        } else {
+            mesh.ensureQuadCapacity();
+            UiRect bounds = UiRect.of(x, y, w, h);
+            int i1 = appendGeometryVertex(mesh, x, y, argb, bounds,
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, stroke);
+            int i2 = appendGeometryVertex(mesh, x, y + h, argb, bounds,
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, stroke);
+            int i3 = appendGeometryVertex(mesh, x + w, y + h, argb, bounds,
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, stroke);
+            int i4 = appendGeometryVertex(mesh, x + w, y, argb, bounds,
+                    UiFastShapeParams.KIND_CIRCLE, (float) radius, softness, stroke);
+            mesh.quad(i1, i2, i3, i4);
+        }
+
+        endAutoBatch(auto);
+    }
+
+    public void arcStroke(double cx, double cy, double radius, double thickness,
+                          float startAngleDeg, float endAngleDeg, int argb) {
+        arcStroke(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, 1.1f, argb);
+    }
+
+    public void arcStroke(double cx, double cy, double radius, double thickness,
+                          float startAngleDeg, float endAngleDeg, float softness, int argb) {
+        arcStrokeQuad(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, true,
+                argb, argb, argb, argb);
+    }
+
+    public void arcStrokeFlat(double cx, double cy, double radius, double thickness,
+                              float startAngleDeg, float endAngleDeg, float softness, int argb) {
+        arcStrokeQuad(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, false,
+                argb, argb, argb, argb);
+    }
+
+    public void arcStrokeFlat(double cx, double cy, double radius, double thickness,
+                              float startAngleDeg, float endAngleDeg, int argb) {
+        arcStrokeFlat(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, 0.0f, argb);
+    }
+
+    public void arcStrokeGradient(double cx, double cy, double radius, double thickness,
+                                  float startAngleDeg, float endAngleDeg, float softness,
+                                  int startArgb, int endArgb, float angleDeg) {
+        arcStrokeGradient(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness,
+                startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void arcStrokeGradient(double cx, double cy, double radius, double thickness,
+                                  float startAngleDeg, float endAngleDeg,
+                                  int startArgb, int endArgb, float angleDeg) {
+        arcStrokeGradient(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, 0.0f,
+                startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void arcStrokeGradient(double cx, double cy, double radius, double thickness,
+                                  float startAngleDeg, float endAngleDeg,
+                                  int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        arcStrokeGradient(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, 0.0f,
+                startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void arcStrokeGradient(double cx, double cy, double radius, double thickness,
+                                  float startAngleDeg, float endAngleDeg, float softness,
+                                  int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        double outerRadius = radius + Math.max(0.0, thickness) * 0.5 + softness;
+        computeLinearGradientColors((float) (outerRadius * 2.0), (float) (outerRadius * 2.0),
+                startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        arcStrokeQuad(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, true,
+                gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    /**
+     * Statistics/playtime variant: the visible arc is still one SHAPE quad.  hashTime is expressed
+     * in virtual history buckets and the shader reconstructs a fixed rolling color history from it.
+     */
+    public void arcStrokeHashedGradient(double cx, double cy, double radius, double thickness,
+                                        float startAngleDeg, float endAngleDeg, float softness,
+                                        int startArgb, int endArgb, float angleDeg, float offsetPx,
+                                        float hashTime) {
+        double outerRadius = radius + Math.max(0.0, thickness) * 0.5 + softness;
+        computeLinearGradientColors((float) (outerRadius * 2.0), (float) (outerRadius * 2.0),
+                startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        arcStrokeQuadInternal(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, true,
+                gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3],
+                1.0f, Math.max(0.0f, hashTime));
+    }
+
+    private void arcStrokeQuad(double cx, double cy, double radius, double thickness,
+                              float startAngleDeg, float endAngleDeg, float softness,
+                              int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        arcStrokeQuad(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, true,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    private void arcStrokeQuad(double cx, double cy, double radius, double thickness,
+                              float startAngleDeg, float endAngleDeg, float softness, boolean caps,
+                              int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        arcStrokeQuadInternal(cx, cy, radius, thickness, startAngleDeg, endAngleDeg, softness, caps,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft, 0.0f, 0.0f);
+    }
+
+    private void arcStrokeQuadInternal(double cx, double cy, double radius, double thickness,
+                                       float startAngleDeg, float endAngleDeg, float softness, boolean caps,
+                                       int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft,
+                                       float historyMode, float historyTime) {
+        float rawSweep = endAngleDeg - startAngleDeg;
+        float start = normalizeDegrees(startAngleDeg);
+        float sweep;
+        if (historyMode > 0.5f) {
+            // The history shader needs the complete ring quad so already completed virtual
+            // layers remain visible underneath the current-hour sweep.
+            sweep = 360.0f;
+        } else {
+            if (Math.abs(rawSweep) <= 0.001f) {
+                return;
+            }
+            if (Math.abs(rawSweep) >= 359.99f) {
+                sweep = 360.0f;
+            } else {
+                sweep = rawSweep % 360.0f;
+                if (sweep <= 0.0f) sweep += 360.0f;
+            }
+        }
+        float end = normalizeDegrees(start + sweep);
+
+        shapeStroke(UiShape.arc(cx, cy, radius, start, end), UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        float stroke = (float) Math.max(0.0, thickness);
+        double outerRadius = radius + stroke * 0.5 + softness;
+        double x = cx - outerRadius;
+        double y = cy - outerRadius;
+        double w = outerRadius * 2.0;
+        double h = outerRadius * 2.0;
+
+        int tlA = (cTopLeft >>> 24) & 0xFF;
+        int tlR = (cTopLeft >>> 16) & 0xFF;
+        int tlG = (cTopLeft >>> 8) & 0xFF;
+        int tlB = cTopLeft & 0xFF;
+        int trA = (cTopRight >>> 24) & 0xFF;
+        int trR = (cTopRight >>> 16) & 0xFF;
+        int trG = (cTopRight >>> 8) & 0xFF;
+        int trB = cTopRight & 0xFF;
+        int brA = (cBottomRight >>> 24) & 0xFF;
+        int brR = (cBottomRight >>> 16) & 0xFF;
+        int brG = (cBottomRight >>> 8) & 0xFF;
+        int brB = cBottomRight & 0xFF;
+        int blA = (cBottomLeft >>> 24) & 0xFF;
+        int blR = (cBottomLeft >>> 16) & 0xFF;
+        int blG = (cBottomLeft >>> 8) & 0xFF;
+        int blB = cBottomLeft & 0xFF;
+
+        UiRect arcBounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, x, y, cTopLeft, arcBounds,
+                UiFastShapeParams.KIND_ARC, (float) radius, softness, stroke, start, end, caps ? 1f : 0f, 0f,
+                historyMode, historyTime, 0f, 0f);
+        int i2 = appendGeometryVertex(mesh, x, y + h, cBottomLeft, arcBounds,
+                UiFastShapeParams.KIND_ARC, (float) radius, softness, stroke, start, end, caps ? 1f : 0f, 0f,
+                historyMode, historyTime, 0f, 0f);
+        int i3 = appendGeometryVertex(mesh, x + w, y + h, cBottomRight, arcBounds,
+                UiFastShapeParams.KIND_ARC, (float) radius, softness, stroke, start, end, caps ? 1f : 0f, 0f,
+                historyMode, historyTime, 0f, 0f);
+        int i4 = appendGeometryVertex(mesh, x + w, y, cTopRight, arcBounds,
+                UiFastShapeParams.KIND_ARC, (float) radius, softness, stroke, start, end, caps ? 1f : 0f, 0f,
+                historyMode, historyTime, 0f, 0f);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void orbizRing(double cx, double cy,
+                          double radius, double thickness,
+                          float startAngleDeg, float sweepAngleDeg,
+                          float softness, float glowRadius, float glowStrength,
+                          int primaryArgb, int secondaryArgb,
+                          int colorMode, float angularOffset, float angularCycles,
+                          float trackAlpha, float bodyAlpha, float headBoost,
+                          float trackGlow, boolean caps) {
+        if (textured) {
+            throw new IllegalStateException("Orbiz ring drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (radius <= 0.0 || thickness <= 0.0) return;
+        if (((primaryArgb >>> 24) & 0xFF) <= 0 && ((secondaryArgb >>> 24) & 0xFF) <= 0) return;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.ORBIZ_RING, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (primaryArgb >>> 24) & 0xFF;
+        int r = (primaryArgb >>> 16) & 0xFF;
+        int g = (primaryArgb >>> 8) & 0xFF;
+        int b = primaryArgb & 0xFF;
+
+        float sr = ((secondaryArgb >>> 16) & 0xFF) / 255.0f;
+        float sg = ((secondaryArgb >>> 8) & 0xFF) / 255.0f;
+        float sb = (secondaryArgb & 0xFF) / 255.0f;
+        float sa = ((secondaryArgb >>> 24) & 0xFF) / 255.0f;
+
+        float stroke = (float) Math.max(0.0, thickness);
+        float ringRadius = (float) Math.max(0.0, radius);
+        float soft = Math.max(0.0f, softness);
+        float glow = Math.max(0.0f, glowRadius);
+        float expand = stroke * 0.5f + soft + glow + 1.0f;
+        double outerRadius = radius + expand;
+        double x = cx - outerRadius;
+        double y = cy - outerRadius;
+        double w = outerRadius * 2.0;
+        double h = outerRadius * 2.0;
+        double ringX = cx - radius;
+        double ringY = cy - radius;
+        double ringSize = radius * 2.0;
+
+        float start = normalizeDegrees(startAngleDeg);
+        float sweep = Mth.clamp(sweepAngleDeg, 0.0f, 360.0f);
+        float offset = angularOffset - (float) Math.floor(angularOffset);
+        float cycles = Math.max(0.001f, angularCycles);
+        float mode = Math.max(0, colorMode);
+        float track = Mth.clamp(trackAlpha, 0.0f, 1.0f);
+        float body = Mth.clamp(bodyAlpha, 0.0f, 1.0f);
+        float glowPower = Math.max(0.0f, glowStrength);
+        float head = Math.max(0.0f, headBoost);
+        float trackGlowAmount = Mth.clamp(trackGlow, 0.0f, 1.0f);
+
+        int i1 = mesh.vec2(x, y).local2(x, y).color(r, g, b, a)
+                .vec4(ringX, ringY, ringSize, ringSize)
+                .vec4(ringRadius, soft, stroke, start)
+                .vec4(sweep, glow, glowPower, mode)
+                .vec4(sr, sg, sb, sa)
+                .vec4(offset, cycles, 0.0f, caps ? 1.0f : 0.0f)
+                .vec4(track, body, head, trackGlowAmount)
+                .next();
+        int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(r, g, b, a)
+                .vec4(ringX, ringY, ringSize, ringSize)
+                .vec4(ringRadius, soft, stroke, start)
+                .vec4(sweep, glow, glowPower, mode)
+                .vec4(sr, sg, sb, sa)
+                .vec4(offset, cycles, 0.0f, caps ? 1.0f : 0.0f)
+                .vec4(track, body, head, trackGlowAmount)
+                .next();
+        int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(r, g, b, a)
+                .vec4(ringX, ringY, ringSize, ringSize)
+                .vec4(ringRadius, soft, stroke, start)
+                .vec4(sweep, glow, glowPower, mode)
+                .vec4(sr, sg, sb, sa)
+                .vec4(offset, cycles, 0.0f, caps ? 1.0f : 0.0f)
+                .vec4(track, body, head, trackGlowAmount)
+                .next();
+        int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(r, g, b, a)
+                .vec4(ringX, ringY, ringSize, ringSize)
+                .vec4(ringRadius, soft, stroke, start)
+                .vec4(sweep, glow, glowPower, mode)
+                .vec4(sr, sg, sb, sa)
+                .vec4(offset, cycles, 0.0f, caps ? 1.0f : 0.0f)
+                .vec4(track, body, head, trackGlowAmount)
+                .next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    private void roundedRectMasked(double x, double y, double w, double h,
+                                  double maskX, double maskY, double maskW, double maskH,
+                                  float radius, float softness, int argb) {
+        roundedRectMaskedQuad(x, y, w, h, maskX, maskY, maskW, maskH, radius, softness, argb, argb, argb, argb);
+    }
+
+    public void roundedRectStroke(double x, double y, double w, double h,
+                                  float radius, float softness, float thickness, int argb) {
+        roundedRectStrokeGradientQuad(x, y, w, h, radius, softness, thickness,
+                argb, argb, argb, argb);
+    }
+
+    public void roundedRectStroke(double x, double y, double w, double h,
+                                  float radius, float thickness, int argb) {
+        roundedRectStroke(x, y, w, h, radius, 0.0f, thickness, argb);
+    }
+
+    public void roundedRectStrokeAngularGradient(double x, double y, double w, double h,
+                                                 float radius, float softness, float thickness,
+                                                 int startArgb, int endArgb, float offset) {
+        shapeStroke(UiShape.roundedRect(x, y, w, h, radius), UiPaint.solid(startArgb), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.ROUNDED_STROKE_ANGULAR, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int sa = (startArgb >>> 24) & 0xFF;
+        int sr = (startArgb >>> 16) & 0xFF;
+        int sg = (startArgb >>> 8) & 0xFF;
+        int sb = startArgb & 0xFF;
+        float ea = ((endArgb >>> 24) & 0xFF) / 255.0f;
+        float er = ((endArgb >>> 16) & 0xFF) / 255.0f;
+        float eg = ((endArgb >>> 8) & 0xFF) / 255.0f;
+        float eb = (endArgb & 0xFF) / 255.0f;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+        float stroke = Math.max(0.0f, thickness);
+        float phase = offset - (float) Math.floor(offset);
+
+        int i1 = mesh.vec2(x, y).local2(x, y).color(sr, sg, sb, sa).vec4(x, y, w, h).vec4(clampedRadius, 0.0f, stroke, phase).vec4(er, eg, eb, ea).next();
+        int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(sr, sg, sb, sa).vec4(x, y, w, h).vec4(clampedRadius, 0.0f, stroke, phase).vec4(er, eg, eb, ea).next();
+        int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(sr, sg, sb, sa).vec4(x, y, w, h).vec4(clampedRadius, 0.0f, stroke, phase).vec4(er, eg, eb, ea).next();
+        int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(sr, sg, sb, sa).vec4(x, y, w, h).vec4(clampedRadius, 0.0f, stroke, phase).vec4(er, eg, eb, ea).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectStrokeCorners(double x, double y, double w, double h,
+                                         float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                         float softness, float thickness, int argb) {
+        shapeStroke(UiShape.roundedRect(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL), UiPaint.solid(argb), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        normalizeCornerRadii(w, h, radiusTL, radiusTR, radiusBR, radiusBL, cornerRadiiTmp);
+        float stroke = Math.max(0.0f, thickness);
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, x, y, argb, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, stroke, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i2 = appendGeometryVertex(mesh, x, y + h, argb, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, stroke, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i3 = appendGeometryVertex(mesh, x + w, y + h, argb, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, stroke, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i4 = appendGeometryVertex(mesh, x + w, y, argb, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, stroke, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectStrokeCorners(double x, double y, double w, double h,
+                                         float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                         float thickness, int argb) {
+        roundedRectStrokeCorners(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL, 0.0f, thickness, argb);
+    }
+
+    public void roundedRectCorners(double x, double y, double w, double h,
+                                   float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                   float softness, int argb) {
+        roundedRectCornersQuad(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                0.0f,
+                argb, argb, argb, argb);
+    }
+
+    public void roundedRectCorners(double x, double y, double w, double h,
+                                   float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                   int argb) {
+        roundedRectCorners(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL, 0.0f, argb);
+    }
+
+    public void roundedRectCornersQuad(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float softness,
+                                       int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shape(UiShape.roundedRect(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL), UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        int tlA = (cTopLeft >>> 24) & 0xFF;
+        int tlR = (cTopLeft >>> 16) & 0xFF;
+        int tlG = (cTopLeft >>> 8) & 0xFF;
+        int tlB = cTopLeft & 0xFF;
+        int trA = (cTopRight >>> 24) & 0xFF;
+        int trR = (cTopRight >>> 16) & 0xFF;
+        int trG = (cTopRight >>> 8) & 0xFF;
+        int trB = cTopRight & 0xFF;
+        int brA = (cBottomRight >>> 24) & 0xFF;
+        int brR = (cBottomRight >>> 16) & 0xFF;
+        int brG = (cBottomRight >>> 8) & 0xFF;
+        int brB = cBottomRight & 0xFF;
+        int blA = (cBottomLeft >>> 24) & 0xFF;
+        int blR = (cBottomLeft >>> 16) & 0xFF;
+        int blG = (cBottomLeft >>> 8) & 0xFF;
+        int blB = cBottomLeft & 0xFF;
+        normalizeCornerRadii(w, h, radiusTL, radiusTR, radiusBR, radiusBL, cornerRadiiTmp);
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, x, y, cTopLeft, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, 0f, 1f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i2 = appendGeometryVertex(mesh, x, y + h, cBottomLeft, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, 0f, 1f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i3 = appendGeometryVertex(mesh, x + w, y + h, cBottomRight, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, 0f, 1f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i4 = appendGeometryVertex(mesh, x + w, y, cTopRight, bounds,
+                UiFastShapeParams.KIND_ROUNDED_CORNERS, softness, 0f, 1f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectCornersQuad(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        roundedRectCornersQuad(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL, 0.0f,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    public void roundedRectGradient(double x, double y, double w, double h,
+                                    float radius, float softness,
+                                    int startArgb, int endArgb, float angleDeg) {
+        roundedRectGradient(x, y, w, h, radius, 0.0f, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void roundedRectGradient(double x, double y, double w, double h,
+                                    float radius, int startArgb, int endArgb, float angleDeg) {
+        roundedRectGradient(x, y, w, h, radius, 0.0f, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void roundedRectGradient(double x, double y, double w, double h,
+                                    float radius, float softness,
+                                    int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) w, (float) h, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        roundedRectGradientQuad(x, y, w, h, radius, 0.0f, gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void roundedRectGradient(double x, double y, double w, double h,
+                                    float radius,
+                                    int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        roundedRectGradient(x, y, w, h, radius, 0.0f, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    /**
+     * Draws a progress segment clipped by the full rounded bar outline.
+     *
+     * <p>Unlike drawing a rounded rectangle with the current fill width, this keeps the moving
+     * progress edge straight and lets only the fixed outer bar bounds define rounded ends. That
+     * prevents small health values from becoming a pill/capsule and prevents the fill from leaking
+     * outside the left/right rounded shell when the progress edge crosses an outer corner.</p>
+     */
+    public void roundedProgressRectGradient(double x, double y, double w, double h,
+                                            float radius, float softness,
+                                            float progress,
+                                            boolean fromRight,
+                                            int startArgb, int endArgb,
+                                            float angleDeg, float offsetPx) {
+        if (w <= 0.0 || h <= 0.0) return;
+        float p = Mth.clamp(progress, 0.0f, 1.0f);
+        if (p <= 0.0001f) return;
+        if (p >= 0.9999f) {
+            roundedRectGradient(x, y, w, h, radius, softness, startArgb, endArgb, angleDeg, offsetPx);
+            return;
+        }
+
+        double fillW = Math.max(0.0, Math.min(w, w * p));
+        double fillX = fromRight ? x + w - fillW : x;
+        double clipX = fromRight ? fillX : x + fillW;
+        int count = buildRoundedProgressRect(progressShapeTmp, rectShapeTmp, x, y, w, h, radius, clipX, fromRight);
+        if (count < 3) return;
+        polygonGradient(progressShapeTmp, count, fillX, y, fillW, h, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void roundedProgressRectGradient(double x, double y, double w, double h,
+                                            float radius,
+                                            float progress,
+                                            boolean fromRight,
+                                            int startArgb, int endArgb,
+                                            float angleDeg, float offsetPx) {
+        roundedProgressRectGradient(x, y, w, h, radius, 0.0f, progress, fromRight,
+                startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void roundedSmokeFill(double x, double y, double w, double h,
+                                 float radius, float softness,
+                                 float fillRatio,
+                                 boolean fromRight,
+                                 int firstArgb,
+                                 int secondArgb,
+                                 int thirdArgb,
+                                 float time,
+                                 float smokeScale,
+                                 float smokeMix,
+                                 int octaves,
+                                 float flowX,
+                                 float flowY,
+                                 float intensity) {
+        if (w <= 0.0 || h <= 0.0) return;
+        float fill = Mth.clamp(fillRatio, 0.0f, 1.0f);
+        if (fill <= 0.0001f) return;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.ROUNDED_FILL_SMOKE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a0 = (firstArgb >>> 24) & 0xFF;
+        int r0 = (firstArgb >>> 16) & 0xFF;
+        int g0 = (firstArgb >>> 8) & 0xFF;
+        int b0 = firstArgb & 0xFF;
+
+        float r1 = ((secondArgb >>> 16) & 0xFF) / 255.0f;
+        float g1 = ((secondArgb >>> 8) & 0xFF) / 255.0f;
+        float b1 = (secondArgb & 0xFF) / 255.0f;
+        float a1 = ((secondArgb >>> 24) & 0xFF) / 255.0f;
+
+        float r2 = ((thirdArgb >>> 16) & 0xFF) / 255.0f;
+        float g2 = ((thirdArgb >>> 8) & 0xFF) / 255.0f;
+        float b2 = (thirdArgb & 0xFF) / 255.0f;
+        float a2 = ((thirdArgb >>> 24) & 0xFF) / 255.0f;
+
+        float fromRightFlag = fromRight ? 1.0f : 0.0f;
+        float safeScale = Math.max(0.1f, smokeScale);
+        float safeMix = Mth.clamp(smokeMix, 0.0f, 1.0f);
+        float safeOctaves = Mth.clamp(octaves, 1, 8);
+        float safeIntensity = Math.max(0.0f, intensity);
+
+        int i1 = mesh.vec2(x, y).local2(x, y).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, softness, fill, fromRightFlag)
+                .vec4(r1, g1, b1, a1)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, safeScale, safeMix, safeOctaves)
+                .vec4(flowX, flowY, safeIntensity, 0.0f)
+                .next();
+        int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, softness, fill, fromRightFlag)
+                .vec4(r1, g1, b1, a1)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, safeScale, safeMix, safeOctaves)
+                .vec4(flowX, flowY, safeIntensity, 0.0f)
+                .next();
+        int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, softness, fill, fromRightFlag)
+                .vec4(r1, g1, b1, a1)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, safeScale, safeMix, safeOctaves)
+                .vec4(flowX, flowY, safeIntensity, 0.0f)
+                .next();
+        int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, softness, fill, fromRightFlag)
+                .vec4(r1, g1, b1, a1)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, safeScale, safeMix, safeOctaves)
+                .vec4(flowX, flowY, safeIntensity, 0.0f)
+                .next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedSmokeFill(double x, double y, double w, double h,
+                                 float radius,
+                                 float fillRatio,
+                                 boolean fromRight,
+                                 int firstArgb,
+                                 int secondArgb,
+                                 int thirdArgb,
+                                 float time,
+                                 float smokeScale,
+                                 float smokeMix,
+                                 int octaves,
+                                 float flowX,
+                                 float flowY,
+                                 float intensity) {
+        roundedSmokeFill(x, y, w, h, radius, 0.0f, fillRatio, fromRight,
+                firstArgb, secondArgb, thirdArgb, time, smokeScale, smokeMix, octaves, flowX, flowY, intensity);
+    }
+
+    /**
+     * Draws the animated category material used by ClickGui module rows.
+     * The shader owns the material detail; callers own clipping (normally the parent glass shape).
+     */
+    public void moduleCategorySurface(double x, double y, double w, double h,
+                                      float radius,
+                                      double backdropX,
+                                      double backdropY,
+                                      double backdropW,
+                                      double backdropH,
+                                      float shaderBackdropRadius,
+                                      int effectMode,
+                                      float reveal,
+                                      float time,
+                                      float mouseX,
+                                      float mouseY,
+                                      float seed,
+                                      int primaryArgb,
+                                      int secondaryArgb,
+                                      int highlightArgb,
+                                      float intensity) {
+        if (w <= 0.0 || h <= 0.0) return;
+        float safeReveal = Mth.clamp(reveal, 0.0f, 1.0f);
+        float safeIntensity = Math.max(0.0f, intensity);
+        if (safeReveal <= 0.0001f || safeIntensity <= 0.0001f) return;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.MODULE_CATEGORY_SURFACE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int a0 = (primaryArgb >>> 24) & 0xFF;
+        int r0 = (primaryArgb >>> 16) & 0xFF;
+        int g0 = (primaryArgb >>> 8) & 0xFF;
+        int b0 = primaryArgb & 0xFF;
+
+        float r1 = ((secondaryArgb >>> 16) & 0xFF) / 255.0f;
+        float g1 = ((secondaryArgb >>> 8) & 0xFF) / 255.0f;
+        float b1 = (secondaryArgb & 0xFF) / 255.0f;
+
+        float r2 = ((highlightArgb >>> 16) & 0xFF) / 255.0f;
+        float g2 = ((highlightArgb >>> 8) & 0xFF) / 255.0f;
+        float b2 = (highlightArgb & 0xFF) / 255.0f;
+        float a2 = ((highlightArgb >>> 24) & 0xFF) / 255.0f;
+
+        float mx = w > 0.0 ? Mth.clamp((float) ((mouseX - x) / w), 0.0f, 1.0f) : 0.5f;
+        float my = h > 0.0 ? Mth.clamp((float) ((mouseY - y) / h), 0.0f, 1.0f) : 0.5f;
+        float mode = Math.max(0, effectMode);
+
+        int i1 = mesh.vec2(x, y).local2(x, y).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, mode, safeReveal, safeIntensity)
+                .vec4(r1, g1, b1, shaderBackdropRadius)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, mx, my, seed)
+                .vec4((float) backdropX, (float) backdropY, (float) backdropW, (float) backdropH)
+                .next();
+        int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, mode, safeReveal, safeIntensity)
+                .vec4(r1, g1, b1, shaderBackdropRadius)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, mx, my, seed)
+                .vec4((float) backdropX, (float) backdropY, (float) backdropW, (float) backdropH)
+                .next();
+        int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, mode, safeReveal, safeIntensity)
+                .vec4(r1, g1, b1, shaderBackdropRadius)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, mx, my, seed)
+                .vec4((float) backdropX, (float) backdropY, (float) backdropW, (float) backdropH)
+                .next();
+        int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(r0, g0, b0, a0)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, mode, safeReveal, safeIntensity)
+                .vec4(r1, g1, b1, shaderBackdropRadius)
+                .vec4(r2, g2, b2, a2)
+                .vec4(time, mx, my, seed)
+                .vec4((float) backdropX, (float) backdropY, (float) backdropW, (float) backdropH)
+                .next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    /**
+     * Procedural vanilla-widget material. One quad owns button chrome, hover lighting and slider track/fill.
+     * Warp affects only geometry/local coordinates; the material remains in the same logical widget space.
+     */
+    public void widgetSurface(double x, double y, double w, double h,
+                              float radius, int kind, float hover, boolean enabled, boolean focused,
+                              int primaryArgb, int secondaryArgb, int accentArgb,
+                              float time, float mouseX, float mouseY,
+                              float value, boolean dragging, float softness, float globalAlpha,
+                              float gradientAngleDeg, float gradientIntensity, float fieldStrength) {
+        if (w <= 0.0 || h <= 0.0) return;
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.WIDGET_SURFACE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int pa = (primaryArgb >>> 24) & 0xFF;
+        int pr = (primaryArgb >>> 16) & 0xFF;
+        int pg = (primaryArgb >>> 8) & 0xFF;
+        int pb = primaryArgb & 0xFF;
+        float sr = ((secondaryArgb >>> 16) & 0xFF) / 255.0f;
+        float sg = ((secondaryArgb >>> 8) & 0xFF) / 255.0f;
+        float sb = (secondaryArgb & 0xFF) / 255.0f;
+        float sa = ((secondaryArgb >>> 24) & 0xFF) / 255.0f;
+        float ar = ((accentArgb >>> 16) & 0xFF) / 255.0f;
+        float ag = ((accentArgb >>> 8) & 0xFF) / 255.0f;
+        float ab = (accentArgb & 0xFF) / 255.0f;
+        float aa = ((accentArgb >>> 24) & 0xFF) / 255.0f;
+        float mx = w > 0.0 ? Mth.clamp((float) ((mouseX - x) / w), 0.0f, 1.0f) : 0.5f;
+        float my = h > 0.0 ? Mth.clamp((float) ((mouseY - y) / h), 0.0f, 1.0f) : 0.5f;
+        float safeHover = Mth.clamp(hover, 0.0f, 1.0f);
+        float safeValue = Mth.clamp(value, 0.0f, 1.0f);
+        float safeAlpha = Mth.clamp(globalAlpha, 0.0f, 1.0f);
+        float safeAngle = ((gradientAngleDeg % 360.0f) + 360.0f) % 360.0f;
+        float angleRad = (float) Math.toRadians(safeAngle);
+        float gradientDirX = (float) Math.cos(angleRad);
+        float gradientDirY = (float) Math.sin(angleRad);
+        float safeGradientIntensity = Mth.clamp(gradientIntensity, 0.0f, 1.0f);
+        float safeFieldStrength = Mth.clamp(fieldStrength, 0.0f, 1.0f);
+
+        int i1 = appendWidgetSurfaceVertex(mesh, x, y, pr, pg, pb, pa, x, y, w, h, radius, kind, safeHover, enabled, sr, sg, sb, sa, ar, ag, ab, aa, time, mx, my, focused, safeValue, dragging, softness, safeAlpha, gradientDirX, gradientDirY, safeGradientIntensity, safeFieldStrength);
+        int i2 = appendWidgetSurfaceVertex(mesh, x, y + h, pr, pg, pb, pa, x, y, w, h, radius, kind, safeHover, enabled, sr, sg, sb, sa, ar, ag, ab, aa, time, mx, my, focused, safeValue, dragging, softness, safeAlpha, gradientDirX, gradientDirY, safeGradientIntensity, safeFieldStrength);
+        int i3 = appendWidgetSurfaceVertex(mesh, x + w, y + h, pr, pg, pb, pa, x, y, w, h, radius, kind, safeHover, enabled, sr, sg, sb, sa, ar, ag, ab, aa, time, mx, my, focused, safeValue, dragging, softness, safeAlpha, gradientDirX, gradientDirY, safeGradientIntensity, safeFieldStrength);
+        int i4 = appendWidgetSurfaceVertex(mesh, x + w, y, pr, pg, pb, pa, x, y, w, h, radius, kind, safeHover, enabled, sr, sg, sb, sa, ar, ag, ab, aa, time, mx, my, focused, safeValue, dragging, softness, safeAlpha, gradientDirX, gradientDirY, safeGradientIntensity, safeFieldStrength);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendWidgetSurfaceVertex(MeshBuilder mesh, double px, double py,
+                                                  int r, int g, int b, int a,
+                                                  double x, double y, double w, double h,
+                                                  float radius, int kind, float hover, boolean enabled,
+                                                  float sr, float sg, float sb, float sa,
+                                                  float ar, float ag, float ab, float aa,
+                                                  float time, float mouseX, float mouseY, boolean focused,
+                                                  float value, boolean dragging, float softness, float globalAlpha,
+                                                  float gradientDirX, float gradientDirY, float gradientIntensity, float fieldStrength) {
+        return mesh.vec2(px, py).local2(px, py).color(r, g, b, a)
+                .vec4((float) x, (float) y, (float) w, (float) h)
+                .vec4(radius, kind, hover, enabled ? 1.0f : 0.0f)
+                .vec4(sr, sg, sb, sa)
+                .vec4(ar, ag, ab, aa)
+                .vec4(time, mouseX, mouseY, focused ? 1.0f : 0.0f)
+                .vec4(value, dragging ? 1.0f : 0.0f, softness, globalAlpha)
+                .vec4(gradientDirX, gradientDirY, gradientIntensity, fieldStrength)
+                .next();
+    }
+
+    /** Draws the main-menu glass wall: per-cell blur/refraction with an optional chamfered cutout. */
+    public void mainMenuHoneycombGlass(double x, double y, double w, double h,
+                                     float cellRadius,
+                                     float gap,
+                                     float lineWidth,
+                                     float opacity,
+                                     float mouseX,
+                                     float mouseY,
+                                     float lightRadius,
+                                     float originX,
+                                     float originY,
+                                     int baseArgb,
+                                     int highlightArgb) {
+        mainMenuHoneycombGlass(x, y, w, h, cellRadius, gap, lineWidth, opacity,
+                mouseX, mouseY, lightRadius, originX, originY, baseArgb, highlightArgb,
+                0f, 0f, 0f, 0f, 0f, 0f, UiHoneycombMaterialSpec.SMOKED_MACHINED);
+    }
+
+    /**
+     * Variant used by menu windows. The cutout is evaluated in the honeycomb shader, so both the
+     * lattice and its cursor-light/refraction disappear under the exact chamfered window silhouette.
+     */
+    public void mainMenuHoneycombGlass(double x, double y, double w, double h,
+                                     float cellRadius,
+                                     float gap,
+                                     float lineWidth,
+                                     float opacity,
+                                     float mouseX,
+                                     float mouseY,
+                                     float lightRadius,
+                                     float originX,
+                                     float originY,
+                                     int baseArgb,
+                                     int highlightArgb,
+                                     float cutoutX,
+                                     float cutoutY,
+                                     float cutoutW,
+                                      float cutoutH,
+                                      float cutoutCut,
+                                      float cutoutEnabled) {
+        mainMenuHoneycombGlass(x, y, w, h, cellRadius, gap, lineWidth, opacity,
+                mouseX, mouseY, lightRadius, originX, originY, baseArgb, highlightArgb,
+                cutoutX, cutoutY, cutoutW, cutoutH, cutoutCut, cutoutEnabled,
+                UiHoneycombMaterialSpec.SMOKED_MACHINED);
+    }
+
+    public void mainMenuHoneycombGlass(double x, double y, double w, double h,
+                                      float cellRadius,
+                                      float gap,
+                                      float lineWidth,
+                                      float opacity,
+                                      float mouseX,
+                                      float mouseY,
+                                      float lightRadius,
+                                      float originX,
+                                      float originY,
+                                      int baseArgb,
+                                      int highlightArgb,
+                                      float cutoutX,
+                                      float cutoutY,
+                                      float cutoutW,
+                                      float cutoutH,
+                                      float cutoutCut,
+                                      float cutoutEnabled,
+                                      UiHoneycombMaterialSpec material) {
+        if (w <= 0.0 || h <= 0.0 || cellRadius <= 0.0f || opacity <= 0.001f) return;
+        UiHoneycombMaterialSpec safeMaterial = material != null
+                ? material
+                : UiHoneycombMaterialSpec.SMOKED_MACHINED;
+
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft == null) return;
+        RenderTarget framebuffer = minecraft.gameRenderer.mainRenderTarget();
+        if (framebuffer == null || framebuffer.getColorTextureView() == null) return;
+        GpuSampler sampler = PostProcessManager.getSampler();
+        if (sampler == null) return;
+
+        UiShape backdropShape = UiShape.rect(x, y, w, h);
+        UiBackdropRequest backdrop = UiBackdropRequest.capturedSceneGlass(
+                backdropShape.bounds(), UiBlurQuality.ULTRA, 2.35f);
+        effect(UiEffectSpec.liquidGlass(backdropShape, 0.0, 0.0, 0.0, baseArgb, backdrop));
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateBlur(
+                UiBatchType.MAIN_MENU_HONEYCOMB,
+                framebuffer.getColorTextureView(),
+                sampler,
+                BlurQuality.ULTRA,
+                2.35f,
+                backdrop);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int ba = (baseArgb >>> 24) & 0xFF;
+        int br = (baseArgb >>> 16) & 0xFF;
+        int bg = (baseArgb >>> 8) & 0xFF;
+        int bb = baseArgb & 0xFF;
+        float hr = ((highlightArgb >>> 16) & 0xFF) / 255.0f;
+        float hg = ((highlightArgb >>> 8) & 0xFF) / 255.0f;
+        float hb = (highlightArgb & 0xFF) / 255.0f;
+        float ha = ((highlightArgb >>> 24) & 0xFF) / 255.0f;
+
+        int i1 = appendMainMenuHoneycombVertex(mesh, x, y, br, bg, bb, ba, x, y, w, h,
+                cellRadius, gap, lineWidth, opacity, mouseX, mouseY, lightRadius,
+                 hr, hg, hb, ha, originX, originY,
+                 cutoutX, cutoutY, cutoutW, cutoutH, cutoutCut, cutoutEnabled, safeMaterial);
+        int i2 = appendMainMenuHoneycombVertex(mesh, x, y + h, br, bg, bb, ba, x, y, w, h,
+                cellRadius, gap, lineWidth, opacity, mouseX, mouseY, lightRadius,
+                 hr, hg, hb, ha, originX, originY,
+                 cutoutX, cutoutY, cutoutW, cutoutH, cutoutCut, cutoutEnabled, safeMaterial);
+        int i3 = appendMainMenuHoneycombVertex(mesh, x + w, y + h, br, bg, bb, ba, x, y, w, h,
+                cellRadius, gap, lineWidth, opacity, mouseX, mouseY, lightRadius,
+                 hr, hg, hb, ha, originX, originY,
+                 cutoutX, cutoutY, cutoutW, cutoutH, cutoutCut, cutoutEnabled, safeMaterial);
+        int i4 = appendMainMenuHoneycombVertex(mesh, x + w, y, br, bg, bb, ba, x, y, w, h,
+                cellRadius, gap, lineWidth, opacity, mouseX, mouseY, lightRadius,
+                 hr, hg, hb, ha, originX, originY,
+                 cutoutX, cutoutY, cutoutW, cutoutH, cutoutCut, cutoutEnabled, safeMaterial);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendMainMenuHoneycombVertex(MeshBuilder mesh,
+                                                      double px, double py,
+                                                      int r, int g, int b, int a,
+                                                      double x, double y, double w, double h,
+                                                      float cellRadius, float gap, float lineWidth, float opacity,
+                                                      float mouseX, float mouseY, float lightRadius,
+                                                      float highlightR, float highlightG, float highlightB, float highlightA,
+                                                      float originX, float originY,
+                                                       float cutoutX, float cutoutY, float cutoutW, float cutoutH,
+                                                       float cutoutCut, float cutoutEnabled,
+                                                       UiHoneycombMaterialSpec material) {
+        return mesh.vec2(px, py).local2(px, py).color(r, g, b, a)
+                .vec4(x, y, w, h)
+                .vec4(cellRadius, gap, lineWidth, opacity)
+                .vec4(mouseX, mouseY, lightRadius, material.highlightCompression())
+                .vec4(highlightR, highlightG, highlightB, highlightA)
+                .vec4(originX, originY, cutoutCut, cutoutEnabled)
+                .vec4(cutoutX, cutoutY, cutoutW, cutoutH)
+                .vec4(material.mode().shaderId(), material.cellBlurMix(), material.sceneDetail(),
+                        material.tintAbsorption())
+                .next();
+    }
+
+    public void roundedRectStrokeGradient(double x, double y, double w, double h,
+                                          float radius, float softness, float thickness,
+                                          int startArgb, int endArgb, float angleDeg) {
+        roundedRectStrokeGradient(x, y, w, h, radius, 0.0f, thickness, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void roundedRectStrokeGradient(double x, double y, double w, double h,
+                                          float radius, float thickness,
+                                          int startArgb, int endArgb, float angleDeg) {
+        roundedRectStrokeGradient(x, y, w, h, radius, 0.0f, thickness, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void roundedRectStrokeGradient(double x, double y, double w, double h,
+                                          float radius, float softness, float thickness,
+                                          int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) w, (float) h, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        roundedRectStrokeGradientQuad(x, y, w, h, radius, 0.0f, thickness, gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void roundedRectStrokeGradient(double x, double y, double w, double h,
+                                          float radius, float thickness,
+                                          int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        roundedRectStrokeGradient(x, y, w, h, radius, 0.0f, thickness, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void roundedRectGlow(double x, double y, double w, double h,
+                                float radius, float softness, float glow, int argb) {
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.GLOW, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+
+        double expand = glow;
+        double gx = x - expand;
+        double gy = y - expand;
+        double gw = w + expand * 2.0f;
+        double gh = h + expand * 2.0f;
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGlowVertex(mesh, gx, gy, argb, bounds, 1f, clampedRadius, softness, glow, 0f, 0f);
+        int i2 = appendGlowVertex(mesh, gx, gy + gh, argb, bounds, 1f, clampedRadius, softness, glow, 0f, 0f);
+        int i3 = appendGlowVertex(mesh, gx + gw, gy + gh, argb, bounds, 1f, clampedRadius, softness, glow, 0f, 0f);
+        int i4 = appendGlowVertex(mesh, gx + gw, gy, argb, bounds, 1f, clampedRadius, softness, glow, 0f, 0f);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectShadow(double x, double y, double w, double h,
+                                  float radius, float softness, float spread, int argb) {
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+
+        double expandX = 2.0f;
+        double expandY = spread + 2.0f;
+        double gx = x - expandX;
+        double gw = w + expandX * 2.0f;
+        double gy = y;
+        double gh = h + expandY;
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, gx, gy, argb, bounds,
+                UiFastShapeParams.KIND_SHADOW, clampedRadius, softness, spread);
+        int i2 = appendGeometryVertex(mesh, gx, gy + gh, argb, bounds,
+                UiFastShapeParams.KIND_SHADOW, clampedRadius, softness, spread);
+        int i3 = appendGeometryVertex(mesh, gx + gw, gy + gh, argb, bounds,
+                UiFastShapeParams.KIND_SHADOW, clampedRadius, softness, spread);
+        int i4 = appendGeometryVertex(mesh, gx + gw, gy, argb, bounds,
+                UiFastShapeParams.KIND_SHADOW, clampedRadius, softness, spread);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectSoftShadow(double x, double y, double w, double h,
+                                      float radius, float blur, float innerAlpha, int argb) {
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+
+        double expand = blur * 2.0;
+        double sx = x - expand;
+        double sy = y - expand;
+        double sw = w + expand * 2.0;
+        double sh = h + expand * 2.0;
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, sx, sy, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i2 = appendGeometryVertex(mesh, sx, sy + sh, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i3 = appendGeometryVertex(mesh, sx + sw, sy + sh, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i4 = appendGeometryVertex(mesh, sx + sw, sy, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    /**
+     * Draws a soft rounded shadow whose color is a true linear gradient across the shadow quad.
+     * The existing soft-shadow SDF still controls opacity; vertex color interpolation supplies
+     * the gradient without stacking multiple shadow lobes.
+     */
+    public void roundedRectSoftShadowGradient(double x, double y, double w, double h,
+                                              float radius, float blur, float innerAlpha,
+                                              int startArgb, int endArgb, float angleDeg) {
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        double expand = blur * 2.0;
+        double sx = x - expand;
+        double sy = y - expand;
+        double sw = w + expand * 2.0;
+        double sh = h + expand * 2.0;
+
+        computeLinearGradientColors((float) sw, (float) sh, startArgb, endArgb, angleDeg, 0.0f, gradientTmp);
+        int topLeft = gradientTmp[0];
+        int topRight = gradientTmp[1];
+        int bottomRight = gradientTmp[2];
+        int bottomLeft = gradientTmp[3];
+
+        int tlA = (topLeft >>> 24) & 0xFF;
+        int tlR = (topLeft >>> 16) & 0xFF;
+        int tlG = (topLeft >>> 8) & 0xFF;
+        int tlB = topLeft & 0xFF;
+        int trA = (topRight >>> 24) & 0xFF;
+        int trR = (topRight >>> 16) & 0xFF;
+        int trG = (topRight >>> 8) & 0xFF;
+        int trB = topRight & 0xFF;
+        int brA = (bottomRight >>> 24) & 0xFF;
+        int brR = (bottomRight >>> 16) & 0xFF;
+        int brG = (bottomRight >>> 8) & 0xFF;
+        int brB = bottomRight & 0xFF;
+        int blA = (bottomLeft >>> 24) & 0xFF;
+        int blR = (bottomLeft >>> 16) & 0xFF;
+        int blG = (bottomLeft >>> 8) & 0xFF;
+        int blB = bottomLeft & 0xFF;
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, sx, sy, topLeft, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i2 = appendGeometryVertex(mesh, sx, sy + sh, bottomLeft, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i3 = appendGeometryVertex(mesh, sx + sw, sy + sh, bottomRight, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        int i4 = appendGeometryVertex(mesh, sx + sw, sy, topRight, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, radius, blur, innerAlpha);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    private void squircleSoftShadow(double x, double y, double w, double h,
+                                   UiSquircleProfile profile, float blur, float innerAlpha, int argb) {
+        UiSquircleProfile safe = profile != null ? profile : UiSquircleProfile.STANDARD;
+        squircleSoftShadow(x, y, w, h, safe.exponent(), blur, innerAlpha, argb);
+    }
+
+    private void squircleSoftShadow(double x, double y, double w, double h,
+                                   float exponent, float blur, float innerAlpha, int argb) {
+        UiBoxShape shape = UiBoxShape.squircle(x, y, w, h, exponent);
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        double expand = blur * 2.0;
+        double sx = x - expand;
+        double sy = y - expand;
+        double sw = w + expand * 2.0;
+        double sh = h + expand * 2.0;
+        float encodedShape = -shape.squircleExponent();
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, sx, sy, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, encodedShape, blur, innerAlpha);
+        int i2 = appendGeometryVertex(mesh, sx, sy + sh, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, encodedShape, blur, innerAlpha);
+        int i3 = appendGeometryVertex(mesh, sx + sw, sy + sh, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, encodedShape, blur, innerAlpha);
+        int i4 = appendGeometryVertex(mesh, sx + sw, sy, argb, bounds,
+                UiFastShapeParams.KIND_SOFT_SHADOW, encodedShape, blur, innerAlpha);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    public void radialGlowMasked(double x, double y, double w, double h,
+                                 float radius, float softness,
+                                 float glowRadius, float cx, float cy,
+                                 int argb) {
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.GLOW, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGlowVertex(mesh, x, y, argb, bounds, 2f, clampedRadius, softness, glowRadius, cx, cy);
+        int i2 = appendGlowVertex(mesh, x, y + h, argb, bounds, 2f, clampedRadius, softness, glowRadius, cx, cy);
+        int i3 = appendGlowVertex(mesh, x + w, y + h, argb, bounds, 2f, clampedRadius, softness, glowRadius, cx, cy);
+        int i4 = appendGlowVertex(mesh, x + w, y, argb, bounds, 2f, clampedRadius, softness, glowRadius, cx, cy);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectGradientQuad(double x, double y, double w, double h,
+                                        float radius, float softness,
+                                        int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        roundedRectMaskedQuad(x, y, w, h, x, y, w, h, radius, softness, cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    public void roundedRectGradientQuad(double x, double y, double w, double h,
+                                        float radius,
+                                        int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        roundedRectGradientQuad(x, y, w, h, radius, 0.0f, cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    public void roundedRectMaskedQuad(double x, double y, double w, double h,
+                                      double maskX, double maskY, double maskW, double maskH,
+                                      float radius, float softness,
+                                      int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shape(UiShape.roundedRect(maskX, maskY, maskW, maskH, radius), UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft));
+        boolean auto = beginAutoBatch();
+        boolean warped = RenderWarpStack.active();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        float clampedRadius = clampRoundedRadius(radius, maskW, maskH);
+        UiFastShapeParams params = UiFastShapeParams.rounded(clampedRadius, UiStroke.NONE, true, softness);
+        UiRect bounds = UiRect.of(maskX, maskY, maskW, maskH);
+
+        int i1;
+        int i2;
+        int i3;
+        int i4;
+        if (warped) {
+            appendWarpedSdfGrid(mesh, x, y, w, h,
+                    cTopLeft, cTopRight, cBottomRight, cBottomLeft,
+                    bounds, params.kind(), params.shape(), params.strokeWidth(), params.flags());
+            endAutoBatch(auto);
+            return;
+        } else {
+            mesh.ensureQuadCapacity();
+            i1 = appendShapeVertex(mesh, x, y, cTopLeft, bounds, params);
+            i2 = appendShapeVertex(mesh, x, y + h, cBottomLeft, bounds, params);
+            i3 = appendShapeVertex(mesh, x + w, y + h, cBottomRight, bounds, params);
+            i4 = appendShapeVertex(mesh, x + w, y, cTopRight, bounds, params);
+        }
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectStrokeGradientQuad(double x, double y, double w, double h,
+                                              float radius, float softness, float thickness,
+                                              int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shapeStroke(UiShape.roundedRect(x, y, w, h, radius), UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        boolean warped = RenderWarpStack.active();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+        float stroke = Math.max(0.0f, thickness);
+        UiFastShapeParams params = UiFastShapeParams.rounded(clampedRadius, UiStroke.of(stroke), false, softness);
+        UiRect bounds = UiRect.of(x, y, w, h);
+
+        int i1;
+        int i2;
+        int i3;
+        int i4;
+        if (warped) {
+            appendWarpedSdfGrid(mesh, x, y, w, h,
+                    cTopLeft, cTopRight, cBottomRight, cBottomLeft,
+                    bounds, params.kind(), params.shape(), params.strokeWidth(), params.flags());
+            endAutoBatch(auto);
+            return;
+        } else {
+            mesh.ensureQuadCapacity();
+            i1 = appendShapeVertex(mesh, x, y, cTopLeft, bounds, params);
+            i2 = appendShapeVertex(mesh, x, y + h, cBottomLeft, bounds, params);
+            i3 = appendShapeVertex(mesh, x + w, y + h, cBottomRight, bounds, params);
+            i4 = appendShapeVertex(mesh, x + w, y, cTopRight, bounds, params);
+        }
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedRectStrokeGradientQuad(double x, double y, double w, double h,
+                                              float radius, float thickness,
+                                              int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        roundedRectStrokeGradientQuad(x, y, w, h, radius, 0.0f, thickness,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    public void roundedTexRect(double x, double y, double w, double h,
+                               float radius, float softness,
+                               double texX1, double texY1, double texX2, double texY2,
+                               int argb, GpuTextureView samplerView, GpuSampler sampler) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        if (samplerView == null || sampler == null) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.roundedRect(x, y, w, h, radius), UiPaint.solid(argb),
+                (float) texX1, (float) texY1, (float) texX2, (float) texY2, false));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED_SHAPE, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+        int i1 = mesh.vec2(x, y).raw2(texX1, texY1).local2(x, y).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 0f, 0f).next();
+        int i2 = mesh.vec2(x, y + h).raw2(texX1, texY2).local2(x, y + h).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 0f, 0f).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(texX2, texY2).local2(x + w, y + h).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 0f, 0f).next();
+        int i4 = mesh.vec2(x + w, y).raw2(texX2, texY1).local2(x + w, y).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 0f, 0f).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedTexMaskRect(double x, double y, double w, double h,
+                                   float radius, float softness,
+                                   double texX1, double texY1, double texX2, double texY2,
+                                   int argb, GpuTextureView samplerView, GpuSampler sampler) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        if (samplerView == null || sampler == null) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.roundedRect(x, y, w, h, radius), UiPaint.solid(argb),
+                (float) texX1, (float) texY1, (float) texX2, (float) texY2, true));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED_SHAPE, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+        int i1 = mesh.vec2(x, y).raw2(texX1, texY1).local2(x, y).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i2 = mesh.vec2(x, y + h).raw2(texX1, texY2).local2(x, y + h).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(texX2, texY2).local2(x + w, y + h).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i4 = mesh.vec2(x + w, y).raw2(texX2, texY1).local2(x + w, y).color(r, g, b, a).vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedTexMaskRectGradient(double x, double y, double w, double h,
+                                           float radius, float softness,
+                                           double texX1, double texY1, double texX2, double texY2,
+                                           int startArgb, int endArgb, float angleDeg,
+                                           GpuTextureView samplerView, GpuSampler sampler) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        if (samplerView == null || sampler == null) return;
+
+        recordUi(new UiTextureDrawCommand(samplerView, sampler, UiShape.roundedRect(x, y, w, h, radius),
+                UiPaint.linear(startArgb, endArgb, angleDeg, 0.0f),
+                (float) texX1, (float) texY1, (float) texX2, (float) texY2, true));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.TEXTURED_SHAPE, samplerView, sampler);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        computeLinearGradientColors((float) w, (float) h, startArgb, endArgb, angleDeg, 0.0f, gradientTmp);
+        int tl = gradientTmp[0];
+        int tr = gradientTmp[1];
+        int br = gradientTmp[2];
+        int bl = gradientTmp[3];
+        float clampedRadius = clampRoundedRadius(radius, w, h);
+        int i1 = mesh.vec2(x, y).raw2(texX1, texY1).local2(x, y)
+                .color((tl >>> 16) & 0xFF, (tl >>> 8) & 0xFF, tl & 0xFF, (tl >>> 24) & 0xFF)
+                .vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i2 = mesh.vec2(x, y + h).raw2(texX1, texY2).local2(x, y + h)
+                .color((bl >>> 16) & 0xFF, (bl >>> 8) & 0xFF, bl & 0xFF, (bl >>> 24) & 0xFF)
+                .vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(texX2, texY2).local2(x + w, y + h)
+                .color((br >>> 16) & 0xFF, (br >>> 8) & 0xFF, br & 0xFF, (br >>> 24) & 0xFF)
+                .vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        int i4 = mesh.vec2(x + w, y).raw2(texX2, texY1).local2(x + w, y)
+                .color((tr >>> 16) & 0xFF, (tr >>> 8) & 0xFF, tr & 0xFF, (tr >>> 24) & 0xFF)
+                .vec4(x, y, w, h).vec4(clampedRadius, softness, 1f, 0f).next();
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void roundedTexRect(double x, double y, double w, double h,
+                               float radius, float softness, int argb,
+                               Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || textureId == null) return;
+        AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+        if (tex == null) return;
+        GpuTextureView view = tex.getTextureView();
+        GpuSampler sampler = tex.getSampler();
+        if (view == null || sampler == null) return;
+        roundedTexRect(x, y, w, h, radius, 0.0f, 0, 0, 1, 1, argb, view, sampler);
+    }
+
+    public void roundedTexRect(double x, double y, double w, double h,
+                               float radius, int argb,
+                               Identifier textureId) {
+        roundedTexRect(x, y, w, h, radius, 0.0f, argb, textureId);
+    }
+
+    public void roundedTexMaskRect(double x, double y, double w, double h,
+                                   float radius, float softness, int argb,
+                                   Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || textureId == null) return;
+        AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+        if (tex == null) return;
+        GpuTextureView view = tex.getTextureView();
+        GpuSampler sampler = tex.getSampler();
+        if (view == null || sampler == null) return;
+        roundedTexMaskRect(x, y, w, h, radius, 0.0f, 0, 0, 1, 1, argb, view, sampler);
+    }
+
+    public void roundedTexMaskRect(double x, double y, double w, double h,
+                                   float radius, int argb,
+                                   Identifier textureId) {
+        roundedTexMaskRect(x, y, w, h, radius, 0.0f, argb, textureId);
+    }
+
+    public void roundedTexMaskRectGradient(double x, double y, double w, double h,
+                                           float radius, float softness,
+                                           int startArgb, int endArgb, float angleDeg,
+                                           Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || textureId == null) return;
+        AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+        if (tex == null) return;
+        GpuTextureView view = tex.getTextureView();
+        GpuSampler sampler = tex.getSampler();
+        if (view == null || sampler == null) return;
+        roundedTexMaskRectGradient(x, y, w, h, radius, softness, 0, 0, 1, 1,
+                startArgb, endArgb, angleDeg, view, sampler);
+    }
+
+    public void roundedTexRect(double x, double y, double w, double h,
+                               float radius, float softness,
+                               double texX1, double texY1, double texX2, double texY2,
+                               int argb, Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || textureId == null) return;
+        AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+        if (tex == null) return;
+        GpuTextureView view = tex.getTextureView();
+        GpuSampler sampler = tex.getSampler();
+        if (view == null || sampler == null) return;
+        roundedTexRect(x, y, w, h, radius, 0.0f, texX1, texY1, texX2, texY2, argb, view, sampler);
+    }
+
+    public void roundedTexMaskRect(double x, double y, double w, double h,
+                                   float radius, float softness,
+                                   double texX1, double texY1, double texX2, double texY2,
+                                   int argb, Identifier textureId) {
+        if (!textured) {
+            throw new IllegalStateException("Renderer2D is not configured for textures.");
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || textureId == null) return;
+        AbstractTexture tex = mc.getTextureManager().getTexture(textureId);
+        if (tex == null) return;
+        GpuTextureView view = tex.getTextureView();
+        GpuSampler sampler = tex.getSampler();
+        if (view == null || sampler == null) return;
+        roundedTexMaskRect(x, y, w, h, radius, 0.0f, texX1, texY1, texX2, texY2, argb, view, sampler);
+    }
+
+    public void texQuad(double x, double y, double width, double height, int argb) {
+        texQuad(x, y, width, height, 0, 0, 1, 1, argb);
+    }
+
+    public void quadGradient(double x, double y, double width, double height,
+                             int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        quad(x, y, width, height, cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    public void quadGradientLinear(double x, double y, double width, double height,
+                                   int startArgb, int endArgb, float angleDeg) {
+        quadGradientLinear(x, y, width, height, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void quadGradientLinear(double x, double y, double width, double height,
+                                   int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) width, (float) height, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        quad(x, y, width, height, gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void quadStrokeGradientLinear(double x, double y, double width, double height,
+                                         float thickness,
+                                         int startArgb, int endArgb, float angleDeg) {
+        quadStrokeGradientLinear(x, y, width, height, thickness, startArgb, endArgb, angleDeg, 0.0f);
+    }
+
+    public void quadStrokeGradientLinear(double x, double y, double width, double height,
+                                         float thickness,
+                                         int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        roundedRectStrokeGradient(x, y, width, height, 0.0f, 0.0f, thickness, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void chamferedRect(double x, double y, double width, double height, double chamfer, int argb) {
+        chamferedRectQuad(x, y, width, height, chamfer, argb, argb, argb, argb);
+    }
+
+    public void chamferedRect(double x, double y, double width, double height,
+                              double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                              int argb) {
+        chamferedRectQuad(x, y, width, height,
+                chamferTL, chamferTR, chamferBR, chamferBL,
+                argb, argb, argb, argb);
+    }
+
+    public void chamferedRectGradient(double x, double y, double width, double height,
+                                      double chamfer, int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) width, (float) height, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        chamferedRectQuad(x, y, width, height, chamfer, gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void chamferedRectGradient(double x, double y, double width, double height,
+                                      double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                                      int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) width, (float) height, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        chamferedRectQuad(x, y, width, height,
+                chamferTL, chamferTR, chamferBR, chamferBL,
+                gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void chamferedRectStroke(double x, double y, double width, double height,
+                                    double chamfer, double thickness, int argb) {
+        chamferedRectStrokeQuad(x, y, width, height, chamfer, thickness, argb, argb, argb, argb);
+    }
+
+    public void chamferedRectStroke(double x, double y, double width, double height,
+                                    double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                                    double thickness, int argb) {
+        chamferedRectStrokeQuad(x, y, width, height,
+                chamferTL, chamferTR, chamferBR, chamferBL,
+                thickness, argb, argb, argb, argb);
+    }
+
+    public void chamferedRectStrokeGradient(double x, double y, double width, double height,
+                                            double chamfer, double thickness,
+                                            int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) width, (float) height, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        chamferedRectStrokeQuad(x, y, width, height, chamfer, thickness,
+                gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    public void chamferedRectStrokeGradient(double x, double y, double width, double height,
+                                            double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                                            double thickness,
+                                            int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        computeLinearGradientColors((float) width, (float) height, startArgb, endArgb, angleDeg, offsetPx, gradientTmp);
+        chamferedRectStrokeQuad(x, y, width, height,
+                chamferTL, chamferTR, chamferBR, chamferBL,
+                thickness, gradientTmp[0], gradientTmp[1], gradientTmp[2], gradientTmp[3]);
+    }
+
+    private void chamferedRectQuad(double x, double y, double w, double h,
+                                  double chamfer,
+                                  int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        chamferedRectQuad(x, y, w, h,
+                chamfer, chamfer, chamfer, chamfer,
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    private void chamferedRectQuad(double x, double y, double w, double h,
+                                  double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                                  int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        normalizeChamfers(w, h,
+                (float) chamferTL,
+                (float) chamferTR,
+                (float) chamferBR,
+                (float) chamferBL,
+                cornerRadiiTmp);
+        chamferedRectQuadAxes(x, y, w, h,
+                cornerRadiiTmp[0], cornerRadiiTmp[0],
+                cornerRadiiTmp[1], cornerRadiiTmp[1],
+                cornerRadiiTmp[2], cornerRadiiTmp[2],
+                cornerRadiiTmp[3], cornerRadiiTmp[3],
+                cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    private void chamferedRectQuadAxes(double x, double y, double w, double h,
+                                      double chamferTLX, double chamferTLY,
+                                      double chamferTRX, double chamferTRY,
+                                      double chamferBRX, double chamferBRY,
+                                      double chamferBLX, double chamferBLY,
+                                      int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shape(UiShape.chamferedRectAxes(x, y, w, h, chamferTLX, chamferTLY, chamferTRX, chamferTRY, chamferBRX, chamferBRY, chamferBLX, chamferBLY),
+                UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int tlA = (cTopLeft >>> 24) & 0xFF;
+        int tlR = (cTopLeft >>> 16) & 0xFF;
+        int tlG = (cTopLeft >>> 8) & 0xFF;
+        int tlB = cTopLeft & 0xFF;
+        int trA = (cTopRight >>> 24) & 0xFF;
+        int trR = (cTopRight >>> 16) & 0xFF;
+        int trG = (cTopRight >>> 8) & 0xFF;
+        int trB = cTopRight & 0xFF;
+        int brA = (cBottomRight >>> 24) & 0xFF;
+        int brR = (cBottomRight >>> 16) & 0xFF;
+        int brG = (cBottomRight >>> 8) & 0xFF;
+        int brB = cBottomRight & 0xFF;
+        int blA = (cBottomLeft >>> 24) & 0xFF;
+        int blR = (cBottomLeft >>> 16) & 0xFF;
+        int blG = (cBottomLeft >>> 8) & 0xFF;
+        int blB = cBottomLeft & 0xFF;
+
+        float tlX = clampChamferAxis(chamferTLX, w);
+        float trX = clampChamferAxis(chamferTRX, w);
+        float brX = clampChamferAxis(chamferBRX, w);
+        float blX = clampChamferAxis(chamferBLX, w);
+        float tlY = clampChamferAxis(chamferTLY, h);
+        float trY = clampChamferAxis(chamferTRY, h);
+        float brY = clampChamferAxis(chamferBRY, h);
+        float blY = clampChamferAxis(chamferBLY, h);
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, x, y, cTopLeft, bounds,
+                UiFastShapeParams.KIND_CHAMFER, 0f, 1f, 0f,
+                tlX, trX, brX, blX, tlY, trY, brY, blY);
+        int i2 = appendGeometryVertex(mesh, x, y + h, cBottomLeft, bounds,
+                UiFastShapeParams.KIND_CHAMFER, 0f, 1f, 0f,
+                tlX, trX, brX, blX, tlY, trY, brY, blY);
+        int i3 = appendGeometryVertex(mesh, x + w, y + h, cBottomRight, bounds,
+                UiFastShapeParams.KIND_CHAMFER, 0f, 1f, 0f,
+                tlX, trX, brX, blX, tlY, trY, brY, blY);
+        int i4 = appendGeometryVertex(mesh, x + w, y, cTopRight, bounds,
+                UiFastShapeParams.KIND_CHAMFER, 0f, 1f, 0f,
+                tlX, trX, brX, blX, tlY, trY, brY, blY);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    private void chamferedRectStrokeQuad(double x, double y, double w, double h,
+                                        double chamfer, double thickness,
+                                        int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        chamferedRectStrokeQuad(x, y, w, h,
+                chamfer, chamfer, chamfer, chamfer,
+                thickness, cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+    }
+
+    private void chamferedRectStrokeQuad(double x, double y, double w, double h,
+                                        double chamferTL, double chamferTR, double chamferBR, double chamferBL,
+                                        double thickness,
+                                        int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        shapeStroke(UiShape.chamferedRect(x, y, w, h, chamferTL, chamferTR, chamferBR, chamferBL),
+                UiPaint.corners(cTopLeft, cTopRight, cBottomRight, cBottomLeft), UiStroke.of(thickness));
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int tlA = (cTopLeft >>> 24) & 0xFF;
+        int tlR = (cTopLeft >>> 16) & 0xFF;
+        int tlG = (cTopLeft >>> 8) & 0xFF;
+        int tlB = cTopLeft & 0xFF;
+        int trA = (cTopRight >>> 24) & 0xFF;
+        int trR = (cTopRight >>> 16) & 0xFF;
+        int trG = (cTopRight >>> 8) & 0xFF;
+        int trB = cTopRight & 0xFF;
+        int brA = (cBottomRight >>> 24) & 0xFF;
+        int brR = (cBottomRight >>> 16) & 0xFF;
+        int brG = (cBottomRight >>> 8) & 0xFF;
+        int brB = cBottomRight & 0xFF;
+        int blA = (cBottomLeft >>> 24) & 0xFF;
+        int blR = (cBottomLeft >>> 16) & 0xFF;
+        int blG = (cBottomLeft >>> 8) & 0xFF;
+        int blB = cBottomLeft & 0xFF;
+        normalizeChamfers(w, h,
+                (float) chamferTL,
+                (float) chamferTR,
+                (float) chamferBR,
+                (float) chamferBL,
+                cornerRadiiTmp);
+        float stroke = (float) Math.max(0.0, thickness);
+
+        UiRect bounds = UiRect.of(x, y, w, h);
+        int i1 = appendGeometryVertex(mesh, x, y, cTopLeft, bounds,
+                UiFastShapeParams.KIND_CHAMFER, stroke, 0f, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3],
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i2 = appendGeometryVertex(mesh, x, y + h, cBottomLeft, bounds,
+                UiFastShapeParams.KIND_CHAMFER, stroke, 0f, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3],
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i3 = appendGeometryVertex(mesh, x + w, y + h, cBottomRight, bounds,
+                UiFastShapeParams.KIND_CHAMFER, stroke, 0f, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3],
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        int i4 = appendGeometryVertex(mesh, x + w, y, cTopRight, bounds,
+                UiFastShapeParams.KIND_CHAMFER, stroke, 0f, 0f,
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3],
+                cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3]);
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    public void notchedRect(double x, double y, double width, double height,
+                            double notchWidth, double notchDepth, int argb) {
+        int count = buildNotchedRect(rectShapeTmp, x, y, width, height, notchWidth, notchDepth);
+        polygon(rectShapeTmp, count, argb);
+    }
+
+    public void notchedRectGradient(double x, double y, double width, double height,
+                                    double notchWidth, double notchDepth,
+                                    int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        int count = buildNotchedRect(rectShapeTmp, x, y, width, height, notchWidth, notchDepth);
+        polygonGradient(rectShapeTmp, count, x, y, width, height, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+    public void notchedRectStroke(double x, double y, double width, double height,
+                                  double notchWidth, double notchDepth, double thickness, int argb) {
+        int count = buildNotchedRect(rectShapeTmp, x, y, width, height, notchWidth, notchDepth);
+        polygonStroke(rectShapeTmp, count, thickness, true, argb);
+    }
+
+    public void notchedRectStrokeGradient(double x, double y, double width, double height,
+                                          double notchWidth, double notchDepth, double thickness,
+                                          int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        int count = buildNotchedRect(rectShapeTmp, x, y, width, height, notchWidth, notchDepth);
+        polylineLinearGradient(rectShapeTmp, count, thickness, true,
+                x, y, width, height, startArgb, endArgb, angleDeg, offsetPx, false);
+    }
+
+    public void beveledRect(double x, double y, double width, double height,
+                            double bevel, int fillArgb, int highlightArgb, int shadowArgb) {
+        chamferedRect(x, y, width, height, bevel, fillArgb);
+        double t = Math.max(1.0, Math.min(Math.min(Math.abs(width), Math.abs(height)) * 0.25, bevel));
+        connectorTmp[0] = x + bevel;
+        connectorTmp[1] = y;
+        connectorTmp[2] = x + width - bevel;
+        connectorTmp[3] = y;
+        connectorTmp[4] = x + width;
+        connectorTmp[5] = y + bevel;
+        polyline(connectorTmp, 3, t, false, highlightArgb, false);
+        connectorTmp[0] = x + width;
+        connectorTmp[1] = y + height - bevel;
+        connectorTmp[2] = x + width - bevel;
+        connectorTmp[3] = y + height;
+        connectorTmp[4] = x + bevel;
+        connectorTmp[5] = y + height;
+        connectorTmp[6] = x;
+        connectorTmp[7] = y + height - bevel;
+        polyline(connectorTmp, 4, t, false, shadowArgb, false);
+    }
+
+    public void beveledRectStroke(double x, double y, double width, double height,
+                                  double bevel, double thickness, int argb) {
+        chamferedRectStroke(x, y, width, height, bevel, thickness, argb);
+    }
+
+    public void beveledRectGradient(double x, double y, double width, double height,
+                                    double bevel, int startArgb, int endArgb,
+                                    int highlightArgb, int shadowArgb, float angleDeg, float offsetPx) {
+        chamferedRectGradient(x, y, width, height, bevel, startArgb, endArgb, angleDeg, offsetPx);
+        double t = Math.max(1.0, Math.min(Math.min(Math.abs(width), Math.abs(height)) * 0.25, bevel));
+        connectorTmp[0] = x + bevel;
+        connectorTmp[1] = y;
+        connectorTmp[2] = x + width - bevel;
+        connectorTmp[3] = y;
+        connectorTmp[4] = x + width;
+        connectorTmp[5] = y + bevel;
+        polyline(connectorTmp, 3, t, false, highlightArgb, false);
+        connectorTmp[0] = x + width;
+        connectorTmp[1] = y + height - bevel;
+        connectorTmp[2] = x + width - bevel;
+        connectorTmp[3] = y + height;
+        connectorTmp[4] = x + bevel;
+        connectorTmp[5] = y + height;
+        connectorTmp[6] = x;
+        connectorTmp[7] = y + height - bevel;
+        polyline(connectorTmp, 4, t, false, shadowArgb, false);
+    }
+
+    public void beveledRectStrokeGradient(double x, double y, double width, double height,
+                                          double bevel, double thickness,
+                                          int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        chamferedRectStrokeGradient(x, y, width, height, bevel, thickness, startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+
+    public void connector(double x1, double y1, double x2, double y2, double thickness, Color color) {
+        connector(x1, y1, x2, y2, thickness, color != null ? color.getRGB() : 0);
+    }
+
+    public void connector(double x1, double y1, double x2, double y2, double thickness, int argb) {
+        connectorTmp[0] = x1;
+        connectorTmp[1] = y1;
+        connectorTmp[2] = x2;
+        connectorTmp[3] = y2;
+        polyline(connectorTmp, 2, thickness, false, argb, true);
+    }
+
+    public void connectorGradient(double x1, double y1, double x2, double y2,
+                                  double thickness, int startArgb, int endArgb) {
+        connectorTmp[0] = x1;
+        connectorTmp[1] = y1;
+        connectorTmp[2] = x2;
+        connectorTmp[3] = y2;
+        polylineGradient(connectorTmp, 2, thickness, false, startArgb, endArgb, true);
+    }
+
+    public void cable(double x1, double y1, double x2, double y2,
+                      double thickness, int outerArgb, int innerArgb) {
+        connector(x1, y1, x2, y2, thickness + 2.0, outerArgb);
+        connector(x1, y1, x2, y2, Math.max(1.0, thickness), innerArgb);
+    }
+
+    public void cableGradient(double x1, double y1, double x2, double y2,
+                              double thickness, int outerStartArgb, int outerEndArgb,
+                              int innerStartArgb, int innerEndArgb) {
+        connectorGradient(x1, y1, x2, y2, thickness + 2.0, outerStartArgb, outerEndArgb);
+        connectorGradient(x1, y1, x2, y2, Math.max(1.0, thickness), innerStartArgb, innerEndArgb);
+    }
+
+    /**
+     * Connects two rounded rectangles by their visible border, not by their centers.
+     * The connector uses the centers only as the direction vector used to find each border anchor.
+     */
+    public void roundedRectConnector(double x1, double y1, double w1, double h1, double radius1,
+                                     double x2, double y2, double w2, double h2, double radius2,
+                                     double thickness, int argb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        connector(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3], thickness, argb);
+    }
+
+    public void roundedRectConnectorGradient(double x1, double y1, double w1, double h1, double radius1,
+                                             double x2, double y2, double w2, double h2, double radius2,
+                                             double thickness, int startArgb, int endArgb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        connectorGradient(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3],
+                thickness, startArgb, endArgb);
+    }
+
+    /**
+     * Draws a Bezier node graph edge between two rounded rectangles, anchored on their borders.
+     */
+    public void roundedRectNodeGraphEdge(double x1, double y1, double w1, double h1, double radius1,
+                                         double x2, double y2, double w2, double h2, double radius2,
+                                         double thickness, int argb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        nodeGraphEdge(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3], thickness, argb);
+    }
+
+    public void roundedRectNodeGraphEdgeGradient(double x1, double y1, double w1, double h1, double radius1,
+                                                 double x2, double y2, double w2, double h2, double radius2,
+                                                 double thickness, int startArgb, int endArgb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        nodeGraphEdgeGradient(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3],
+                thickness, startArgb, endArgb);
+    }
+
+    /**
+     * Draws an orthogonal connector between two rounded rectangles, anchored on their borders.
+     */
+    public void roundedRectOrthogonalConnector(double x1, double y1, double w1, double h1, double radius1,
+                                               double x2, double y2, double w2, double h2, double radius2,
+                                               double thickness, int argb) {
+        roundedRectOrthogonalConnector(x1, y1, w1, h1, radius1, x2, y2, w2, h2, radius2,
+                (x1 + w1 * 0.5 + x2 + w2 * 0.5) * 0.5, thickness, argb);
+    }
+
+    /**
+     * Draws an orthogonal connector between two rounded rectangles, anchored on their borders.
+     */
+    public void roundedRectOrthogonalConnector(double x1, double y1, double w1, double h1, double radius1,
+                                               double x2, double y2, double w2, double h2, double radius2,
+                                               double midX, double thickness, int argb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        orthogonalConnector(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3],
+                midX, thickness, argb);
+    }
+
+    public void roundedRectOrthogonalConnectorGradient(double x1, double y1, double w1, double h1, double radius1,
+                                                       double x2, double y2, double w2, double h2, double radius2,
+                                                       double midX, double thickness, int startArgb, int endArgb) {
+        roundedRectAnchor(connectorAnchorTmp, 0, x1, y1, w1, h1, radius1, x2 + w2 * 0.5, y2 + h2 * 0.5);
+        roundedRectAnchor(connectorAnchorTmp, 2, x2, y2, w2, h2, radius2, x1 + w1 * 0.5, y1 + h1 * 0.5);
+        orthogonalConnectorGradient(connectorAnchorTmp[0], connectorAnchorTmp[1], connectorAnchorTmp[2], connectorAnchorTmp[3],
+                midX, thickness, startArgb, endArgb);
+    }
+
+    public void orthogonalConnector(double x1, double y1, double x2, double y2,
+                                    double thickness, int argb) {
+        orthogonalConnector(x1, y1, x2, y2, (x1 + x2) * 0.5, thickness, argb);
+    }
+
+    public void orthogonalConnector(double x1, double y1, double x2, double y2,
+                                    double midX, double thickness, int argb) {
+        connectorTmp[0] = x1;
+        connectorTmp[1] = y1;
+        connectorTmp[2] = midX;
+        connectorTmp[3] = y1;
+        connectorTmp[4] = midX;
+        connectorTmp[5] = y2;
+        connectorTmp[6] = x2;
+        connectorTmp[7] = y2;
+        polyline(connectorTmp, 4, thickness, false, argb, true);
+    }
+
+    public void orthogonalConnectorGradient(double x1, double y1, double x2, double y2,
+                                            double midX, double thickness, int startArgb, int endArgb) {
+        connectorTmp[0] = x1;
+        connectorTmp[1] = y1;
+        connectorTmp[2] = midX;
+        connectorTmp[3] = y1;
+        connectorTmp[4] = midX;
+        connectorTmp[5] = y2;
+        connectorTmp[6] = x2;
+        connectorTmp[7] = y2;
+        polylineGradient(connectorTmp, 4, thickness, false, startArgb, endArgb, true);
+    }
+
+    public void bezierConnector(double x1, double y1,
+                                double cx1, double cy1,
+                                double cx2, double cy2,
+                                double x2, double y2,
+                                double thickness,
+                                int argb) {
+        bezierConnector(x1, y1, cx1, cy1, cx2, cy2, x2, y2, 20, thickness, argb);
+    }
+
+    public void bezierConnector(double x1, double y1,
+                                double cx1, double cy1,
+                                double cx2, double cy2,
+                                double x2, double y2,
+                                int segments,
+                                double thickness,
+                                int argb) {
+        if (textured) throw new IllegalStateException("Bezier drawing is supported only on Renderer2D.COLOR.");
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+        connectorTmp[0] = x1; connectorTmp[1] = y1;
+        connectorTmp[2] = cx1; connectorTmp[3] = cy1;
+        connectorTmp[4] = cx2; connectorTmp[5] = cy2;
+        connectorTmp[6] = x2; connectorTmp[7] = y2;
+        path(UiShape.bezier(connectorTmp, 4), UiPaint.solid(argb), UiStroke.of(t).withRoundCapsAndJoins(), false);
+        pathDrawApi.drawBezier(UI_BATCHER, alpha, x1, y1, cx1, cy1, cx2, cy2, x2, y2,
+                UiPathStrokeLayer.solid(t, argb));
+    }
+
+    public void bezierConnectorGradient(double x1, double y1,
+                                        double cx1, double cy1,
+                                        double cx2, double cy2,
+                                        double x2, double y2,
+                                        double thickness,
+                                        int startArgb,
+                                        int endArgb) {
+        bezierConnectorGradient(x1, y1, cx1, cy1, cx2, cy2, x2, y2, 0, thickness, startArgb, endArgb);
+    }
+
+    public void bezierConnectorGradient(double x1, double y1,
+                                        double cx1, double cy1,
+                                        double cx2, double cy2,
+                                        double x2, double y2,
+                                        int segments,
+                                        double thickness,
+                                        int startArgb,
+                                        int endArgb) {
+        if (textured) throw new IllegalStateException("Bezier drawing is supported only on Renderer2D.COLOR.");
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+        connectorTmp[0] = x1; connectorTmp[1] = y1;
+        connectorTmp[2] = cx1; connectorTmp[3] = cy1;
+        connectorTmp[4] = cx2; connectorTmp[5] = cy2;
+        connectorTmp[6] = x2; connectorTmp[7] = y2;
+        path(UiShape.bezier(connectorTmp, 4), UiPaint.corners(startArgb, endArgb, endArgb, startArgb),
+                UiStroke.of(t).withRoundCapsAndJoins(), false);
+        pathDrawApi.drawBezier(UI_BATCHER, alpha, x1, y1, cx1, cy1, cx2, cy2, x2, y2,
+                UiPathStrokeLayer.gradient(t, startArgb, endArgb));
+    }
+
+    public void nodeGraphEdge(double x1, double y1, double x2, double y2, double thickness, int argb) {
+        double dx = Math.abs(x2 - x1);
+        double c = Math.max(24.0, dx * 0.5);
+        bezierConnector(x1, y1, x1 + c, y1, x2 - c, y2, x2, y2, thickness, argb);
+    }
+
+    public void nodeGraphEdgeGradient(double x1, double y1, double x2, double y2,
+                                      double thickness, int startArgb, int endArgb) {
+        double dx = Math.abs(x2 - x1);
+        double c = Math.max(24.0, dx * 0.5);
+        bezierConnectorGradient(x1, y1, x1 + c, y1, x2 - c, y2, x2, y2, thickness, startArgb, endArgb);
+    }
+
+    public void spline(double[] points, int pointCount, double thickness, boolean closed, Color color) {
+        spline(points, pointCount, thickness, closed, color != null ? color.getRGB() : 0);
+    }
+
+    public void spline(double[] points, int pointCount, double thickness, boolean closed, int argb) {
+        if (textured) throw new IllegalStateException("Spline drawing is supported only on Renderer2D.COLOR.");
+        if (points == null || pointCount < 2) return;
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+        path(UiShape.spline(points, pointCount, closed), UiPaint.solid(argb), UiStroke.of(t).withRoundCapsAndJoins(), false);
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, UiPathCurve.SPLINE, closed,
+                null, null, UiPathStrokeLayer.solid(t, argb));
+    }
+
+    public void splineGradient(double[] points, int pointCount, double thickness, boolean closed,
+                               int startArgb, int endArgb) {
+        if (textured) throw new IllegalStateException("Spline drawing is supported only on Renderer2D.COLOR.");
+        if (points == null || pointCount < 2) return;
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+        path(UiShape.spline(points, pointCount, closed), UiPaint.corners(startArgb, endArgb, endArgb, startArgb),
+                UiStroke.of(t).withRoundCapsAndJoins(), false);
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, UiPathCurve.SPLINE, closed,
+                null, null, UiPathStrokeLayer.gradient(t, startArgb, endArgb));
+    }
+
+    /**
+     * Continuous spline area using the exact same resolved top boundary as spline()/splineGradient().
+     * Intended for streaming graphs where fill/glow/stroke must stay geometrically aligned.
+     */
+    public void splineAreaGradient(double[] points, int pointCount, double baseline,
+                                   int topStartArgb, int topEndArgb,
+                                   int bottomStartArgb, int bottomEndArgb) {
+        if (textured) throw new IllegalStateException("Spline area drawing is supported only on Renderer2D.COLOR.");
+        if (points == null || pointCount < 2) return;
+        path(UiShape.spline(points, pointCount, false), UiPaint.corners(topStartArgb, topEndArgb, bottomEndArgb, bottomStartArgb),
+                UiStroke.NONE, true);
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, UiPathCurve.SPLINE, false,
+                new UiPathAreaFill(baseline, topStartArgb, topEndArgb, bottomStartArgb, bottomEndArgb),
+                null, null);
+    }
+
+    public void texQuad(double x, double y, double width, double height,
+                        double texX1, double texY1, double texX2, double texY2,
+                        int argb) {
+        recordUi(new UiShapeCommand(UiShape.rect(x, y, width, height), UiPaint.solid(argb), UiStroke.NONE, true));
+        if (texturedTriangles == null) return;
+        texturedTriangles.alpha = alpha;
+        texturedTriangles.ensureQuadCapacity();
+
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int i1 = texturedTriangles.vec2(x, y).raw2(texX1, texY1).color(r, g, b, a).next();
+        int i2 = texturedTriangles.vec2(x, y + height).raw2(texX1, texY2).color(r, g, b, a).next();
+        int i3 = texturedTriangles.vec2(x + width, y + height).raw2(texX2, texY2).color(r, g, b, a).next();
+        int i4 = texturedTriangles.vec2(x + width, y).raw2(texX2, texY1).color(r, g, b, a).next();
+
+        texturedTriangles.quad(i1, i2, i3, i4);
+    }
+
+    /** Liquid glass over the same bounded implicit field used by {@link #compoundSdf}. */
+    public void liquidGlassCompound(UiCompoundSdf compound,
+                                    int tintArgb,
+                                    float glassAlpha,
+                                    float blurAlpha,
+                                    LiquidGlassPreset preset) {
+        if (compound == null) return;
+        LiquidGlassPreset safe = preset != null ? preset : LiquidGlassPreset.BALANCED;
+        UiRect bounds = compound.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0) return;
+
+        float effectiveDistort = safe.distortPx * clamp01(glassAlpha);
+        UiBackdropRequest backdrop = liquidGlassBackdrop(
+                bounds, UiBlurQuality.LIQUID_GLASS, LIQUID_GLASS_KAWASE_OFFSET_PX,
+                safe.thicknessPx, effectiveDistort, 0.0f);
+        // The effect command needs the capture bounds; the exact implicit mask is evaluated by the
+        // liquid-glass batch itself and intentionally stays backend-local.
+        effect(UiEffectSpec.liquidGlass(
+                UiShape.rect(x, y, w, h), compound.smoothing(), safe.thicknessPx, safe.distortPx,
+                tintArgb, backdrop, backdropBlend));
+
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return;
+        RenderTarget fb = mc.gameRenderer.mainRenderTarget();
+        if (fb == null) return;
+        GpuTextureView src = fb.getColorTextureView();
+        if (src == null) return;
+        GpuSampler sampler = PostProcessManager.getSampler();
+        if (sampler == null) return;
+
+        float[] payload = new float[16];
+        int shapeMode;
+        int sourceCount;
+        if (compound.mode() == UiCompoundSdf.Mode.ISLAND_BLOB) {
+            shapeMode = 2;
+            sourceCount = compound.circleCount();
+            for (int i = 0; i < sourceCount; i++) {
+                UiCompoundSdf.Circle circle = compound.circle(i);
+                int o = i * 4;
+                payload[o] = (float) (circle.centerX() - x);
+                payload[o + 1] = (float) (circle.centerY() - y);
+                payload[o + 2] = (float) circle.radius();
+            }
+        } else {
+            shapeMode = 3;
+            sourceCount = 2;
+            UiRect first = compound.firstBox();
+            UiRect second = compound.secondBox();
+            payload[0] = first.x() - bounds.x();
+            payload[1] = first.y() - bounds.y();
+            payload[2] = first.width();
+            payload[3] = first.height();
+            payload[4] = second.x() - bounds.x();
+            payload[5] = second.y() - bounds.y();
+            payload[6] = second.width();
+            payload[7] = second.height();
+            if (compound.mode() == UiCompoundSdf.Mode.SMOOTH_SQUIRCLE_UNION) {
+                shapeMode = 4;
+                payload[8] = compound.firstSquircleExponent();
+                payload[9] = compound.secondSquircleExponent();
+            } else {
+                payload[8] = compound.firstRadius();
+                payload[9] = compound.secondRadius();
+            }
+        }
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateBlur(UiBatchType.LIQUID_GLASS, src, sampler,
+                DEFAULT_LIQUID_GLASS_BLUR_QUALITY, LIQUID_GLASS_KAWASE_OFFSET_PX, backdrop,
+                backdropBlend);
+        if (batch != null) batch.includeGlassBounds(bounds);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int a = (tintArgb >>> 24) & 0xFF;
+        int r = (tintArgb >>> 16) & 0xFF;
+        int g = (tintArgb >>> 8) & 0xFF;
+        int b = tintArgb & 0xFF;
+        UiGlassOpticsSpec optics = materialOptics(liquidGlassMaterial);
+        int finalA = Math.round(255.0f * clamp01(glassAlpha));
+        float alphaPayload = materialTintStrength(liquidGlassMaterial);
+        float mix = 0.0f;
+        float packedDistort = packLiquidGlassPayload(effectiveDistort, 2.0f, clamp01(blurAlpha), false);
+
+        int i1 = appendLiquidGlassCompoundVertex(mesh, x, y, mix, packedDistort, r, g, b, finalA, bounds,
+                payload, sourceCount, compound.smoothing(), shapeMode, safe, alphaPayload, liquidGlassMaterial);
+        int i2 = appendLiquidGlassCompoundVertex(mesh, x, y + h, mix, packedDistort, r, g, b, finalA, bounds,
+                payload, sourceCount, compound.smoothing(), shapeMode, safe, alphaPayload, liquidGlassMaterial);
+        int i3 = appendLiquidGlassCompoundVertex(mesh, x + w, y + h, mix, packedDistort, r, g, b, finalA, bounds,
+                payload, sourceCount, compound.smoothing(), shapeMode, safe, alphaPayload, liquidGlassMaterial);
+        int i4 = appendLiquidGlassCompoundVertex(mesh, x + w, y, mix, packedDistort, r, g, b, finalA, bounds,
+                payload, sourceCount, compound.smoothing(), shapeMode, safe, alphaPayload, liquidGlassMaterial);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendLiquidGlassCompoundVertex(MeshBuilder mesh,
+                                                       double x,
+                                                       double y,
+                                                       float fresnelMix,
+                                                       float packedDistort,
+                                                       int r,
+                                                       int g,
+                                                       int b,
+                                                       int a,
+                                                       UiRect bounds,
+                                                       float[] payload,
+                                                       int sourceCount,
+                                                       float smoothing,
+                                                       int shapeMode,
+                                                       LiquidGlassPreset preset,
+                                                       float alphaPayload,
+                                                       UiLiquidGlassMaterial material) {
+        UiGlassOpticsSpec optics = materialOptics(material);
+        float p0x = payload[0], p0y = payload[1], p0z = payload[2], p0w = payload[3];
+        float p3x, p3y, p3z, p3w;
+        float p4x, p4y, p4z, p4w;
+        float p5x, p5y, p5z, p5w;
+        if (shapeMode == 2) {
+            p3x = payload[4]; p3y = payload[5]; p3z = payload[6]; p3w = payload[7];
+            p4x = payload[8]; p4y = payload[9]; p4z = payload[10]; p4w = payload[11];
+            p5x = payload[12]; p5y = payload[13]; p5z = payload[14]; p5w = payload[15];
+        } else {
+            p3x = payload[4]; p3y = payload[5]; p3z = payload[6]; p3w = payload[7];
+            p4x = payload[8]; p4y = payload[9]; p4z = 0.0f; p4w = 0.0f;
+            p5x = p5y = p5z = p5w = 0.0f;
+        }
+        return mesh.vec2(x, y).raw2(fresnelMix, packedDistort).local2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(p0x, p0y, p0z, p0w)
+                .vec4(preset.thicknessPx, preset.fresnelPower, clamp01(preset.fresnelAlpha), alphaPayload)
+                .vec4(p3x, p3y, p3z, p3w)
+                .vec4(p4x, p4y, p4z, p4w)
+                .vec4(p5x, p5y, p5z, p5w)
+                .vec4(sourceCount, smoothing, packGlassOpticalFlags(optics), shapeMode)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(material),
+                        materialInnerGlowSize(material), packLiquidGlassRgb(materialInnerGlowArgb(material)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(material).x(), materialInteraction(material).y(),
+                        materialInteraction(material).dx(), materialInteraction(material).dy())
+                .vec4(materialInteraction(material).activity(), materialInteraction(material).press(),
+                        materialInteraction(material).open(), glassMagnificationFlag(optics, materialInteraction(material)))
+                .next();
+    }
+
+    public void liquidGlassCircle(double cx, double cy, double radius,
+                                  float softness,
+                                  int tintArgb,
+                                  float globalAlpha,
+                                  float fresnelPower,
+                                  float fresnelAlpha,
+                                  float baseAlpha,
+                                  float fresnelMix,
+                                  float distortPx,
+                                  float squirclePower) {
+        if (radius <= 0.0) return;
+        double size = radius * 2.0;
+        liquidGlassRect(cx - radius, cy - radius, size, size,
+                (float) radius, softness,
+                tintArgb,
+                globalAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower);
+    }
+
+    private UiBackdropRequest liquidGlassBackdrop(UiRect bounds,
+                                                   UiBlurQuality sceneQuality,
+                                                   float sceneOffsetPx,
+                                                   float thickness,
+                                                   float distortStrength,
+                                                   float prismStrength) {
+        UiRect blurBounds = liquidGlassBlurBounds(bounds);
+        UiBackdropRequest.SceneSource sceneSource = liquidGlassSceneSourceOverride;
+        UiBackdropRequest request = switch (sceneSource != null
+                ? sceneSource
+                : UiBackdropRequest.SceneSource.CAPTURED_SCENE) {
+            case UI_UNDERLAY -> UiBackdropRequest.uiUnderlayGlass(
+                    blurBounds, sceneQuality, sceneOffsetPx);
+            case CURRENT_TARGET -> UiBackdropRequest.currentTargetGlass(
+                    blurBounds, sceneQuality, sceneOffsetPx);
+            case STACKED_LENSES -> UiBackdropRequest.stackedGlass(
+                    blurBounds, sceneQuality, sceneOffsetPx);
+            case CAPTURED_SCENE, NONE -> UiBackdropRequest.capturedSceneGlass(
+                    blurBounds, sceneQuality, sceneOffsetPx);
+        };
+        UiBackdropRequest.UiUnderlayMode mode = liquidGlassUiUnderlayOverride;
+        if (mode == null) {
+            mode = UiBackdropRequest.UiUnderlayMode.NONE;
+        }
+        if (mode == UiBackdropRequest.UiUnderlayMode.NONE) return request;
+
+        UiBackdropRequest.BlurParameters uiBlur = mode == UiBackdropRequest.UiUnderlayMode.BLUR
+                ? UiBackdropRequest.BlurParameters.of(liquidGlassUiBlurQuality, liquidGlassUiBlurOffsetPx)
+                : UiBackdropRequest.BlurParameters.NONE;
+        return request.withUiUnderlay(mode, uiBlur, liquidGlassUiMix);
+    }
+
+    private UiRect liquidGlassBlurBounds(UiRect bounds) {
+        if (bounds == null) return null;
+
+        ViewportContext viewport = ViewportContext.current();
+        if (viewport == null) return bounds;
+
+        float framebufferWidth = Math.max(1.0f, viewport.framebufferWidth());
+        float framebufferHeight = Math.max(1.0f, viewport.framebufferHeight());
+        float logicalWidth = Math.max(1.0f, viewport.width());
+        float logicalHeight = Math.max(1.0f, viewport.height());
+
+        float frostedJitterFramebufferPx = Math.min(4.0f,
+                Math.max(0.0f, materialFrostedJitter(liquidGlassMaterial)));
+        UiGlassOpticsSpec optics = materialOptics(liquidGlassMaterial);
+        float bevelReach = (Math.abs(optics.refraction()) + Math.abs(optics.bevelDepth()))
+                * (1.0f + optics.chromaticAberration())
+                * Math.max(logicalWidth, logicalHeight);
+        float lensRadius = 0.5f * (float) Math.hypot(bounds.width(), bounds.height());
+        float zoomReach = lensRadius * Math.abs(1.0f / optics.magnification() - 1.0f);
+        float tiltReach = 0.05f * (float) Math.hypot(
+                Math.tan(Math.toRadians(optics.tiltYDegrees())) * logicalWidth,
+                Math.tan(Math.toRadians(optics.tiltXDegrees())) * logicalHeight);
+        UiGlassInteraction interaction = materialInteraction(liquidGlassMaterial);
+        float motionReach = interaction.local() && optics.interactionStrength() > 0.0f
+                ? (float) Math.hypot(interaction.dx() * bounds.width(),
+                interaction.dy() * bounds.height()) + 6.0f * optics.chromaticAberration()
+                : 0.0f;
+        float liquidReachLogicalPx = bevelReach + zoomReach + tiltReach + motionReach;
+        float liquidReachFramebufferPx = liquidReachLogicalPx
+                / Math.max(Math.max(logicalWidth / framebufferWidth, logicalHeight / framebufferHeight), 0.0001f);
+        float chromaticReachFramebufferPx = optics.chromaticAberration() > 0.001f
+                ? Math.min(24.0f, 10.0f + optics.chromaticAberration() * 42.0f)
+                : 0.0f;
+        float blurSampleReachFramebufferPx = Math.max(
+                Math.max(frostedJitterFramebufferPx, liquidReachFramebufferPx),
+                chromaticReachFramebufferPx) + 2.0f;
+
+        float logicalPerFramebufferX = logicalWidth / framebufferWidth;
+        float logicalPerFramebufferY = logicalHeight / framebufferHeight;
+        float logicalPadding = blurSampleReachFramebufferPx
+                * Math.max(logicalPerFramebufferX, logicalPerFramebufferY);
+        if (!(logicalPadding > 0.0f) || !Float.isFinite(logicalPadding)) return bounds;
+
+        return new UiRect(
+                bounds.x() - logicalPadding,
+                bounds.y() - logicalPadding,
+                bounds.width() + logicalPadding * 2.0f,
+                bounds.height() + logicalPadding * 2.0f
+        );
+    }
+
+    public void liquidGlassSquircle(UiBoxShape squircle,
+                                    int tintArgb,
+                                    float glassAlpha,
+                                    float blurAlpha,
+                                    LiquidGlassPreset preset) {
+        if (squircle == null || !squircle.isSquircle()) return;
+        UiRect b = squircle.bounds();
+        liquidGlassRect(b.x(), b.y(), b.width(), b.height(), 0.0f,
+                tintArgb, glassAlpha, blurAlpha, preset, -squircle.squircleExponent());
+    }
+
+    /** Liquid glass using the same analytic mask as a convex panel primitive. */
+    public void liquidGlassPrimitive(UiPrimitive primitive,
+                                     int tintArgb,
+                                     float glassAlpha,
+                                     float blurAlpha,
+                                     LiquidGlassPreset preset) {
+        LiquidGlassPreset safe = preset != null ? preset : LiquidGlassPreset.BALANCED;
+        liquidGlassPrimitive(primitive, tintArgb, glassAlpha, blurAlpha,
+                safe.thicknessPx, safe.fresnelPower, safe.fresnelAlpha,
+                safe.baseAlpha, safe.fresnelMix, safe.distortPx, 0.0f, 0.0f);
+    }
+
+    private void liquidGlassPrimitive(UiPrimitive primitive,
+                                     int tintArgb,
+                                     float glassAlpha,
+                                     float blurAlpha,
+                                     float thickness,
+                                     float fresnelPower,
+                                     float fresnelAlpha,
+                                     float baseAlpha,
+                                     float fresnelMix,
+                                     float distortPx,
+                                     float prismStrength,
+                                     float prismPhase) {
+        liquidGlassPrimitive(primitive, tintArgb, glassAlpha, blurAlpha,
+                thickness, fresnelPower, fresnelAlpha, baseAlpha, fresnelMix, distortPx,
+                prismStrength, prismPhase, DEFAULT_LIQUID_GLASS_BLUR_QUALITY, LIQUID_GLASS_KAWASE_OFFSET_PX);
+    }
+
+    /** Same liquid-glass primitive with an explicit prepared Kawase blur profile. */
+    public void liquidGlassPrimitive(UiPrimitive primitive,
+                                     int tintArgb,
+                                     float glassAlpha,
+                                     float blurAlpha,
+                                     float thickness,
+                                     float fresnelPower,
+                                     float fresnelAlpha,
+                                     float baseAlpha,
+                                     float fresnelMix,
+                                     float distortPx,
+                                     float prismStrength,
+                                     float prismPhase,
+                                     BlurQuality blurQuality,
+                                     float blurOffsetPx) {
+        if (primitive == null || !primitive.shaderEligible()) {
+            throw new IllegalArgumentException("Liquid-glass primitives require a convex shape with 3..8 points");
+        }
+        UiRect bounds = primitive.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0) return;
+
+        BlurQuality preparedBlurQuality = blurQuality != null ? blurQuality : DEFAULT_LIQUID_GLASS_BLUR_QUALITY;
+        float preparedBlurOffset = Float.isFinite(blurOffsetPx)
+                ? Math.max(0.0f, blurOffsetPx)
+                : LIQUID_GLASS_KAWASE_OFFSET_PX;
+        UiShape glassShape = UiShape.polyline(primitive.points(), primitive.pointCount(), true);
+        UiBackdropRequest backdrop = liquidGlassBackdrop(
+                bounds, UiBlurQuality.fromRenderer(preparedBlurQuality), preparedBlurOffset,
+                thickness, distortPx, prismStrength);
+        effect(UiEffectSpec.liquidGlass(
+                glassShape, primitive.rounding(), thickness, distortPx, tintArgb, backdrop, backdropBlend));
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return;
+        RenderTarget fb = mc.gameRenderer.mainRenderTarget();
+        if (fb == null) return;
+        GpuTextureView src = fb.getColorTextureView();
+        if (src == null) return;
+        GpuSampler sampler = PostProcessManager.getSampler();
+        if (sampler == null) return;
+
+        Arrays.fill(primitivePointsTmp, 0.0f);
+        for (int i = 0; i < primitive.pointCount(); i++) {
+            primitivePointsTmp[i * 2] = primitive.localX(i);
+            primitivePointsTmp[i * 2 + 1] = primitive.localY(i);
+        }
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateBlur(UiBatchType.LIQUID_GLASS, src, sampler,
+                preparedBlurQuality, preparedBlurOffset, backdrop, backdropBlend);
+        if (batch != null) batch.includeGlassBounds(new UiRect((float)x, (float)y, (float)w, (float)h));
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+
+        int a = (tintArgb >>> 24) & 0xFF;
+        int r = (tintArgb >>> 16) & 0xFF;
+        int g = (tintArgb >>> 8) & 0xFF;
+        int b = tintArgb & 0xFF;
+        UiGlassOpticsSpec optics = materialOptics(liquidGlassMaterial);
+        int finalA = Math.round(255.0f * clamp01(glassAlpha));
+        float mix = 0.0f;
+        float packedDistort = packLiquidGlassPayload(distortPx, 2.0f, clamp01(blurAlpha), false);
+        float fa = clamp01(fresnelAlpha);
+        float ba = materialTintStrength(liquidGlassMaterial);
+        float rounding = Math.min(primitive.rounding(), (float) Math.min(w, h) * 0.45f);
+
+        int i1 = appendLiquidGlassPrimitiveVertex(mesh, x, y, mix, packedDistort, r, g, b, finalA,
+                bounds, primitivePointsTmp, primitive.pointCount(), rounding, thickness, fresnelPower, fa, ba, liquidGlassMaterial);
+        int i2 = appendLiquidGlassPrimitiveVertex(mesh, x, y + h, mix, packedDistort, r, g, b, finalA,
+                bounds, primitivePointsTmp, primitive.pointCount(), rounding, thickness, fresnelPower, fa, ba, liquidGlassMaterial);
+        int i3 = appendLiquidGlassPrimitiveVertex(mesh, x + w, y + h, mix, packedDistort, r, g, b, finalA,
+                bounds, primitivePointsTmp, primitive.pointCount(), rounding, thickness, fresnelPower, fa, ba, liquidGlassMaterial);
+        int i4 = appendLiquidGlassPrimitiveVertex(mesh, x + w, y, mix, packedDistort, r, g, b, finalA,
+                bounds, primitivePointsTmp, primitive.pointCount(), rounding, thickness, fresnelPower, fa, ba, liquidGlassMaterial);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendLiquidGlassPrimitiveVertex(MeshBuilder mesh,
+                                                        double x,
+                                                        double y,
+                                                        float fresnelMix,
+                                                        float packedDistort,
+                                                        int r,
+                                                        int g,
+                                                        int b,
+                                                        int a,
+                                                        UiRect bounds,
+                                                        float[] points,
+                                                        int pointCount,
+                                                        float rounding,
+                                                        float thickness,
+                                                        float fresnelPower,
+                                                        float fresnelAlpha,
+                                                        float baseAlpha,
+                                                        UiLiquidGlassMaterial material) {
+        UiGlassOpticsSpec optics = materialOptics(material);
+        return mesh.vec2(x, y).raw2(fresnelMix, packedDistort).local2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(points[0], points[1], points[2], points[3])
+                .vec4(thickness, fresnelPower, fresnelAlpha, baseAlpha)
+                .vec4(points[4], points[5], points[6], points[7])
+                .vec4(points[8], points[9], points[10], points[11])
+                .vec4(points[12], points[13], points[14], points[15])
+                .vec4(pointCount, rounding, packGlassOpticalFlags(optics), 1.0f)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(material),
+                        materialInnerGlowSize(material), packLiquidGlassRgb(materialInnerGlowArgb(material)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(material).x(), materialInteraction(material).y(),
+                        materialInteraction(material).dx(), materialInteraction(material).dy())
+                .vec4(materialInteraction(material).activity(), materialInteraction(material).press(),
+                        materialInteraction(material).open(), glassMagnificationFlag(optics, materialInteraction(material)))
+                .next();
+    }
+
+    public void liquidGlassCircle(double cx, double cy, double radius,
+                                  int tintArgb,
+                                  float globalAlpha,
+                                  LiquidGlassPreset preset) {
+        if (radius <= 0.0) return;
+        double size = radius * 2.0;
+        liquidGlassRect(cx - radius, cy - radius, size, size,
+                (float) radius,
+                tintArgb,
+                globalAlpha,
+                preset);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius, float softness,
+                                int tintArgb,
+                                float globalAlpha,
+                                float fresnelPower,
+                                float fresnelAlpha,
+                                float baseAlpha,
+                                float fresnelMix,
+                                float distortPx) {
+        liquidGlassRect(x, y, w, h,
+                radius, softness,
+                tintArgb,
+                globalAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                0.0f);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius, float softness,
+                                int tintArgb,
+                                float globalAlpha,
+                                float fresnelPower,
+                                float fresnelAlpha,
+                                float baseAlpha,
+                                float fresnelMix,
+                                float distortPx,
+                                float squirclePower) {
+        liquidGlassRect(x, y, w, h,
+                radius, softness,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius, float softness,
+                                int tintArgb,
+                                float glassAlpha,
+                                float blurAlpha,
+                                float fresnelPower,
+                                float fresnelAlpha,
+                                float baseAlpha,
+                                float fresnelMix,
+                                float distortPx,
+                                float squirclePower) {
+        liquidGlassRect(x, y, w, h,
+                radius, softness,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower,
+                0.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius, float softness,
+                                int tintArgb,
+                                float glassAlpha,
+                                float blurAlpha,
+                                float fresnelPower,
+                                float fresnelAlpha,
+                                float baseAlpha,
+                                float fresnelMix,
+                                float distortPx,
+                                float squirclePower,
+                                float prismStrength,
+                                float prismPhase) {
+        liquidGlassRectCorners(x, y, w, h,
+                radius, radius, radius, radius,
+                softness,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower,
+                prismStrength,
+                prismPhase);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float globalAlpha,
+                                LiquidGlassPreset preset) {
+        liquidGlassRect(x, y, w, h,
+                radius,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                preset,
+                1.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float glassAlpha,
+                                float blurAlpha,
+                                LiquidGlassPreset preset) {
+        liquidGlassRect(x, y, w, h,
+                radius,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                preset,
+                1.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float globalAlpha,
+                                LiquidGlassPreset preset,
+                                float squirclePower) {
+        liquidGlassRect(x, y, w, h,
+                radius,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                preset,
+                1.0f,
+                squirclePower);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float glassAlpha,
+                                float blurAlpha,
+                                LiquidGlassPreset preset,
+                                float squirclePower) {
+        liquidGlassRect(x, y, w, h,
+                radius,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                preset,
+                1.0f,
+                squirclePower);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float globalAlpha,
+                                LiquidGlassPreset preset,
+                                float thicknessScale,
+                                float squirclePower) {
+        liquidGlassRect(x, y, w, h, radius, tintArgb, globalAlpha, globalAlpha, preset, thicknessScale, squirclePower);
+    }
+
+    public void liquidGlassRect(double x, double y, double w, double h,
+                                float radius,
+                                int tintArgb,
+                                float glassAlpha,
+                                float blurAlpha,
+                                LiquidGlassPreset preset,
+                                float thicknessScale,
+                                float squirclePower) {
+        LiquidGlassPreset p = preset != null ? preset : LiquidGlassPreset.BALANCED;
+        float materialAlpha = clamp01(glassAlpha);
+        float blurStrength = clamp01(blurAlpha);
+        float scale = Math.max(0.001f, thicknessScale);
+        liquidGlassRect(x, y, w, h,
+                radius, p.thicknessPx * scale,
+                tintArgb,
+                materialAlpha,
+                blurStrength,
+                p.fresnelPower,
+                p.fresnelAlpha,
+                p.baseAlpha,
+                p.fresnelMix,
+                p.distortPx * materialAlpha,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float globalAlpha,
+                                       LiquidGlassPreset preset) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                preset,
+                1.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float glassAlpha,
+                                       float blurAlpha,
+                                       LiquidGlassPreset preset) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                preset,
+                1.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float globalAlpha,
+                                       LiquidGlassPreset preset,
+                                       float squirclePower) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                preset,
+                1.0f,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float glassAlpha,
+                                       float blurAlpha,
+                                       LiquidGlassPreset preset,
+                                       float squirclePower) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                preset,
+                1.0f,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float globalAlpha,
+                                       LiquidGlassPreset preset,
+                                       float thicknessScale,
+                                       float squirclePower) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                preset,
+                thicknessScale,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       int tintArgb,
+                                       float glassAlpha,
+                                       float blurAlpha,
+                                       LiquidGlassPreset preset,
+                                       float thicknessScale,
+                                       float squirclePower) {
+        LiquidGlassPreset p = preset != null ? preset : LiquidGlassPreset.BALANCED;
+        float materialAlpha = clamp01(glassAlpha);
+        float blurStrength = clamp01(blurAlpha);
+        float scale = Math.max(0.001f, thicknessScale);
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                p.thicknessPx * scale,
+                tintArgb,
+                materialAlpha,
+                blurStrength,
+                p.fresnelPower,
+                p.fresnelAlpha,
+                p.baseAlpha,
+                p.fresnelMix,
+                p.distortPx * materialAlpha,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float softness,
+                                       int tintArgb,
+                                       float globalAlpha,
+                                       float fresnelPower,
+                                       float fresnelAlpha,
+                                       float baseAlpha,
+                                       float fresnelMix,
+                                       float distortPx) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                softness,
+                tintArgb,
+                globalAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                0.0f);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float softness,
+                                       int tintArgb,
+                                       float globalAlpha,
+                                       float fresnelPower,
+                                       float fresnelAlpha,
+                                       float baseAlpha,
+                                       float fresnelMix,
+                                       float distortPx,
+                                       float squirclePower) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                softness,
+                tintArgb,
+                globalAlpha,
+                globalAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float softness,
+                                       int tintArgb,
+                                       float glassAlpha,
+                                       float blurAlpha,
+                                       float fresnelPower,
+                                       float fresnelAlpha,
+                                       float baseAlpha,
+                                       float fresnelMix,
+                                       float distortPx,
+                                       float squirclePower) {
+        liquidGlassRectCorners(x, y, w, h,
+                radiusTL, radiusTR, radiusBR, radiusBL,
+                softness,
+                tintArgb,
+                glassAlpha,
+                blurAlpha,
+                fresnelPower,
+                fresnelAlpha,
+                baseAlpha,
+                fresnelMix,
+                distortPx,
+                squirclePower,
+                0.0f,
+                0.0f);
+    }
+
+    public void liquidGlassRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float softness,
+                                       int tintArgb,
+                                       float glassAlpha,
+                                       float blurAlpha,
+                                       float fresnelPower,
+                                       float fresnelAlpha,
+                                       float baseAlpha,
+                                       float fresnelMix,
+                                       float distortPx,
+                                       float squirclePower,
+                                       float prismStrength,
+                                       float prismPhase) {
+        if (w <= 0.0 || h <= 0.0) return;
+
+        boolean wholeBoxSquircle = squirclePower <= -1.5f;
+        float shapePower = Math.abs(squirclePower);
+        UiShape glassShape = wholeBoxSquircle
+                ? UiShape.box(UiBoxShape.squircle(x, y, w, h, shapePower))
+                : UiShape.roundedRect(x, y, w, h, radiusTL, radiusTR, radiusBR, radiusBL);
+        BlurQuality preparedBlurQuality = liquidGlassBlurQualityOverride != null
+                ? liquidGlassBlurQualityOverride
+                : DEFAULT_LIQUID_GLASS_BLUR_QUALITY;
+        float preparedBlurOffset = Float.isFinite(liquidGlassBlurOffsetOverridePx)
+                ? Math.max(0.0f, liquidGlassBlurOffsetOverridePx)
+                : LIQUID_GLASS_KAWASE_OFFSET_PX;
+        UiBackdropRequest backdrop = liquidGlassBackdrop(
+                glassShape.bounds(), UiBlurQuality.fromRenderer(preparedBlurQuality), preparedBlurOffset,
+                softness, distortPx, prismStrength);
+        effect(UiEffectSpec.liquidGlass(glassShape, softness, softness, distortPx, tintArgb, backdrop, backdropBlend));
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return;
+        RenderTarget fb = mc.gameRenderer.mainRenderTarget();
+        if (fb == null) return;
+        GpuTextureView src = fb.getColorTextureView();
+        if (src == null) return;
+        GpuSampler sampler = PostProcessManager.getSampler();
+        if (sampler == null) return;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateBlur(UiBatchType.LIQUID_GLASS, src, sampler,
+                preparedBlurQuality, preparedBlurOffset, backdrop, backdropBlend);
+        if (batch != null) batch.includeGlassBounds(new UiRect((float)x, (float)y, (float)w, (float)h));
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+
+        mesh.ensureQuadCapacity();
+
+        int a = (tintArgb >>> 24) & 0xFF;
+        int r = (tintArgb >>> 16) & 0xFF;
+        int g = (tintArgb >>> 8) & 0xFF;
+        int b = tintArgb & 0xFF;
+
+        float clampedGlassAlpha = clamp01(glassAlpha);
+        float clampedBlurAlpha = clamp01(blurAlpha);
+        UiGlassOpticsSpec optics = materialOptics(liquidGlassMaterial);
+        int finalA = Math.round(255.0f * clampedGlassAlpha);
+
+        normalizeCornerRadii(w, h, radiusTL, radiusTR, radiusBR, radiusBL, cornerRadiiTmp);
+
+        float thickness = Math.max(0.0f, softness);
+        float mix = 0.0f;
+        float fa = clamp01(fresnelAlpha);
+        float ba = materialTintStrength(liquidGlassMaterial);
+        float packedDistort = packLiquidGlassPayload(distortPx, shapePower, clampedBlurAlpha, wholeBoxSquircle);
+
+        int i1 = mesh.vec2(x, y).raw2(mix, packedDistort).local2(x, y).color(r, g, b, finalA)
+                .vec4(x, y, w, h)
+                .vec4(cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3])
+                .vec4(thickness, fresnelPower, fa, ba)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, 0f, 0f)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, packGlassOpticalFlags(optics), 0f)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(liquidGlassMaterial),
+                        materialInnerGlowSize(liquidGlassMaterial), packLiquidGlassRgb(materialInnerGlowArgb(liquidGlassMaterial)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(liquidGlassMaterial).x(), materialInteraction(liquidGlassMaterial).y(),
+                        materialInteraction(liquidGlassMaterial).dx(), materialInteraction(liquidGlassMaterial).dy())
+                .vec4(materialInteraction(liquidGlassMaterial).activity(), materialInteraction(liquidGlassMaterial).press(),
+                        materialInteraction(liquidGlassMaterial).open(), glassMagnificationFlag(optics, materialInteraction(liquidGlassMaterial)))
+                .next();
+        int i2 = mesh.vec2(x, y + h).raw2(mix, packedDistort).local2(x, y + h).color(r, g, b, finalA)
+                .vec4(x, y, w, h)
+                .vec4(cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3])
+                .vec4(thickness, fresnelPower, fa, ba)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, 0f, 0f)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, packGlassOpticalFlags(optics), 0f)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(liquidGlassMaterial),
+                        materialInnerGlowSize(liquidGlassMaterial), packLiquidGlassRgb(materialInnerGlowArgb(liquidGlassMaterial)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(liquidGlassMaterial).x(), materialInteraction(liquidGlassMaterial).y(),
+                        materialInteraction(liquidGlassMaterial).dx(), materialInteraction(liquidGlassMaterial).dy())
+                .vec4(materialInteraction(liquidGlassMaterial).activity(), materialInteraction(liquidGlassMaterial).press(),
+                        materialInteraction(liquidGlassMaterial).open(), glassMagnificationFlag(optics, materialInteraction(liquidGlassMaterial)))
+                .next();
+        int i3 = mesh.vec2(x + w, y + h).raw2(mix, packedDistort).local2(x + w, y + h).color(r, g, b, finalA)
+                .vec4(x, y, w, h)
+                .vec4(cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3])
+                .vec4(thickness, fresnelPower, fa, ba)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, 0f, 0f)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, packGlassOpticalFlags(optics), 0f)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(liquidGlassMaterial),
+                        materialInnerGlowSize(liquidGlassMaterial), packLiquidGlassRgb(materialInnerGlowArgb(liquidGlassMaterial)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(liquidGlassMaterial).x(), materialInteraction(liquidGlassMaterial).y(),
+                        materialInteraction(liquidGlassMaterial).dx(), materialInteraction(liquidGlassMaterial).dy())
+                .vec4(materialInteraction(liquidGlassMaterial).activity(), materialInteraction(liquidGlassMaterial).press(),
+                        materialInteraction(liquidGlassMaterial).open(), glassMagnificationFlag(optics, materialInteraction(liquidGlassMaterial)))
+                .next();
+        int i4 = mesh.vec2(x + w, y).raw2(mix, packedDistort).local2(x + w, y).color(r, g, b, finalA)
+                .vec4(x, y, w, h)
+                .vec4(cornerRadiiTmp[0], cornerRadiiTmp[1], cornerRadiiTmp[2], cornerRadiiTmp[3])
+                .vec4(thickness, fresnelPower, fa, ba)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, 0f, 0f)
+                .vec4(0f, 0f, 0f, 0f).vec4(0f, 0f, packGlassOpticalFlags(optics), 0f)
+                .vec4(optics.chromaticAberration(), materialInnerGlowStrength(liquidGlassMaterial),
+                        materialInnerGlowSize(liquidGlassMaterial), packLiquidGlassRgb(materialInnerGlowArgb(liquidGlassMaterial)))
+                .vec4(optics.mode().shaderId(), optics.refraction(), optics.bevelWidth(), optics.bevelDepth())
+                .vec4(optics.interactionStrength(), optics.interactionRadius(),
+                        optics.interactionViscosity(), optics.cleanReveal())
+                .vec4(materialInteraction(liquidGlassMaterial).x(), materialInteraction(liquidGlassMaterial).y(),
+                        materialInteraction(liquidGlassMaterial).dx(), materialInteraction(liquidGlassMaterial).dy())
+                .vec4(materialInteraction(liquidGlassMaterial).activity(), materialInteraction(liquidGlassMaterial).press(),
+                        materialInteraction(liquidGlassMaterial).open(), glassMagnificationFlag(optics, materialInteraction(liquidGlassMaterial)))
+                .next();
+
+        mesh.quad(i1, i2, i3, i4);
+
+        endAutoBatch(auto);
+    }
+
+    // 24-bit integer is represented exactly by a 32-bit float vertex attribute.
+    // Params6.z is the unused channel for rect/primitive/compound geometries.
+    // bits [0..1] chromatic motion; [8..14] tilt X; [15..21] tilt Y;
+    // [22] shape deformation; [23] directional specular. Keep payload GL3.3/16 attributes.
+    private static float packGlassOpticalFlags(UiGlassOpticsSpec optics) {
+        int tiltX = Math.max(0, Math.min(127, Math.round(optics.tiltXDegrees() * 4f) + 64));
+        int tiltY = Math.max(0, Math.min(127, Math.round(optics.tiltYDegrees() * 4f) + 64));
+        int bits = optics.chromaticMotion().shaderId() | (tiltX << 8) | (tiltY << 15)
+                | (optics.shapeDeformation() ? (1 << 22) : 0)
+                | (optics.specular() ? (1 << 23) : 0);
+        return bits;
+    }
+
+    // Params11.w was a binary local flag. Sign now encodes ownership and magnitude encodes
+    // zoom, leaving all other 15 attribute locations and all geometry payloads unchanged.
+    private static float glassMagnificationFlag(UiGlassOpticsSpec optics, UiGlassInteraction state) {
+        return (state.local() ? -1.0f : 1.0f) * optics.magnification();
+    }
+
+    private static float materialFrostedJitter(UiLiquidGlassMaterial material) {
+        return material != null ? material.frostedJitterPx() : 0.0f;
+    }
+
+    private static UiGlassInteraction materialInteraction(UiLiquidGlassMaterial material) {
+        return material != null && material.interaction() != null
+                ? material.interaction() : UiGlassInteraction.FRAME_POINTER;
+    }
+
+    private static UiGlassOpticsSpec materialOptics(UiLiquidGlassMaterial material) {
+        return material != null && material.optics() != null
+                ? material.optics()
+                : UiGlassOpticsSpec.LIQUID;
+    }
+
+    private static float materialInnerGlowStrength(UiLiquidGlassMaterial material) {
+        if (material == null) return 0.0f;
+        float alpha = ((material.innerGlowArgb() >>> 24) & 0xFF) / 255.0f;
+        return material.innerGlowStrength() * alpha;
+    }
+
+    private static float materialInnerGlowSize(UiLiquidGlassMaterial material) {
+        return material != null ? material.innerGlowSizePx() : 0.0f;
+    }
+
+    private static int materialInnerGlowArgb(UiLiquidGlassMaterial material) {
+        return material != null ? material.innerGlowArgb() : 0x00FFFFFF;
+    }
+
+    private static float materialTintStrength(UiLiquidGlassMaterial material) {
+        return material != null ? material.tintStrength() : 0.12f;
+    }
+
+    private static float packLiquidGlassRgb(int argb) {
+        int rgb = argb & 0x00FFFFFF;
+        return (float) rgb;
+    }
+
+    private static BlurQuality legacyBlurQuality(float legacyQuality) {
+        if (legacyQuality >= 32.0f) return BlurQuality.ULTRA;
+        if (legacyQuality >= 12.0f) return BlurQuality.HIGH;
+        if (legacyQuality >= 5.0f) return BlurQuality.MEDIUM;
+        return BlurQuality.LOW;
+    }
+
+    private static float legacyKawaseOffset(float legacyQuality) {
+        if (!Float.isFinite(legacyQuality)) return DEFAULT_KAWASE_OFFSET_PX;
+        return Mth.clamp(legacyQuality / 18.0f, 0.85f, 3.25f);
+    }
+
+    public void blurRect(double x, double y, double w, double h,
+                         float radius, float quality, float brightness, float alpha, int ignoredTintRgb) {
+        blurRect(x, y, w, h, radius, quality, brightness, alpha, ignoredTintRgb, UiBatchType.BLUR);
+    }
+
+    /**
+     * Blurs the scene captured before HUD rendering. Already-rendered HUD/UI is
+     * excluded, so the result is stable regardless of widget order.
+     */
+    public void backdropBlurRect(double x, double y, double w, double h,
+                                 float radius, float quality, float brightness, float alpha) {
+        backdropBlurRectCorners(x, y, w, h, radius, radius, radius, radius,
+                quality, brightness, alpha);
+    }
+
+    /** Captured-scene-only backdrop blur with independent corner radii and no glass/rim shader. */
+    public void backdropBlurRectCorners(double x, double y, double w, double h,
+                                        float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                        float quality, float brightness, float alpha) {
+        if (w <= 0.0 || h <= 0.0 || alpha <= 0.001f) return;
+
+        float rTL = Math.max(0.0f, radiusTL);
+        float rTR = Math.max(0.0f, radiusTR);
+        float rBR = Math.max(0.0f, radiusBR);
+        float rBL = Math.max(0.0f, radiusBL);
+        UiShape blurShape = UiShape.roundedRect(x, y, w, h, rTL, rTR, rBR, rBL);
+        // Captured scene is prewarmed before HUD extraction. Keep this key identical so clipped
+        // HUD consumers reuse that texture instead of trying to run Kawase passes inside stencil.
+        BlurQuality blurQuality = DEFAULT_LIQUID_GLASS_BLUR_QUALITY;
+        float blurOffset = LIQUID_GLASS_KAWASE_OFFSET_PX;
+        UiBackdropRequest backdrop = UiBackdropRequest.capturedSceneBlur(
+                blurShape.bounds(), UiBlurQuality.fromRenderer(blurQuality), blurOffset);
+        effect(UiEffectSpec.blur(blurShape, Math.max(Math.max(rTL, rTR), Math.max(rBR, rBL)),
+                0xFFFFFF, backdrop));
+        BlurSource source = getBlurSource();
+        if (source == null) return;
+
+        boolean auto = beginAutoBatch();
+        try {
+            DrawBatch batch = UI_BATCHER.getOrCreateBlur(
+                    UiBatchType.BLUR_CORNERS, source.view, source.sampler,
+                    blurQuality, blurOffset, backdrop);
+            if (batch == null) return;
+            MeshBuilder mesh = batch.mesh;
+            mesh.alpha = 1.0;
+
+            float finalAlpha = clamp01((float) (alpha * this.alpha));
+            if (finalAlpha <= 0.001f) return;
+            int a = Math.max(0, Math.min(255, Math.round(finalAlpha * 255.0f)));
+            float smoothness = 2.0f;
+
+            mesh.ensureQuadCapacity();
+            int i1 = mesh.vec2(x, y).local2(x, y).color(255, 255, 255, a)
+                    .vec4(x, y, w, h).vec4(rTL, rTR, rBR, rBL)
+                    .vec4(quality, brightness, smoothness, 0.0f).next();
+            int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(255, 255, 255, a)
+                    .vec4(x, y, w, h).vec4(rTL, rTR, rBR, rBL)
+                    .vec4(quality, brightness, smoothness, 0.0f).next();
+            int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(255, 255, 255, a)
+                    .vec4(x, y, w, h).vec4(rTL, rTR, rBR, rBL)
+                    .vec4(quality, brightness, smoothness, 0.0f).next();
+            int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(255, 255, 255, a)
+                    .vec4(x, y, w, h).vec4(rTL, rTR, rBR, rBL)
+                    .vec4(quality, brightness, smoothness, 0.0f).next();
+            mesh.quad(i1, i2, i3, i4);
+        } finally {
+            endAutoBatch(auto);
+        }
+    }
+
+    public void blurSquircle(double x, double y, double w, double h,
+                             UiSquircleProfile profile,
+                             float quality, float brightness, float alpha, int ignoredTintRgb) {
+        UiSquircleProfile safe = profile != null ? profile : UiSquircleProfile.STANDARD;
+        blurSquircle(x, y, w, h, safe.exponent(), quality, brightness, alpha, ignoredTintRgb);
+    }
+
+    public void blurSquircle(double x, double y, double w, double h,
+                             float exponent,
+                             float quality, float brightness, float alpha, int ignoredTintRgb) {
+        if (w <= 0.0 || h <= 0.0 || alpha <= 0.001f) return;
+        UiBoxShape box = UiBoxShape.squircle(x, y, w, h, exponent);
+        BlurQuality blurQuality = legacyBlurQuality(quality);
+        float blurOffset = legacyKawaseOffset(quality);
+        UiBackdropRequest backdrop = UiBackdropRequest.currentTargetBlur(
+                box.bounds(), UiBlurQuality.fromRenderer(blurQuality), blurOffset);
+        effect(UiEffectSpec.blur(UiShape.box(box), 0.0, ignoredTintRgb, backdrop));
+        BlurSource source = getBlurSource();
+        if (source == null) return;
+
+        boolean auto = beginAutoBatch();
+        try {
+            DrawBatch batch = UI_BATCHER.getOrCreateBlur(UiBatchType.BLUR, source.view, source.sampler,
+                    blurQuality, blurOffset, backdrop);
+            if (batch == null) return;
+            MeshBuilder mesh = batch.mesh;
+            mesh.alpha = 1.0;
+            float finalAlpha = (float) (alpha * this.alpha);
+            float encodedShape = -1000.0f - box.squircleExponent();
+            mesh.ensureQuadCapacity();
+            int i1 = mesh.vec2(x, y).local2(x, y).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(encodedShape, quality, brightness, finalAlpha).next();
+            int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(encodedShape, quality, brightness, finalAlpha).next();
+            int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(encodedShape, quality, brightness, finalAlpha).next();
+            int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(encodedShape, quality, brightness, finalAlpha).next();
+            mesh.quad(i1, i2, i3, i4);
+        } finally {
+            endAutoBatch(auto);
+        }
+    }
+
+    private void blurRect(double x, double y, double w, double h,
+                          float radius, float quality, float brightness, float alpha, int ignoredTintRgb,
+                          UiBatchType batchType) {
+        if (w <= 0.0 || h <= 0.0) return;
+        if (alpha <= 0.001f) return;
+
+        UiShape blurShape = UiShape.roundedRect(x, y, w, h, radius);
+        BlurQuality blurQuality = legacyBlurQuality(quality);
+        float blurOffset = legacyKawaseOffset(quality);
+        UiBackdropRequest backdrop = UiBackdropRequest.currentTargetBlur(
+                blurShape.bounds(), UiBlurQuality.fromRenderer(blurQuality), blurOffset);
+        effect(UiEffectSpec.blur(blurShape, radius, ignoredTintRgb, backdrop));
+        BlurSource source = getBlurSource();
+        if (source == null) return;
+
+        boolean auto = beginAutoBatch();
+        try {
+            DrawBatch batch = UI_BATCHER.getOrCreateBlur(batchType, source.view, source.sampler,
+                    blurQuality, blurOffset, backdrop);
+            if (batch == null) return;
+            MeshBuilder mesh = batch.mesh;
+            mesh.alpha = 1.0;
+
+            float finalAlpha = (float) (alpha * this.alpha);
+            mesh.ensureQuadCapacity();
+            int i1 = mesh.vec2(x, y).local2(x, y).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(radius, quality, brightness, finalAlpha).next();
+            int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(radius, quality, brightness, finalAlpha).next();
+            int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(radius, quality, brightness, finalAlpha).next();
+            int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(255, 255, 255, 255).vec4(x, y, w, h).vec4(radius, quality, brightness, finalAlpha).next();
+            mesh.quad(i1, i2, i3, i4);
+        } finally {
+            endAutoBatch(auto);
+        }
+    }
+
+    public void blurChamferedRect(double x, double y, double w, double h,
+                                  double chamfer, float quality, float brightness, float alpha, int ignoredTintRgb) {
+        if (w <= 0.0 || h <= 0.0) return;
+        if (alpha <= 0.001f) return;
+        float cut = clampChamfer(chamfer, w, h);
+        if (cut <= 0.0f) {
+            blurRect(x, y, w, h, 0.0f, quality, brightness, alpha, ignoredTintRgb);
+            return;
+        }
+        blurRect(x, y, w, h, -cut, quality, brightness, alpha, ignoredTintRgb);
+    }
+
+    public void blurComposite(Consumer<BlurComposite> consumer) {
+        if (consumer == null) return;
+
+        BlurSource source = getBlurSource();
+        if (source == null) return;
+
+        UiBackdropRequest backdrop = UiBackdropRequest.currentTargetBlur(
+                null, UiBlurQuality.MEDIUM, DEFAULT_KAWASE_OFFSET_PX);
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreateBlur(UiBatchType.BLUR_CORNERS, source.view, source.sampler,
+                DEFAULT_BLUR_QUALITY, DEFAULT_KAWASE_OFFSET_PX, backdrop);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = 1.0;
+
+        try {
+            consumer.accept(new BlurComposite(mesh, (float) this.alpha));
+        } finally {
+            endAutoBatch(auto);
+        }
+    }
+
+    private BlurSource getBlurSource() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return null;
+        RenderTarget fb = mc.gameRenderer.mainRenderTarget();
+        if (fb == null) return null;
+        GpuTextureView src = fb.getColorTextureView();
+        if (src == null) return null;
+        GpuSampler sampler = PostProcessManager.getSampler();
+        if (sampler == null) return null;
+        return new BlurSource(src, sampler);
+    }
+
+    private boolean beginAutoBatch() {
+        return UiRenderDispatcher.beginAutoBatch();
+    }
+
+    private void endAutoBatch(boolean auto) {
+        UiRenderDispatcher.endAutoBatch(auto);
+    }
+
+    private void renderFlexibleBoxFallback(UiBoxShape box, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (textured || box == null || paint == null) return;
+        int count = UiBoxPathBuilder.write(box, rectShapeTmp, rectShapeTmp.length / 2);
+        if (count < 3) return;
+
+        if (fill) {
+            switch (paint.kind()) {
+                case LINEAR_GRADIENT ->
+                        polygonGradient(rectShapeTmp, count, box.bounds().x(), box.bounds().y(), box.bounds().width(), box.bounds().height(),
+                                paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx());
+                default -> polygon(rectShapeTmp, count, paint.solidColor());
+            }
+        } else if (stroke != null && stroke.enabled()) {
+            if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+                polylineLinearGradient(rectShapeTmp, count, stroke.thickness(), true,
+                        box.bounds().x(), box.bounds().y(), box.bounds().width(), box.bounds().height(),
+                        paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(),
+                        stroke.join() == UiPathJoin.ROUND || stroke.cap() == UiPathCap.ROUND);
+            } else {
+                polyline(rectShapeTmp, count, stroke.thickness(), true, paint.solidColor(),
+                        stroke.join() == UiPathJoin.ROUND || stroke.cap() == UiPathCap.ROUND);
+            }
+        }
+    }
+
+    private void renderPrimitiveFallback(UiPrimitive primitive, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (textured || primitive == null || paint == null) return;
+        double[] points = primitive.points();
+        int count = primitive.pointCount();
+        UiRect bounds = primitive.bounds();
+        if (fill) {
+            switch (paint.kind()) {
+                case LINEAR_GRADIENT -> polygonGradient(points, count,
+                        bounds.x(), bounds.y(), bounds.width(), bounds.height(),
+                        paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx());
+                default -> polygon(points, count, paint.solidColor());
+            }
+        } else if (stroke != null && stroke.enabled()) {
+            if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+                polylineLinearGradient(points, count, stroke.thickness(), true,
+                        bounds.x(), bounds.y(), bounds.width(), bounds.height(),
+                        paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(),
+                        stroke.join() == UiPathJoin.ROUND || stroke.cap() == UiPathCap.ROUND);
+            } else {
+                polyline(points, count, stroke.thickness(), true, paint.solidColor(),
+                        stroke.join() == UiPathJoin.ROUND || stroke.cap() == UiPathCap.ROUND);
+            }
+        }
+    }
+
+    private void renderCompoundSdf(UiCompoundSdf compound, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (textured || compound == null || paint == null) return;
+        UiRect bounds = compound.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0) return;
+
+        int cTL = paint.topLeft();
+        int cTR = paint.topRight();
+        int cBR = paint.bottomRight();
+        int cBL = paint.bottomLeft();
+        if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+            computeLinearGradientColors((float) w, (float) h,
+                    paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(), gradientTmp);
+            cTL = gradientTmp[0];
+            cTR = gradientTmp[1];
+            cBR = gradientTmp[2];
+            cBL = gradientTmp[3];
+        }
+
+        float[] payload = new float[16];
+        int mode;
+        int sourceCount;
+        if (compound.mode() == UiCompoundSdf.Mode.ISLAND_BLOB) {
+            mode = 1;
+            sourceCount = compound.circleCount();
+            for (int i = 0; i < sourceCount; i++) {
+                UiCompoundSdf.Circle circle = compound.circle(i);
+                int o = i * 4;
+                payload[o] = (float) (circle.centerX() - x);
+                payload[o + 1] = (float) (circle.centerY() - y);
+                payload[o + 2] = (float) circle.radius();
+                payload[o + 3] = 0.0f;
+            }
+        } else {
+            mode = compound.mode() == UiCompoundSdf.Mode.SMOOTH_SQUIRCLE_UNION ? 3 : 2;
+            sourceCount = 2;
+            UiRect first = compound.firstBox();
+            UiRect second = compound.secondBox();
+            payload[0] = (float) (first.x() - x);
+            payload[1] = (float) (first.y() - y);
+            payload[2] = first.width();
+            payload[3] = first.height();
+            payload[4] = (float) (second.x() - x);
+            payload[5] = (float) (second.y() - y);
+            payload[6] = second.width();
+            payload[7] = second.height();
+            if (mode == 3) {
+                payload[8] = compound.firstSquircleExponent();
+                payload[9] = compound.secondSquircleExponent();
+            } else {
+                payload[8] = compound.firstRadius();
+                payload[9] = compound.secondRadius();
+            }
+        }
+
+        float strokeWidth = !fill && stroke != null ? stroke.thickness() : 0.0f;
+        float flags = fill ? 1.0f : 2.0f;
+        float packedFlags = mode * 16.0f + flags;
+        double outset = !fill ? strokeWidth * 0.5 : 0.0;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.PRIMITIVE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+        int i1 = appendCompoundSdfVertex(mesh, x - outset, y - outset, cTL, bounds, payload,
+                sourceCount, compound.smoothing(), strokeWidth, packedFlags);
+        int i2 = appendCompoundSdfVertex(mesh, x - outset, y + h + outset, cBL, bounds, payload,
+                sourceCount, compound.smoothing(), strokeWidth, packedFlags);
+        int i3 = appendCompoundSdfVertex(mesh, x + w + outset, y + h + outset, cBR, bounds, payload,
+                sourceCount, compound.smoothing(), strokeWidth, packedFlags);
+        int i4 = appendCompoundSdfVertex(mesh, x + w + outset, y - outset, cTR, bounds, payload,
+                sourceCount, compound.smoothing(), strokeWidth, packedFlags);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendCompoundSdfVertex(MeshBuilder mesh,
+                                               double x,
+                                               double y,
+                                               int argb,
+                                               UiRect bounds,
+                                               float[] payload,
+                                               int sourceCount,
+                                               float smoothing,
+                                               float strokeWidth,
+                                               float packedFlags) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        return mesh.vec2(x, y).local2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(payload[0], payload[1], payload[2], payload[3])
+                .vec4(payload[4], payload[5], payload[6], payload[7])
+                .vec4(payload[8], payload[9], payload[10], payload[11])
+                .vec4(payload[12], payload[13], payload[14], payload[15])
+                .vec4(sourceCount, smoothing, strokeWidth, packedFlags)
+                .next();
+    }
+
+    private void renderPrimitiveSdf(UiPrimitive primitive, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (textured || primitive == null || paint == null) return;
+        UiRect bounds = primitive.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0 || (!fill && (stroke == null || !stroke.enabled()))) return;
+
+        int cTL = paint.topLeft();
+        int cTR = paint.topRight();
+        int cBR = paint.bottomRight();
+        int cBL = paint.bottomLeft();
+        if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+            computeLinearGradientColors((float) w, (float) h,
+                    paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(), gradientTmp);
+            cTL = gradientTmp[0];
+            cTR = gradientTmp[1];
+            cBR = gradientTmp[2];
+            cBL = gradientTmp[3];
+        }
+
+        Arrays.fill(primitivePointsTmp, 0.0f);
+        for (int i = 0; i < primitive.pointCount(); i++) {
+            primitivePointsTmp[i * 2] = primitive.localX(i);
+            primitivePointsTmp[i * 2 + 1] = primitive.localY(i);
+        }
+        float strokeWidth = !fill && stroke != null ? stroke.thickness() : 0.0f;
+        float flags = fill ? 1.0f : 2.0f;
+        float rounding = Math.min(primitive.rounding(), (float) Math.min(w, h) * 0.45f);
+        double outset = !fill ? strokeWidth * 0.5 : 0.0;
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.PRIMITIVE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+        int i1 = appendPrimitiveVertex(mesh, x - outset, y - outset, cTL, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, strokeWidth, flags);
+        int i2 = appendPrimitiveVertex(mesh, x - outset, y + h + outset, cBL, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, strokeWidth, flags);
+        int i3 = appendPrimitiveVertex(mesh, x + w + outset, y + h + outset, cBR, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, strokeWidth, flags);
+        int i4 = appendPrimitiveVertex(mesh, x + w + outset, y - outset, cTR, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, strokeWidth, flags);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private void renderMaterialPrimitiveSdf(UiPrimitive primitive, UiPaint paint,
+                                            UiSurfaceMaterialSpec material) {
+        if (textured || primitive == null || paint == null || material == null) return;
+        UiRect bounds = primitive.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0) return;
+
+        int cTL = paint.topLeft();
+        int cTR = paint.topRight();
+        int cBR = paint.bottomRight();
+        int cBL = paint.bottomLeft();
+        if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+            computeLinearGradientColors((float) w, (float) h,
+                    paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(), gradientTmp);
+            cTL = gradientTmp[0];
+            cTR = gradientTmp[1];
+            cBR = gradientTmp[2];
+            cBL = gradientTmp[3];
+        }
+
+        Arrays.fill(primitivePointsTmp, 0.0f);
+        for (int i = 0; i < primitive.pointCount(); i++) {
+            primitivePointsTmp[i * 2] = primitive.localX(i);
+            primitivePointsTmp[i * 2 + 1] = primitive.localY(i);
+        }
+        float rounding = Math.min(primitive.rounding(), (float) Math.min(w, h) * 0.45f);
+
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.MATERIAL_PRIMITIVE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        mesh.ensureQuadCapacity();
+        int i1 = appendMaterialPrimitiveVertex(mesh, x, y, cTL, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, material);
+        int i2 = appendMaterialPrimitiveVertex(mesh, x, y + h, cBL, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, material);
+        int i3 = appendMaterialPrimitiveVertex(mesh, x + w, y + h, cBR, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, material);
+        int i4 = appendMaterialPrimitiveVertex(mesh, x + w, y, cTR, bounds, primitivePointsTmp,
+                primitive.pointCount(), rounding, material);
+        mesh.quad(i1, i2, i3, i4);
+        endAutoBatch(auto);
+    }
+
+    private static int appendMaterialPrimitiveVertex(MeshBuilder mesh,
+                                                     double x,
+                                                     double y,
+                                                     int argb,
+                                                     UiRect bounds,
+                                                     float[] points,
+                                                     int pointCount,
+                                                     float rounding,
+                                                     UiSurfaceMaterialSpec material) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int accent = material.accentArgb();
+        float accentR = ((accent >>> 16) & 0xFF) / 255.0f;
+        float accentG = ((accent >>> 8) & 0xFF) / 255.0f;
+        float accentB = (accent & 0xFF) / 255.0f;
+        return mesh.vec2(x, y).local2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(points[0], points[1], points[2], points[3])
+                .vec4(points[4], points[5], points[6], points[7])
+                .vec4(points[8], points[9], points[10], points[11])
+                .vec4(points[12], points[13], points[14], points[15])
+                .vec4(pointCount, rounding, 0.0f, 1.0f)
+                .vec4(material.mode().shaderId(), material.detailScale(), material.roughness(), material.response())
+                .vec4(accentR, accentG, accentB, material.bevelStrength())
+                .next();
+    }
+
+    private static int appendPrimitiveVertex(MeshBuilder mesh,
+                                             double x,
+                                             double y,
+                                             int argb,
+                                             UiRect bounds,
+                                             float[] points,
+                                             int pointCount,
+                                             float rounding,
+                                             float strokeWidth,
+                                             float flags) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        return mesh.vec2(x, y).local2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(points[0], points[1], points[2], points[3])
+                .vec4(points[4], points[5], points[6], points[7])
+                .vec4(points[8], points[9], points[10], points[11])
+                .vec4(points[12], points[13], points[14], points[15])
+                .vec4(pointCount, rounding, strokeWidth, flags)
+                .next();
+    }
+
+    private void renderSquircleSdf(UiBoxShape box, UiPaint paint, UiStroke stroke, boolean fill) {
+        if (textured || box == null || paint == null) return;
+        UiRect bounds = box.bounds();
+        double x = bounds.x();
+        double y = bounds.y();
+        double w = bounds.width();
+        double h = bounds.height();
+        if (w <= 0.0 || h <= 0.0 || (!fill && (stroke == null || !stroke.enabled()))) return;
+
+        boolean auto = beginAutoBatch();
+        boolean warped = RenderWarpStack.active();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+
+        int cTL = paint.topLeft();
+        int cTR = paint.topRight();
+        int cBR = paint.bottomRight();
+        int cBL = paint.bottomLeft();
+        if (paint.kind() == UiPaintKind.LINEAR_GRADIENT) {
+            computeLinearGradientColors((float) w, (float) h,
+                    paint.topLeft(), paint.topRight(), paint.angleDeg(), paint.offsetPx(), gradientTmp);
+            cTL = gradientTmp[0];
+            cTR = gradientTmp[1];
+            cBR = gradientTmp[2];
+            cBL = gradientTmp[3];
+        }
+
+        UiFastShapeParams params = UiFastShapeParams.squircle(box, fill ? UiStroke.NONE : stroke, fill);
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        double strokeOutset = !fill && stroke != null ? stroke.thickness() * 0.5 : 0.0;
+        double qx = x - strokeOutset;
+        double qy = y - strokeOutset;
+        double qw = w + strokeOutset * 2.0;
+        double qh = h + strokeOutset * 2.0;
+        if (warped) {
+            appendWarpedSdfGrid(mesh, qx, qy, qw, qh, cTL, cTR, cBR, cBL,
+                    bounds, params.kind(), params.shape(), params.strokeWidth(), params.flags());
+        } else {
+            mesh.ensureQuadCapacity();
+            int i1 = appendShapeVertex(mesh, qx, qy, cTL, bounds, params);
+            int i2 = appendShapeVertex(mesh, qx, qy + qh, cBL, bounds, params);
+            int i3 = appendShapeVertex(mesh, qx + qw, qy + qh, cBR, bounds, params);
+            int i4 = appendShapeVertex(mesh, qx + qw, qy, cTR, bounds, params);
+            mesh.quad(i1, i2, i3, i4);
+        }
+        endAutoBatch(auto);
+    }
+
+    private static int appendShapeVertex(MeshBuilder mesh, double x, double y, int argb,
+                                         UiRect bounds, UiFastShapeParams p) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        mesh.vec2(x, y).rawLocal2(x, y);
+        return mesh.color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(p.kind(), p.shape(), p.strokeWidth(), p.flags())
+                .vec4(0f, 0f, 0f, 0f)
+                .vec4(0f, 0f, 0f, 0f).next();
+    }
+
+    private static int appendGeometryVertex(MeshBuilder mesh, double x, double y, int argb, UiRect bounds,
+                                            float p0, float p1, float p2, float p3) {
+        return appendGeometryVertex(mesh, x, y, argb, bounds, p0, p1, p2, p3,
+                0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+    }
+
+    private static int appendGeometryVertex(MeshBuilder mesh, double x, double y, int argb, UiRect bounds,
+                                            float p0, float p1, float p2, float p3,
+                                            float p20, float p21, float p22, float p23) {
+        return appendGeometryVertex(mesh, x, y, argb, bounds, p0, p1, p2, p3,
+                p20, p21, p22, p23, 0f, 0f, 0f, 0f);
+    }
+
+    private static int appendGeometryVertex(MeshBuilder mesh, double x, double y, int argb, UiRect bounds,
+                                            float p0, float p1, float p2, float p3,
+                                            float p20, float p21, float p22, float p23,
+                                            float p30, float p31, float p32, float p33) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        return mesh.vec2(x, y).rawLocal2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(p0, p1, p2, p3)
+                .vec4(p20, p21, p22, p23)
+                .vec4(p30, p31, p32, p33).next();
+    }
+
+
+    private static void appendGeometryQuad(MeshBuilder mesh,
+                                           double x, double y, double width, double height,
+                                           int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+        mesh.ensureQuadCapacity();
+        UiRect bounds = UiRect.of(x, y, width, height);
+        int i1 = appendGeometryVertex(mesh, x, y, cTopLeft, bounds,
+                UiFastShapeParams.KIND_RECT, 0f, 0f, 0f);
+        int i2 = appendGeometryVertex(mesh, x, y + height, cBottomLeft, bounds,
+                UiFastShapeParams.KIND_RECT, 0f, 0f, 0f);
+        int i3 = appendGeometryVertex(mesh, x + width, y + height, cBottomRight, bounds,
+                UiFastShapeParams.KIND_RECT, 0f, 0f, 0f);
+        int i4 = appendGeometryVertex(mesh, x + width, y, cTopRight, bounds,
+                UiFastShapeParams.KIND_RECT, 0f, 0f, 0f);
+        mesh.quad(i1, i2, i3, i4);
+    }
+
+    private static int appendGlowVertex(MeshBuilder mesh, double x, double y, int argb, UiRect bounds,
+                                        float kind, float radius, float softness, float glowRadius,
+                                        float centerX, float centerY) {
+        int a = (argb >>> 24) & 0xFF;
+        int r = (argb >>> 16) & 0xFF;
+        int g = (argb >>> 8) & 0xFF;
+        int b = argb & 0xFF;
+        return mesh.vec2(x, y).rawLocal2(x, y).color(r, g, b, a)
+                .vec4(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+                .vec4(kind, radius, softness, glowRadius)
+                .vec4(centerX, centerY, 0f, 0f).next();
+    }
+
+    private void appendWarpedSdfGrid(
+            MeshBuilder mesh,
+            double x,
+            double y,
+            double width,
+            double height,
+            int cTopLeft,
+            int cTopRight,
+            int cBottomRight,
+            int cBottomLeft,
+            UiRect sdfBounds,
+            float param0,
+            float param1,
+            float param2,
+            float param3
+    ) {
+        int columns = warpedGridSegments(width);
+        int rows = warpedGridSegments(height);
+        int stride = columns + 1;
+        int vertexCount = stride * (rows + 1);
+        int indexCount = columns * rows * 6;
+        mesh.ensureCapacity(vertexCount, indexCount);
+
+        for (int row = 0; row <= rows; row++) {
+            double v = row / (double) rows;
+            double py = y + height * v;
+            for (int column = 0; column <= columns; column++) {
+                double u = column / (double) columns;
+                double px = x + width * u;
+                // Match the two-triangle interpolation used by the ordinary quad path.
+                // Bilinear interpolation changes the authored gradient as soon as the
+                // same shape enters a warp scope (most visible on Settings cards).
+                int argb = quadTriangleArgb(cTopLeft, cTopRight, cBottomRight, cBottomLeft, u, v);
+                int a = (argb >>> 24) & 0xFF;
+                int r = (argb >>> 16) & 0xFF;
+                int g = (argb >>> 8) & 0xFF;
+                int b = argb & 0xFF;
+                warpedShapeVertexTmp[row * stride + column] = mesh
+                        .vec2(px, py)
+                        // Preserve source-space interpolation under perspective. Geometry
+                        // tessellation is only an approximation detail and must not turn
+                        // the material into a screen-space gradient.
+                        .local2(px, py)
+                        .color(r, g, b, a)
+                        .vec4(sdfBounds.x(), sdfBounds.y(), sdfBounds.width(), sdfBounds.height())
+                        .vec4(param0, param1, param2, param3)
+                        .vec4(0f, 0f, 0f, 0f)
+                        .vec4(0f, 0f, 0f, 0f)
+                        .next();
+            }
+        }
+
+        for (int row = 0; row < rows; row++) {
+            for (int column = 0; column < columns; column++) {
+                int topLeft = warpedShapeVertexTmp[row * stride + column];
+                int topRight = warpedShapeVertexTmp[row * stride + column + 1];
+                int bottomLeft = warpedShapeVertexTmp[(row + 1) * stride + column];
+                int bottomRight = warpedShapeVertexTmp[(row + 1) * stride + column + 1];
+                mesh.quad(topLeft, bottomLeft, bottomRight, topRight);
+            }
+        }
+    }
+
+    private static int warpedGridSegments(double extent) {
+        return Math.max(4, Math.min(8, (int) Math.ceil(Math.abs(extent) / 18.0)));
+    }
+
+    private static int quadTriangleArgb(int topLeft, int topRight, int bottomRight, int bottomLeft,
+                                        double u, double v) {
+        double clampedU = Math.max(0.0, Math.min(1.0, u));
+        double clampedV = Math.max(0.0, Math.min(1.0, v));
+        if (clampedU <= clampedV) {
+            return mixArgb(topLeft, bottomLeft, bottomRight,
+                    1.0 - clampedV, clampedV - clampedU, clampedU);
+        }
+        return mixArgb(topLeft, topRight, bottomRight,
+                1.0 - clampedU, clampedU - clampedV, clampedV);
+    }
+
+    private static int mixArgb(int first, int second, int third,
+                               double firstWeight, double secondWeight, double thirdWeight) {
+        int a = weightedChannel(first, second, third, 24, firstWeight, secondWeight, thirdWeight);
+        int r = weightedChannel(first, second, third, 16, firstWeight, secondWeight, thirdWeight);
+        int g = weightedChannel(first, second, third, 8, firstWeight, secondWeight, thirdWeight);
+        int b = weightedChannel(first, second, third, 0, firstWeight, secondWeight, thirdWeight);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    private static int weightedChannel(int first, int second, int third, int shift,
+                                       double firstWeight, double secondWeight, double thirdWeight) {
+        return (int) Math.round(
+                ((first >>> shift) & 0xFF) * firstWeight
+                        + ((second >>> shift) & 0xFF) * secondWeight
+                        + ((third >>> shift) & 0xFF) * thirdWeight
+        );
+    }
+
+    public void polygon(double[] points, int pointCount, int argb) {
+        if (textured) {
+            throw new IllegalStateException("Polygon drawing is supported only on Renderer2D.COLOR.");
+        }
+        int safeCount = Math.min(pointCount, points != null ? points.length / 2 : 0);
+        safeCount = Math.min(safeCount, Math.min(polygonIndexTmp.length, polygonVertexTmp.length));
+        if (points == null || safeCount < 3) return;
+
+        path(UiShape.polyline(points, safeCount, true), UiPaint.solid(argb), UiStroke.NONE, true);
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        appendPolygon(mesh, points, safeCount, polygonIndexTmp, polygonVertexTmp, argb);
+        endAutoBatch(auto);
+    }
+
+    private void polygonGradient(double[] points, int pointCount,
+                                 double x, double y, double width, double height,
+                                 int startArgb, int endArgb, float angleDeg, float offsetPx) {
+        if (textured) {
+            throw new IllegalStateException("Polygon drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (points == null || pointCount < 3) return;
+
+        path(UiShape.polyline(points, pointCount, true), UiPaint.linear(startArgb, endArgb, angleDeg, offsetPx), UiStroke.NONE, true);
+        boolean auto = beginAutoBatch();
+        DrawBatch batch = UI_BATCHER.getOrCreate(UiBatchType.SHAPE, null, null);
+        if (batch == null) {
+            endAutoBatch(auto);
+            return;
+        }
+        MeshBuilder mesh = batch.mesh;
+        mesh.alpha = alpha;
+        appendPolygonGradient(mesh, points, pointCount, polygonIndexTmp, polygonVertexTmp,
+                x, y, width, height, startArgb, endArgb, angleDeg, offsetPx);
+        endAutoBatch(auto);
+    }
+
+    private void polygonStroke(double[] points, int pointCount, double thickness, boolean closed, int argb) {
+        polyline(points, pointCount, thickness, closed, argb, false);
+    }
+
+    private void polyline(double[] points, int pointCount, double thickness, boolean closed, int argb) {
+        polyline(points, pointCount, thickness, closed, argb, false);
+    }
+
+    private void polyline(double[] points, int pointCount, double thickness, boolean closed, int argb, boolean roundCapsAndJoins) {
+        if (textured) {
+            throw new IllegalStateException("Polyline drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (points == null || pointCount < 2) return;
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+
+        UiStroke stroke = roundCapsAndJoins ? UiStroke.of(t).withRoundCapsAndJoins() : UiStroke.of(t);
+        path(UiShape.polyline(points, pointCount, closed), UiPaint.solid(argb), stroke, false);
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, UiPathCurve.LINEAR, closed,
+                null, null, new UiPathStrokeLayer(t, argb, argb, stroke.cap(), stroke.join()));
+    }
+
+    private void polylineGradient(double[] points, int pointCount, double thickness, boolean closed,
+                                  int startArgb, int endArgb, boolean roundCapsAndJoins) {
+        if (textured) {
+            throw new IllegalStateException("Polyline drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (points == null || pointCount < 2) return;
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+
+        UiStroke stroke = roundCapsAndJoins ? UiStroke.of(t).withRoundCapsAndJoins() : UiStroke.of(t);
+        path(UiShape.polyline(points, pointCount, closed), UiPaint.corners(startArgb, endArgb, endArgb, startArgb), stroke, false);
+        pathDrawApi.draw(UI_BATCHER, alpha, points, pointCount, UiPathCurve.LINEAR, closed,
+                null, null, new UiPathStrokeLayer(t, startArgb, endArgb, stroke.cap(), stroke.join()));
+    }
+
+    private void polylineLinearGradient(double[] points, int pointCount, double thickness, boolean closed,
+                                        double x, double y, double width, double height,
+                                        int startArgb, int endArgb, float angleDeg, float offsetPx,
+                                        boolean roundCapsAndJoins) {
+        if (textured) {
+            throw new IllegalStateException("Polyline drawing is supported only on Renderer2D.COLOR.");
+        }
+        if (points == null || pointCount < 2) return;
+        double t = Math.max(0.0, thickness);
+        if (t <= 0.0) return;
+
+        UiStroke stroke = roundCapsAndJoins ? UiStroke.of(t).withRoundCapsAndJoins() : UiStroke.of(t);
+        path(UiShape.polyline(points, pointCount, closed), UiPaint.linear(startArgb, endArgb, angleDeg, offsetPx), stroke, false);
+        pathDrawApi.drawLinearGradientStroke(UI_BATCHER, alpha, points, pointCount, closed, t,
+                stroke.cap(), stroke.join(), x, y, width, height,
+                startArgb, endArgb, angleDeg, offsetPx);
+    }
+
+
+    // ---- Engine integration -------------------------------------------------------
+
+    public static boolean isBatching() {
+        return UI_BATCHER.isActive();
+    }
+
+    public static BatchStats getBatchStats() {
+        return BATCH_STATS;
+    }
+
+    public static UiStatsSnapshot getUiStatsSnapshot() {
+        return UiRenderDispatcher.statsSnapshot();
+    }
+
+    public static void beginDeferredExtractFrame() {
+        UiDeferredScheduler.beginExtractFrame();
+    }
+
+    public static void endDeferredExtractFrame() {
+        UiDeferredScheduler.endExtractFrame();
+    }
+
+    public static void prepareDeferredUiItems() {
+        UiDeferredScheduler.prepareDeferredUiItems();
+    }
+
+    public static void drainDeferred2D(Deferred2DLayer layer) {
+        UiDeferredScheduler.drain(layer);
+    }
+
+    public static boolean isDeferredExtractRecording() {
+        return UiDeferredScheduler.shouldDefer();
+    }
+
+    public static void withDeferredLayer(Deferred2DLayer layer, Runnable action) {
+        UiDeferredScheduler.withLayer(layer, action);
+    }
+
+    public static void deferRenderThreadAction(Runnable action) {
+        UiDeferredScheduler.deferAction(action);
+    }
+
+    public static ViewportContext snapshotViewport() {
+        return UiDeferredScheduler.snapshotViewport();
+    }
+
+    private static void beginUiLayer() {
+        UiRenderDispatcher.beginLayer();
+    }
+
+    private static void recordUi(UiCommand command) {
+        UiRenderDispatcher.record(command);
+    }
+
+    public static void flushUiLayer() {
+        UiRenderDispatcher.flushLayer();
+    }
+
+    public static boolean enqueueTextMesh(String label,
+                                          GlyphFont font,
+                                          MeshBuilder sourceMesh,
+                                          RenderPipeline pipeline,
+                                          TextPlacementMode placement) {
+        return UiRenderDispatcher.enqueueTextMesh(label, font, sourceMesh, pipeline, placement);
+    }
+
+    public static boolean enqueueLiquidGlassTextMesh(String label,
+                                                     GlyphFont font,
+                                                     MeshBuilder sourceMesh,
+                                                     RenderPipeline pipeline,
+                                                     TextPlacementMode placement,
+                                                     UiRect bounds) {
+        return UiRenderDispatcher.enqueueLiquidGlassTextMesh(
+                label, font, sourceMesh, pipeline, placement, bounds);
+    }
+
+    public static boolean enqueueLiquidGlassTextMesh(String label,
+                                                     GlyphFont font,
+                                                     MeshBuilder sourceMesh,
+                                                     RenderPipeline pipeline,
+                                                     TextPlacementMode placement,
+                                                     UiRect bounds,
+                                                     UiBackdropBlendSpec backdropBlend,
+                                                     UiBackdropRequest backdropRequest) {
+        return UiRenderDispatcher.enqueueLiquidGlassTextMesh(
+                label, font, sourceMesh, pipeline, placement, bounds, backdropBlend, backdropRequest);
+    }
+
+    public static RenderWarpStack.Scope pushWarp(RenderWarp warp) {
+        return RenderWarpStack.push(warp);
+    }
+
+    public static RenderWarpStack.Scope pushPerspectiveWarp(float x,
+                                                            float y,
+                                                            float width,
+                                                            float height,
+                                                            float yawDeg,
+                                                            float pitchDeg,
+                                                            float rollDeg,
+                                                            float depth,
+                                                            float perspective,
+                                                            float scale) {
+        return RenderWarpStack.push(RenderWarp.perspective(
+                x, y, width, height, yawDeg, pitchDeg, rollDeg, depth, perspective, scale
+        ));
+    }
+
+    /** Flushes pending UI work without ending the current ordered batch. */
+    public static void flushBatch() {
+        flushBatch(FlushReason.EXPLICIT);
+    }
+
+    public static void flushBatch(FlushReason reason) {
+        UiRenderDispatcher.flushBatch(reason);
+    }
+
+    public static boolean isFlushingBatch() {
+        return UiRenderDispatcher.isFlushingBatch();
+    }
+
+    public static float getUnscaledItemRatio() {
+        float scaleFactor = ViewportContext.getScaleFactor();
+        if (scaleFactor == 0.0f) {
+            return 1.0f;
+        }
+        return ViewportContext.getUiScale() / scaleFactor;
+    }
+
+    public enum FlushReason {
+        UNKNOWN,
+        EXPLICIT,
+        PROJECTION,
+        SCISSOR,
+        VANILLA_TEXT,
+        UI_TEXTURE,
+        TEXTURED_DIRECT,
+        AUTO_BATCH,
+        RENDER_END
+    }
+
+    public enum LiquidGlassPreset {
+        LIGHT(7.0f, -5.50f, 0.70f, 0.42f, 0.40f, 0.030f),
+        BALANCED(11.0f, -7.50f, 0.78f, 0.52f, 0.42f, 0.040f),
+        HEAVY(15.0f, -9.00f, 0.86f, 0.62f, 0.48f, 0.052f),
+        HUD_SMALL(11.0f, -12.00f, 0.84f, 0.78f, 0.22f, 0.055f),
+        HUD_LARGE(13.5f, -14.00f, 0.88f, 0.72f, 0.20f, 0.060f),
+        HEALTH_BAR(3.25f, -18.00f, 0.52f, 0.96f, 0.055f, 0.0030f);
+
+        private final float thicknessPx;
+        private final float fresnelPower;
+        private final float fresnelAlpha;
+        private final float baseAlpha;
+        private final float fresnelMix;
+        private final float distortPx;
+
+        LiquidGlassPreset(float thicknessPx,
+                          float fresnelPower,
+                          float fresnelAlpha,
+                          float baseAlpha,
+                          float fresnelMix,
+                          float distortPx) {
+            this.thicknessPx = thicknessPx;
+            this.fresnelPower = fresnelPower;
+            this.fresnelAlpha = fresnelAlpha;
+            this.baseAlpha = baseAlpha;
+            this.fresnelMix = fresnelMix;
+            this.distortPx = distortPx;
+        }
+    }
+
+    public static final class BlurComposite {
+        private final MeshBuilder mesh;
+        private final float globalAlpha;
+
+        private BlurComposite(MeshBuilder mesh, float globalAlpha) {
+            this.mesh = mesh;
+            this.globalAlpha = globalAlpha;
+        }
+
+        public void rect(double x, double y, double w, double h,
+                         float quality, float brightness, float alpha, int ignoredTintRgb) {
+            roundedRect(x, y, w, h, 0.0f, quality, brightness, alpha, ignoredTintRgb);
+        }
+
+        public void roundedRect(double x, double y, double w, double h,
+                                float radius, float quality, float brightness, float alpha, int ignoredTintRgb) {
+            roundedRectCorners(x, y, w, h, radius, radius, radius, radius, quality, brightness, alpha, ignoredTintRgb);
+        }
+
+        public void roundedRectCorners(double x, double y, double w, double h,
+                                       float radiusTL, float radiusTR, float radiusBR, float radiusBL,
+                                       float quality, float brightness, float alpha, int ignoredTintRgb) {
+            if (w <= 0.0 || h <= 0.0) return;
+            float finalAlpha = clamp01(alpha * globalAlpha);
+            if (finalAlpha <= 0.001f) return;
+
+            mesh.ensureQuadCapacity();
+
+            int a = Math.max(0, Math.min(255, Math.round(finalAlpha * 255.0f)));
+
+            float smoothness = 2.0f;
+
+            int i1 = mesh.vec2(x, y).local2(x, y).color(255, 255, 255, a)
+                    .vec4(x, y, w, h)
+                    .vec4(radiusTL, radiusTR, radiusBR, radiusBL)
+                    .vec4(quality, brightness, smoothness, 0.0f)
+                    .next();
+            int i2 = mesh.vec2(x, y + h).local2(x, y + h).color(255, 255, 255, a)
+                    .vec4(x, y, w, h)
+                    .vec4(radiusTL, radiusTR, radiusBR, radiusBL)
+                    .vec4(quality, brightness, smoothness, 0.0f)
+                    .next();
+            int i3 = mesh.vec2(x + w, y + h).local2(x + w, y + h).color(255, 255, 255, a)
+                    .vec4(x, y, w, h)
+                    .vec4(radiusTL, radiusTR, radiusBR, radiusBL)
+                    .vec4(quality, brightness, smoothness, 0.0f)
+                    .next();
+            int i4 = mesh.vec2(x + w, y).local2(x + w, y).color(255, 255, 255, a)
+                    .vec4(x, y, w, h)
+                    .vec4(radiusTL, radiusTR, radiusBR, radiusBL)
+                    .vec4(quality, brightness, smoothness, 0.0f)
+                    .next();
+            mesh.quad(i1, i2, i3, i4);
+        }
+    }
+
+    public static final class QuadBatch {
+        private final MeshBuilder mesh;
+
+        private QuadBatch(MeshBuilder mesh) {
+            this.mesh = mesh;
+        }
+
+        public void quad(double x, double y, double width, double height, int argb) {
+            quad(x, y, width, height, argb, argb, argb, argb);
+        }
+
+        public void quad(double x, double y, double width, double height,
+                         int cTopLeft, int cTopRight, int cBottomRight, int cBottomLeft) {
+            appendGeometryQuad(mesh, x, y, width, height,
+                    cTopLeft, cTopRight, cBottomRight, cBottomLeft);
+        }
+    }
+
+    public static final class BatchStats extends UiBatchStats {
+    }
+}

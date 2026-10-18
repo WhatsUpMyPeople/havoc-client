@@ -1,0 +1,742 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17.12'
+    id 'maven-publish'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url = 'https://maven.fabricmc.net/'
+    }
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = "Modrinth"
+                url = "https://api.modrinth.com/maven"
+            }
+        }
+        filter {
+            includeGroup "maven.modrinth"
+        }
+    }
+    maven {
+        // ViaFabricPlus / ViaVersion
+        url = 'https://repo.viaversion.com/everything'
+    }
+    maven {
+        // ViaBedrock snapshots (dependency of ViaFabricPlus)
+        url = 'https://repo.opencollab.dev/maven-snapshots/'
+    }
+    maven {
+        // ViaBedrock snapshots (alt repo used by Via* stack)
+        url = 'https://maven.lenni0451.net/snapshots'
+    }
+    maven {
+        // JitPack (for com.github.* artifacts like CubeConverter)
+        url = 'https://jitpack.io'
+    }
+    maven {
+        name = "Xaero's Maven"
+        url = 'https://chocolateminecraft.com/maven'
+    }
+    maven {
+        url = uri("$rootDir/local-maven")
+    }
+}
+
+version = providers.gradleProperty("mod_version").get()
+group = providers.gradleProperty("maven_group").get()
+
+def havocModId = providers.gradleProperty("mod_id").get()
+def havocModName = providers.gradleProperty("mod_name").get()
+def havocModLicense = providers.gradleProperty("mod_license").get()
+def duplexCourierVersion = providers.gradleProperty("duplex_courier_version").get()
+
+base {
+    archivesName = providers.gradleProperty("archives_base_name").get()
+}
+
+def havocVulkanDebugEnabled = providers.gradleProperty("havocVulkanDebug")
+        .map { it.toBoolean() }
+        .orElse(false)
+def havocDevTaskRequested = gradle.startParameter.taskNames.any { it == "buildDev" || it.endsWith(":buildDev") }
+def havocDevEnabled = providers.gradleProperty("havocDev")
+        .orElse(providers.gradleProperty("dev"))
+        .orElse(providers.gradleProperty("devBuild"))
+        .orElse(havocDevTaskRequested ? "true" : "false")
+        .map { it.toBoolean() }
+        .orElse(false)
+def svgMsdfGeneratedResources = layout.buildDirectory.dir("generated/resources/svgMsdf")
+// GLSL block declarations are the sole source of truth for generated UBO/SSBO layouts.
+// The generator uses the JDK source-file launcher; no Python/Groovy plugin or runtime reflection.
+def generatedUniformResources = layout.buildDirectory.dir("generated/resources/havocUniforms")
+def javetNativeGeneratedResources = layout.buildDirectory.dir("generated/resources/javetNatives")
+def javetVersion = "5.0.9"
+def targetJavaVersion = 25
+
+sourceSets {
+    main {
+        resources.srcDir(svgMsdfGeneratedResources)
+        resources.srcDir(generatedUniformResources)
+    }
+    svgMsdfTool {
+        java.srcDir("src/svgMsdfTool/java")
+        compileClasspath += sourceSets.main.output.classesDirs + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+    dev {
+        java.srcDir("src/dev/java")
+        resources.srcDir("src/dev/resources")
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+    duplexCourier {
+        java.srcDir("src/duplexCourier/java")
+        resources.srcDir("src/duplexCourier/resources")
+        compileClasspath += sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+    vulkanDebug {
+        java.srcDir("src/vulkanDebug/java")
+        resources.srcDir("src/vulkanDebug/resources")
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+}
+
+configurations {
+    bundledLibrary
+    linuxBundledLibrary
+    javetNativeBundle
+    modImplementation
+    compileOnly.extendsFrom bundledLibrary, linuxBundledLibrary
+    runtimeOnly.extendsFrom bundledLibrary, linuxBundledLibrary
+    implementation.extendsFrom modImplementation
+    runtimeOnly.extendsFrom modImplementation
+    devImplementation.extendsFrom implementation
+    devCompileOnly.extendsFrom compileOnly
+    devAnnotationProcessor.extendsFrom annotationProcessor
+    vulkanDebugImplementation.extendsFrom implementation
+    vulkanDebugCompileOnly.extendsFrom compileOnly
+    vulkanDebugAnnotationProcessor.extendsFrom annotationProcessor
+    duplexCourierImplementation.extendsFrom implementation
+    duplexCourierCompileOnly.extendsFrom compileOnly
+}
+
+loom {
+    mods {
+        "havoc" {
+            sourceSet sourceSets.main
+            if (havocDevEnabled.get()) {
+                sourceSet sourceSets.dev
+            }
+            if (havocVulkanDebugEnabled.get()) {
+                sourceSet sourceSets.vulkanDebug
+            }
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'org.projectlombok:lombok:1.18.46'
+    annotationProcessor 'org.projectlombok:lombok:1.18.46'
+    annotationProcessor project(':registry-processor')
+    testCompileOnly 'org.projectlombok:lombok:1.18.46'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.46'
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    devCompileOnly 'org.projectlombok:lombok:1.18.46'
+    devAnnotationProcessor 'org.projectlombok:lombok:1.18.46'
+    vulkanDebugCompileOnly 'org.projectlombok:lombok:1.18.46'
+    vulkanDebugAnnotationProcessor 'org.projectlombok:lombok:1.18.46'
+
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+
+    // Renderer targets. Sodium is required; Iris stays optional but available in dev runtime.
+    compileOnly "maven.modrinth:sodium:${project.sodium_version}"
+    compileOnly "maven.modrinth:iris:${project.iris_version}"
+    compileOnly "maven.modrinth:immediatelyfast:${project.immediatelyfast_version}"
+    if (providers.gradleProperty("withOptionalModRuntime").map { it.toBoolean() }.orElse(false).get()) {
+        runtimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+        runtimeOnly "maven.modrinth:iris:${project.iris_version}"
+        runtimeOnly "maven.modrinth:immediatelyfast:${project.immediatelyfast_version}"
+    }
+
+    // Xaero is a typed development/runtime integration target. Loom does not bundle
+    // modImplementation dependencies into Havoc's distributable jar.
+    modImplementation "xaero.minimap:xaerominimap-fabric-${project.minecraft_version}:${project.xaero_minimap_version}"
+    compileOnly "maven.modrinth:xaeros-world-map:${project.xaero_worldmap_version}"
+
+    // ViaFabricPlus (optional)
+    compileOnly "com.viaversion:viafabricplus-api:${project.viafabricplus_version}"
+    if (providers.gradleProperty("withViaFabricPlusRuntime").map { it.toBoolean() }.orElse(false).get()) {
+        // Dev/runtime only (not bundled) to test locally.
+        runtimeOnly "com.viaversion:viafabricplus:${project.viafabricplus_version}"
+    }
+
+    // Entity Culling (optional): typed compile-time API for shader ESP visibility compat.
+    compileOnly "maven.modrinth:entityculling:${project.entityculling_version}"
+
+    bundledLibrary "de.marhali:json5-java:3.0.0"
+
+    // glTF 2.0 decoding foundation. GFBS-glTF-derived importer code converts JglTF models
+    // into Havoc-owned immutable asset contracts; no JglTF renderer is used.
+    bundledLibrary "de.javagl:jgltf-model:2.0.4"
+    bundledLibrary "de.javagl:jgltf-impl-v1:2.0.4"
+    bundledLibrary "de.javagl:jgltf-impl-v2:2.0.4"
+    bundledLibrary "com.fasterxml.jackson.core:jackson-annotations:2.13.4"
+    bundledLibrary "com.fasterxml.jackson.core:jackson-core:2.13.4"
+    bundledLibrary "com.fasterxml.jackson.core:jackson-databind:2.13.4.2"
+
+    // Linux-only MPRIS backend dependencies. Kept in a separate bundle so slim
+    // distributions can remove the complete transitive payload safely.
+    linuxBundledLibrary "com.github.hypfvieh:dbus-java-core:4.3.1"
+    linuxBundledLibrary "com.github.hypfvieh:dbus-java-transport-native-unixsocket:4.3.1"
+
+    // Provided by Minecraft runtime; keep it out of the bundled jar.
+    compileOnly 'com.google.code.gson:gson:2.10.1'
+
+    // Provided by Minecraft/Fabric runtime; do not shade it into the mod jar.
+    compileOnly 'org.slf4j:slf4j-api:2.0.17'
+
+    // Javet core only. Native V8 binaries are copied into resources/javet/natives.
+    bundledLibrary "com.caoccao.javet:javet:${javetVersion}"
+
+    // Javet in minimal V8 mode only: no Node runtime. The canonical remap jar
+    // stays universal; release slim artifacts retain only their target native.
+    javetNativeBundle "com.caoccao.javet:javet-v8-windows-x86_64:${javetVersion}"
+    javetNativeBundle "com.caoccao.javet:javet-v8-linux-x86_64:${javetVersion}"
+    javetNativeBundle "com.caoccao.javet:javet-v8-linux-arm64:${javetVersion}"
+    javetNativeBundle "com.caoccao.javet:javet-v8-macos-x86_64:${javetVersion}"
+    javetNativeBundle "com.caoccao.javet:javet-v8-macos-arm64:${javetVersion}"
+
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+def resolveUiContractSource = { roots, relativePath, fallbackPath ->
+    File resolved = roots.collect { new File(it, relativePath) }.find { it.isFile() }
+    resolved != null ? resolved : file(fallbackPath)
+}
+
+tasks.register("verifyUiApiContract") {
+    group = "verification"
+    description = "Verifies the canonical Havoc UI authoring contract against Java and TypeScript surfaces."
+
+    inputs.files(
+            file("src/main/resources/assets/havoc/ui/api/ui.contract.json"),
+            file("src/main/resources/assets/havoc/ui/api/ui.d.ts"),
+            file("src/main/java/havoc/client/render/engine/renderer/ui/runtime/core/UiNodeType.java"),
+            file("resources/assets/havoc/ui/api/ui.contract.json"),
+            file("resources/assets/havoc/ui/api/ui.d.ts"),
+            file("java/havoc/client/render/engine/renderer/ui/runtime/core/UiNodeType.java")
+    )
+
+    doLast {
+        File contractFile = resolveUiContractSource(
+                sourceSets.main.resources.srcDirs,
+                "assets/havoc/ui/api/ui.contract.json",
+                "resources/assets/havoc/ui/api/ui.contract.json"
+        )
+        File declarationsFile = resolveUiContractSource(
+                sourceSets.main.resources.srcDirs,
+                "assets/havoc/ui/api/ui.d.ts",
+                "resources/assets/havoc/ui/api/ui.d.ts"
+        )
+        File nodeTypeFile = resolveUiContractSource(
+                sourceSets.main.java.srcDirs,
+                "havoc/client/render/engine/renderer/ui/runtime/core/UiNodeType.java",
+                "java/havoc/client/render/engine/renderer/ui/runtime/core/UiNodeType.java"
+        )
+
+        [contractFile, declarationsFile, nodeTypeFile].each { candidate ->
+            if (!candidate.isFile()) {
+                throw new GradleException("UI contract verification input is missing: ${candidate}")
+            }
+        }
+
+        def contract = new groovy.json.JsonSlurper().parse(contractFile)
+        def rawNodeTypes = (contract.nodeTypes ?: []).collect { String.valueOf(it) }
+        def expectedNodeTypes = new LinkedHashSet(rawNodeTypes)
+        if (expectedNodeTypes.isEmpty()) {
+            throw new GradleException("ui.contract.json must declare at least one node type.")
+        }
+        if (expectedNodeTypes.size() != rawNodeTypes.size()) {
+            throw new GradleException("ui.contract.json contains duplicate nodeTypes.")
+        }
+
+        String enumSource = nodeTypeFile.getText("UTF-8")
+        def enumMatcher = enumSource =~ /(?s)public\s+enum\s+UiNodeType\s*\{(.*)\}\s*$/
+        if (!enumMatcher.find()) {
+            throw new GradleException("Could not parse UiNodeType enum for UI contract verification.")
+        }
+        def enumNames = new LinkedHashSet()
+        (enumMatcher.group(1) =~ /(?m)^\s*([A-Z][A-Z0-9_]*)\s*,?\s*$/).each { match ->
+            enumNames.add(match[1].toLowerCase(java.util.Locale.ROOT))
+        }
+        if (enumNames != expectedNodeTypes) {
+            def missingInJava = new LinkedHashSet(expectedNodeTypes)
+            missingInJava.removeAll(enumNames)
+            def missingInContract = new LinkedHashSet(enumNames)
+            missingInContract.removeAll(expectedNodeTypes)
+            throw new GradleException(
+                    "UI node-type contract mismatch. Missing in UiNodeType=${missingInJava}, "
+                            + "missing in ui.contract.json=${missingInContract}"
+            )
+        }
+
+        String declarations = declarationsFile.getText("UTF-8")
+        def nodeTypeMatcher = declarations =~ /(?s)export\s+type\s+UiNodeType\s*=\s*(.*?);/
+        if (!nodeTypeMatcher.find()) {
+            throw new GradleException("Could not parse UiNodeType from ui.d.ts.")
+        }
+        def declarationNodeTypes = new LinkedHashSet()
+        (nodeTypeMatcher.group(1) =~ /"([^"]+)"/).each { match -> declarationNodeTypes.add(match[1]) }
+        if (declarationNodeTypes != expectedNodeTypes) {
+            def missingInTypes = new LinkedHashSet(expectedNodeTypes)
+            missingInTypes.removeAll(declarationNodeTypes)
+            def extraInTypes = new LinkedHashSet(declarationNodeTypes)
+            extraInTypes.removeAll(expectedNodeTypes)
+            throw new GradleException(
+                    "UI TypeScript node-type contract mismatch. Missing=${missingInTypes}, extra=${extraInTypes}"
+            )
+        }
+
+        def styleMatcher = declarations =~ /(?s)export\s+type\s+UiInlineStyle\s*=\s*\{(.*?)\r?\n\};/
+        if (!styleMatcher.find()) {
+            throw new GradleException("Could not parse UiInlineStyle from ui.d.ts.")
+        }
+        def declarationStyleKeys = new LinkedHashSet()
+        (styleMatcher.group(1) =~ /(?m)^\s{2}([A-Za-z_$][A-Za-z0-9_$]*)\?:/).each { match ->
+            declarationStyleKeys.add(match[1])
+        }
+        def rawStyleKeys = (contract.styleKeys ?: []).collect { String.valueOf(it) }
+        def expectedStyleKeys = new LinkedHashSet(rawStyleKeys)
+        if (expectedStyleKeys.size() != rawStyleKeys.size()) {
+            throw new GradleException("ui.contract.json contains duplicate styleKeys.")
+        }
+        if (declarationStyleKeys != expectedStyleKeys) {
+            def missingInTypes = new LinkedHashSet(expectedStyleKeys)
+            missingInTypes.removeAll(declarationStyleKeys)
+            def extraInTypes = new LinkedHashSet(declarationStyleKeys)
+            extraInTypes.removeAll(expectedStyleKeys)
+            throw new GradleException(
+                    "UI TypeScript style-key contract mismatch. Missing=${missingInTypes}, extra=${extraInTypes}"
+            )
+        }
+
+        (contract.promotedStyles ?: [:]).each { sourceKey, targetKey ->
+            if (!expectedStyleKeys.contains(String.valueOf(targetKey))) {
+                throw new GradleException(
+                        "UI promoted style '${sourceKey}' targets unknown style key '${targetKey}'."
+                )
+            }
+        }
+        (contract.styleValues ?: [:]).each { styleKey, values ->
+            if (!expectedStyleKeys.contains(String.valueOf(styleKey))
+                    && !(contract.promotedStyles ?: [:]).containsKey(styleKey)) {
+                throw new GradleException("UI styleValues declares unknown style key '${styleKey}'.")
+            }
+            if (!(values instanceof Collection) || values.isEmpty()) {
+                throw new GradleException("UI styleValues['${styleKey}'] must be a non-empty array.")
+            }
+        }
+    }
+}
+
+tasks.register("verifyUniformCodegen", Exec) {
+    group = "verification"
+    description = "Checks GLSL std140/std430 packing, arrays, matrix strides and malformed layouts."
+    inputs.file(file("tools/uniform-codegen/UniformCodegen.java"))
+    commandLine "${System.getProperty('java.home')}/bin/java",
+            file("tools/uniform-codegen/UniformCodegen.java"), "test"
+}
+
+tasks.register("verifyGeneratedUniformPacking", Exec) {
+    group = "verification"
+    description = "Compiles generated std140/std430 classes and verifies actual byte-level layouts."
+    dependsOn tasks.named("verifyUniformCodegen")
+    inputs.files(file("tools/uniform-codegen/CodegenSmoke.java"),
+            file("tools/uniform-codegen/UniformCodegen.java"),
+            file("src/main/java/havoc/client/render/engine/rhi/shader/Std430Type.java"),
+            file("src/main/java/havoc/client/render/engine/rhi/shader/Std430StructLayout.java"))
+    commandLine "${System.getProperty('java.home')}/bin/java",
+            file("tools/uniform-codegen/CodegenSmoke.java")
+}
+
+tasks.register("verifyUniformSourceBoundary") {
+    group = "verification"
+    description = "Rejects direct main-source dependencies on verification-only generated uniform classes."
+    inputs.dir(file("src/main/java"))
+    doLast {
+        def offenders = fileTree("src/main/java") {
+            include "**/*.java"
+        }.files.findAll { it.getText("UTF-8").contains("havoc.client.render.engine.uniform.generated") }
+        if (!offenders.isEmpty()) {
+            throw new GradleException("Main sources import generated uniform classes: " +
+                    offenders.collect { project.relativePath(it) }.join(", "))
+        }
+    }
+}
+
+tasks.register("generateUniformBindings", Exec) {
+    group = "build"
+    description = "Discovers GLSL UBO/SSBO declarations and generates runtime layout metadata."
+    inputs.file(file("tools/uniform-codegen/UniformCodegen.java"))
+    inputs.files(fileTree("src/main/resources/assets/havoc/shaders") {
+        include "**/*.vert", "**/*.frag", "**/*.geom", "**/*.comp", "**/*.glsl"
+    })
+    outputs.dir(generatedUniformResources)
+    commandLine "${System.getProperty('java.home')}/bin/java",
+            file("tools/uniform-codegen/UniformCodegen.java"), "discover",
+            file("src/main/resources/assets/havoc/shaders"),
+            generatedUniformResources.get().asFile
+}
+
+tasks.register("verifyUniformBindingContracts", Exec) {
+    group = "verification"
+    description = "Checks Java uniform writers and blocks against every discovered GLSL layout before compilation."
+    dependsOn tasks.named("generateUniformBindings")
+    inputs.file(file("tools/uniform-codegen/UniformCodegen.java"))
+    inputs.dir(file("src/main/java"))
+    inputs.dir(generatedUniformResources)
+    commandLine "${System.getProperty('java.home')}/bin/java",
+            file("tools/uniform-codegen/UniformCodegen.java"), "verify",
+            generatedUniformResources.get().file("havoc/uniform-bindings-v2.tsv").asFile,
+            file("src/main/java")
+}
+
+tasks.named("compileJava") {
+    dependsOn tasks.named("verifyUniformBindingContracts")
+}
+
+tasks.named("compileJava") {
+    dependsOn tasks.named("verifyUiApiContract")
+}
+
+tasks.named("processResources") {
+    dependsOn tasks.named("verifyUiApiContract"), tasks.named("generateUniformBindings")
+}
+
+// Packaging is intentionally independent from verification. Tests remain available through
+// the explicit `test` / `check` tasks, but the normal `build` path only assembles artifacts.
+tasks.named('build') {
+    setDependsOn([tasks.named('assemble')])
+}
+
+tasks.register("validateIrisPatches", JavaExec) {
+    group = "verification"
+    description = "Compiles bundled Iris patch manifests against a shaderpack zip without modifying it."
+    dependsOn classes
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = "havoc.client.render.iris.patch.ShaderPatchCompilerCli"
+    doFirst {
+        if (!project.hasProperty("shaderpack")) {
+            throw new GradleException("Pass -Pshaderpack=<path-to-shaderpack.zip>")
+        }
+        args project.property("shaderpack")
+    }
+}
+
+tasks.register("generateSvgMsdf", Exec) {
+    group = "render assets"
+    description = "Generates MTSDF texture assets for tintable SVG icons."
+    dependsOn tasks.named("compileSvgMsdfToolJava")
+
+    def inputDir = file("src/main/resources/assets/havoc/svg")
+    def outputDir = svgMsdfGeneratedResources.map { it.dir("assets/havoc/svg/msdf") }
+    def script = file("tools/msdf/GenerateSvgMsdf.ps1")
+    def preprocessorClasspath = sourceSets.svgMsdfTool.output.classesDirs.asPath +
+            File.pathSeparator + sourceSets.main.output.classesDirs.asPath +
+            File.pathSeparator + sourceSets.main.compileClasspath.asPath
+    def generatorJava = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    }
+    inputs.files(fileTree(inputDir) {
+        include "**/*.svg"
+        exclude "msdf/**"
+    })
+    inputs.file(script)
+    outputs.dir(outputDir)
+    onlyIf {
+        if (!script.isFile()) {
+            logger.warn("SVG MSDF generator missing: ${script}")
+            return false
+        }
+        return true
+    }
+    doFirst {
+        outputDir.get().asFile.mkdirs()
+    }
+    commandLine "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", script.absolutePath,
+            "-InputRoot", inputDir.path,
+            "-OutRoot", outputDir.get().asFile.path,
+            "-PreprocessorClasspath", preprocessorClasspath,
+            "-JavaExe", generatorJava.get().executablePath.asFile.absolutePath
+}
+
+tasks.register("generateFontMsdf", Exec) {
+    group = "render assets"
+    description = "Regenerates compact MSDF atlases for bundled icon and symbol fonts."
+
+    def script = file("tools/msdf/GenerateFontMsdf.ps1")
+    inputs.files(fileTree("src/main/resources/assets/havoc/font") {
+        include "matrix_sans_print.ttf", "icons.ttf", "iconsnur.ttf", "mediaplayer.ttf", "vanilla_symbols.ttf", "weather_icons.ttf"
+    })
+    inputs.file(script)
+    def atlasBases = ["matrix_sans_print", "icons", "iconsnur", "mediaplayer", "vanilla_symbols", "weather_icons"]
+    outputs.files(atlasBases.collectMany { base -> [
+            file("src/main/resources/assets/havoc/font/msdf/${base}.json"),
+            file("src/main/resources/assets/havoc/font/msdf/${base}.png")
+    ] })
+
+    commandLine "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", script.absolutePath
+}
+
+
+tasks.register("unpackJavetNatives", Copy) {
+    group = "runtime assets"
+    description = "Copies bundled Javet V8 native binaries into generated resources."
+    into javetNativeGeneratedResources.map { it.dir("javet/natives") }
+    from({ configurations.javetNativeBundle.collect { zipTree(it) } }) {
+        include "**/*.dll", "**/*.so", "**/*.dylib"
+        eachFile { details ->
+            details.path = details.name
+        }
+        includeEmptyDirs = false
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.register("syncJavetNatives", Copy) {
+    group = "runtime assets"
+    description = "Copies Javet V8 native binaries into src/main/resources/javet/natives for committing/debugging."
+    into file("src/main/resources/javet/natives")
+    from({ configurations.javetNativeBundle.collect { zipTree(it) } }) {
+        include "**/*.dll", "**/*.so", "**/*.dylib"
+        eachFile { details ->
+            details.path = details.name
+        }
+        includeEmptyDirs = false
+    }
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+processResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    dependsOn tasks.named("generateSvgMsdf")
+    dependsOn tasks.named("unpackJavetNatives")
+    from(javetNativeGeneratedResources)
+    inputs.property "mod_id", havocModId
+    inputs.property "mod_name", havocModName
+    inputs.property "mod_license", havocModLicense
+    inputs.property "version", project.version
+    inputs.property "minecraft_version", project.minecraft_version
+    inputs.property "havoc_dev", havocDevEnabled.get()
+    inputs.property "havoc_vulkan_debug", havocVulkanDebugEnabled.get()
+    filteringCharset "UTF-8"
+
+    filesMatching("fabric.mod.json") {
+        expand "mod_id": havocModId,
+                "mod_name": havocModName,
+                "mod_license": havocModLicense,
+                "version": project.version,
+                "minecraft_version": project.minecraft_version,
+                "loader_version": project.loader_version
+    }
+
+    doLast {
+        if (!havocDevEnabled.get() && !havocVulkanDebugEnabled.get()) return
+        def metadataFile = new File(destinationDir, "fabric.mod.json")
+        def metadata = new groovy.json.JsonSlurper().parse(metadataFile)
+        def mixins = metadata.mixins instanceof java.util.Collection
+                ? new ArrayList(metadata.mixins)
+                : new ArrayList()
+        if (havocDevEnabled.get() && !mixins.contains("havoc-dev.mixins.json")) {
+            mixins.add("havoc-dev.mixins.json")
+        }
+        if (!mixins.contains("havoc-vulkan-debug.mixins.json")) {
+            if (havocVulkanDebugEnabled.get()) {
+                mixins.add("havoc-vulkan-debug.mixins.json")
+            }
+        }
+        metadata.mixins = mixins
+        metadataFile.setText(
+                groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(metadata)) + System.lineSeparator(),
+                "UTF-8"
+        )
+    }
+}
+
+tasks.named("processDevResources") {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+tasks.named("processDuplexCourierResources") {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    inputs.property "version", duplexCourierVersion
+    inputs.property "minecraft_version", providers.gradleProperty("minecraft_version").get()
+    filteringCharset "UTF-8"
+    filesMatching("fabric.mod.json") {
+        expand "version": duplexCourierVersion,
+                "minecraft_version": providers.gradleProperty("minecraft_version").get()
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    // ensure that the encoding is set to UTF-8, no matter what the system default is
+    // this fixes some edge cases with special characters not displaying correctly
+    // see http://yodaconditions.net/blog/fix-for-java-file-encoding-problems-with-gradle.html
+    // If Javadoc is generated, this must be specified in that task too.
+    it.options.encoding = "UTF-8"
+    if (targetJavaVersion >= 10 || JavaVersion.current().isJava10Compatible()) {
+        it.options.release.set(targetJavaVersion)
+    }
+}
+
+tasks.named("compileJava", JavaCompile) {
+    options.compilerArgs.add("-Ahavoc.indexName=main")
+}
+
+tasks.named("compileDevJava", JavaCompile) {
+    options.compilerArgs.add("-Ahavoc.indexName=dev")
+}
+
+tasks.named("compileVulkanDebugJava", JavaCompile) {
+    options.compilerArgs.add("-Ahavoc.indexName=vulkanDebug")
+}
+
+tasks.named("compileDuplexCourierJava", JavaCompile) {
+    options.compilerArgs.add("-proc:none")
+}
+
+def duplexCourierJar = tasks.register("duplexCourierJar", Jar) {
+    group = "build"
+    description = "Assembles the standalone Duplex Courier Fabric mod."
+    dependsOn tasks.named("duplexCourierClasses")
+    archiveBaseName.set("havoc-duplex-courier")
+    archiveVersion.set(duplexCourierVersion)
+    archiveClassifier.set("")
+    from(sourceSets.duplexCourier.output)
+    manifest {
+        attributes(
+                "Multi-Release": "true",
+                "Fabric-Mapping-Namespace": "official"
+        )
+    }
+}
+
+tasks.register("buildDuplexCourier") {
+    group = "build"
+    description = "Builds only the standalone Duplex Courier mod."
+    dependsOn duplexCourierJar
+}
+
+java {
+    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
+    if (JavaVersion.current() < javaVersion) {
+        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    }
+    // Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+    // if it is present.
+    // If you remove this line, sources will not be generated.
+   // withSourcesJar()
+}
+
+tasks.matching { it.name == "sourcesJar" }.configureEach {
+    dependsOn tasks.named("generateSvgMsdf")
+    exclude("javet/natives/**")
+    exclude("havoc/nativeguard/**")
+}
+
+jar {
+    manifest {
+        attributes("Multi-Release": "true")
+    }
+
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+    from("THIRD_PARTY_NOTICES.md")
+    from("THIRD_PARTY_LICENSES/Noto-OFL-1.1.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from("THIRD_PARTY_LICENSES/Noto-CJK-OFL-1.1.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from("THIRD_PARTY_LICENSES/Iosevka-OFL-1.1.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from("THIRD_PARTY_LICENSES/GFBS-glTF-MIT.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from("THIRD_PARTY_LICENSES/JglTF-MIT.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from("THIRD_PARTY_LICENSES/Jackson-Apache-2.0.txt") {
+        into "THIRD_PARTY_LICENSES"
+    }
+    from {
+        [configurations.bundledLibrary, configurations.linuxBundledLibrary]
+                .collectMany { configuration -> configuration.collect { it.isDirectory() ? it : zipTree(it) } }
+    }
+    exclude "com/google/gson/**"
+    exclude "org/slf4j/**"
+    exclude "META-INF/*.RSA", "META-INF/*.SF", "META-INF/*.DSA"
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    if (havocDevEnabled.get()) {
+        dependsOn tasks.named("compileDevJava"), tasks.named("processDevResources")
+        from(sourceSets.dev.output)
+    }
+    if (havocVulkanDebugEnabled.get()) {
+        dependsOn tasks.named("compileVulkanDebugJava"), tasks.named("processVulkanDebugResources")
+        from(sourceSets.vulkanDebug.output)
+    }
+}
+
+// Gradle cannot accept an arbitrary global `--dev` flag for the built-in `build` task
+// from build.gradle itself. Use this alias or `-PhavocDev=true`.
+tasks.register("buildDev") {
+    group = "build"
+    description = "Builds Havoc with development source set and dev metadata enabled."
+    dependsOn "build"
+}
+
+// configure the maven publication
+publishing {
+    publications {
+        create("mavenJava", MavenPublication) {
+            artifactId = project.archives_base_name
+            from components.java
+        }
+    }
+
+    // See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+    repositories {
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/${System.getenv('GITHUB_REPOSITORY') ?: 'OWNER/havoc-client'}")
+            credentials {
+                username = findProperty("gpr.user") ?: System.getenv("GITHUB_ACTOR") ?: ""
+                password = findProperty("gpr.key") ?: System.getenv("GITHUB_TOKEN") ?: System.getenv("GH_TOKEN") ?: ""
+            }
+        }
+    }
+}
+
+// Release profile packaging lives separately from the ordinary Loom build.
+ext.havocJavetVersion = javetVersion
+apply from: rootProject.file("gradle/release-distributions.gradle")

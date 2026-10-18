@@ -1,0 +1,181 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.module.modules.player;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import havoc.client.config.values.BooleanValue;
+import havoc.client.features.module.Module;
+import havoc.client.features.module.ModuleCategory;
+import havoc.client.features.module.ModuleInfo;
+import havoc.client.features.module.ModuleSubcategory;
+import havoc.client.mixins.accessors.PlayerInventoryAccessor;
+import havoc.client.util.player.ResetAttackCooldown;
+import havoc.client.util.player.inventory.InventorySwap;
+
+@ModuleInfo(
+        id = "clickpearl",
+        displayName = "ClickPearl",
+        category = ModuleCategory.PLAYER, subcategory = ModuleSubcategory.AUTOMATION,
+        description = "module.clickpearl.description")
+public class ClickPearl extends Module {
+    private static final String ACTION_CLICKPEARL = "clickpearl";
+
+    private final BooleanValue useOffhand = bool("clickPearlUseOffhand", "use_offhand", true);
+    private final BooleanValue searchInventory = bool("clickPearlSearchInventory", "search_inventory", true);
+    private final BooleanValue swing = bool("clickPearlSwing", "swing", true);
+
+    private final Minecraft client = Minecraft.getInstance();
+    private ItemStack previousHeld = ItemStack.EMPTY;
+
+    public ClickPearl() {
+        // Default binds:
+        // - Toggle module with LEFT_CTRL+Z
+        // - Action key is Z (handled by module's own logic)
+        setDefaultBind("LEFT_CTRL+Z");
+        action(ACTION_CLICKPEARL, "Z");
+    }
+
+    @havoc.client.features.gui.hud.actions.HudAction(id = ACTION_CLICKPEARL,
+            label = "Pearl", description = "Throw an ender pearl", icon = "circle-dot")
+    public havoc.client.features.gui.hud.actions.HudActionRegistry.State hudPearl() {
+        var player = client.player;
+        boolean hasPearl = player != null && (useOffhand.get() && isPearl(player.getOffhandItem())
+                || findPearlInHotbar(player) >= 0
+                || searchInventory.get() && findPearlInInventory(player) >= 0);
+        boolean cooling = player != null && player.getCooldowns().isOnCooldown(new ItemStack(Items.ENDER_PEARL));
+        return new havoc.client.features.gui.hud.actions.HudActionRegistry.State(
+                new ItemStack(Items.ENDER_PEARL), hasPearl, false, false, cooling ? 1.0f : 0.0f);
+    }
+
+    @Override
+    public void onTick() {
+        if (!isEnabled()) return;
+        if (client.player == null || client.gameMode == null) return;
+
+        if (isActionPressedOnce(ACTION_CLICKPEARL)) {
+            tryThrowPearl();
+        }
+    }
+
+    // ===========================
+    //      ТВОЯ ЛОГИКА — НЕ ТРОНУТА
+    // ===========================
+    private void tryThrowPearl() {
+        LocalPlayer player = client.player;
+        MultiPlayerGameMode manager = client.gameMode;
+        if (player == null || manager == null) return;
+        if (player.getCooldowns().isOnCooldown(new ItemStack(Items.ENDER_PEARL))) return;
+
+        PlayerInventoryAccessor inv = (PlayerInventoryAccessor) player.getInventory();
+        int originalSlot = inv.havoc$getSelectedSlot();
+
+        ItemStack off = player.getOffhandItem();
+        if (useOffhand.get() && isPearl(off)) {
+            manager.useItem(player, InteractionHand.OFF_HAND);
+            swingIfEnabled(player, InteractionHand.OFF_HAND);
+            return;
+        }
+
+        int hotbarPearl = findPearlInHotbar(player);
+        if (hotbarPearl != -1) {
+            inv.havoc$setSelectedSlot(hotbarPearl);
+            manager.useItem(player, InteractionHand.MAIN_HAND);
+            swingIfEnabled(player, InteractionHand.MAIN_HAND);
+            inv.havoc$setSelectedSlot(originalSlot);
+            return;
+        }
+
+        if (!searchInventory.get()) return;
+        int invPearl = findPearlInInventory(player);
+        if (invPearl == -1) return;
+
+        int emptyHotbar = findFirstEmptyHotbarSlot(player);
+        var handler = player.inventoryMenu;
+        if (handler == null) return;
+        int syncId = handler.containerId;
+
+        client.execute(() -> {
+            if (emptyHotbar != -1) {
+                int pearlScreen = InventorySwap.mapInventoryToScreenSlot(invPearl);
+                int targetScreen = InventorySwap.mapHotbarToScreenSlot(emptyHotbar);
+
+                InventorySwap.INSTANCE.swapScreenSlots(pearlScreen, targetScreen);
+
+                inv.havoc$setSelectedSlot(emptyHotbar);
+                manager.useItem(player, InteractionHand.MAIN_HAND);
+                swingIfEnabled(player, InteractionHand.MAIN_HAND);
+                inv.havoc$setSelectedSlot(originalSlot);
+            } else {
+                int targetScreen = InventorySwap.mapHotbarToScreenSlot(originalSlot);
+                int pearlScreen = InventorySwap.mapInventoryToScreenSlot(invPearl);
+
+                ItemStack currentHeld = player.getMainHandItem();
+                previousHeld = currentHeld.isEmpty() ? ItemStack.EMPTY : currentHeld.copy();
+
+                InventorySwap.INSTANCE.swapScreenSlots(pearlScreen, targetScreen);
+
+                manager.useItem(player, InteractionHand.MAIN_HAND);
+                swingIfEnabled(player, InteractionHand.MAIN_HAND);
+
+                if (!previousHeld.isEmpty()) {
+                    int restoreSlot = findItemInInventory(player, previousHeld);
+                    if (restoreSlot != -1) {
+                        int restoreScreen = InventorySwap.mapInventoryToScreenSlot(restoreSlot);
+                        InventorySwap.INSTANCE.swapScreenSlots(restoreScreen, targetScreen);
+                        ResetAttackCooldown.resetAttackCooldown(player);
+                    }
+                }
+
+                inv.havoc$setSelectedSlot(originalSlot);
+            }
+        });
+    }
+
+    private void swingIfEnabled(LocalPlayer player, InteractionHand hand) {
+        if (swing.get()) player.swing(hand);
+    }
+
+    private boolean isPearl(ItemStack stack) {
+        return stack != null && stack.is(Items.ENDER_PEARL);
+    }
+
+    private int findPearlInHotbar(LocalPlayer player) {
+        for (int i = 0; i < 9; i++) {
+            if (isPearl(player.getInventory().getItem(i))) return i;
+        }
+        return -1;
+    }
+
+    private int findPearlInInventory(LocalPlayer player) {
+        for (int i = 0; i < 36; i++) {
+            if (isPearl(player.getInventory().getItem(i))) return i;
+        }
+        return -1;
+    }
+
+    private int findFirstEmptyHotbarSlot(LocalPlayer player) {
+        for (int i = 0; i < 9; i++) {
+            if (player.getInventory().getItem(i).isEmpty()) return i;
+        }
+        return -1;
+    }
+
+    private int findItemInInventory(LocalPlayer player, ItemStack itemStack) {
+        if (itemStack == null || itemStack.isEmpty()) return -1;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = player.getInventory().getItem(i);
+            if (!s.isEmpty() && s.getItem() == itemStack.getItem()) return i;
+        }
+        return -1;
+    }
+}

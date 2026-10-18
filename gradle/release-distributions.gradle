@@ -1,0 +1,666 @@
+def havocReleaseDir = layout.buildDirectory.dir("release")
+def havocReleaseReportDir = layout.buildDirectory.dir("reports/havoc-release")
+def havocReleaseFontProfile = providers.gradleProperty("havocReleaseFontProfile")
+        .map { it.trim().toLowerCase(java.util.Locale.ROOT) }
+        .orElse("base")
+def havocReleaseSlimTargets = providers.gradleProperty("havocReleaseSlimTargets")
+        .orElse("windows-x86_64,linux-x86_64,linux-arm64,macos-x86_64,macos-arm64")
+        .map { value -> value.split(',').collect { it.trim().toLowerCase(java.util.Locale.ROOT) }.findAll { !it.isEmpty() } }
+def havocReleaseDevEnabled = providers.gradleProperty("havocDev")
+        .orElse(providers.gradleProperty("dev"))
+        .orElse(providers.gradleProperty("devBuild"))
+        .map { it.toBoolean() }
+        .orElse(false)
+def havocReleaseVulkanDebugEnabled = providers.gradleProperty("havocVulkanDebug")
+        .map { it.toBoolean() }
+        .orElse(false)
+
+def havocSupportedSlimTargets = new LinkedHashSet<String>([
+        "windows-x86_64",
+        "linux-x86_64",
+        "linux-arm64",
+        "macos-x86_64",
+        "macos-arm64"
+])
+
+def havocMediaTargets = new LinkedHashSet<String>([
+        "windows-x86_64",
+        "linux-x86_64",
+        "linux-arm64"
+])
+
+def havocJavetModuleByTarget = [
+        "windows-x86_64": "javet-v8-windows-x86_64",
+        "linux-x86_64"  : "javet-v8-linux-x86_64",
+        "linux-arm64"   : "javet-v8-linux-arm64",
+        "macos-x86_64"  : "javet-v8-macos-x86_64",
+        "macos-arm64"   : "javet-v8-macos-arm64"
+]
+
+def havocBuiltinFontRoot = "assets/havoc/font/"
+
+def havocBaseFontOptionalPrefixes = [
+        "assets/havoc/font/coverage/cjk/",
+        "assets/havoc/font/optional/cjk/",
+        "assets/havoc/font/cjk/",
+        "assets/havoc/font/noto-cjk/",
+        "assets/havoc/font/noto_cjk/"
+]
+
+// Confirmed orphaned particle textures: no catalog entry or resource reference remains.
+def havocDeadReleaseEntries = new LinkedHashSet<String>([
+        "assets/havoc/textures/particles/cross.png",
+        "assets/havoc/textures/particles/cube.png",
+        "assets/havoc/textures/particles/feather.png",
+        "assets/havoc/textures/particles/glow.png",
+        "assets/havoc/textures/particles/mcross.png",
+        "assets/havoc/textures/particles/moon.png",
+        "assets/havoc/textures/particles/spark.png",
+        "assets/havoc/textures/particles/triangle.png"
+])
+
+def havocSha256 = { byte[] bytes ->
+    def digest = java.security.MessageDigest.getInstance("SHA-256")
+    digest.digest(bytes).collect { String.format("%02x", it & 0xff) }.join()
+}
+
+def havocFileSha256 = { File file ->
+    def digest = java.security.MessageDigest.getInstance("SHA-256")
+    file.withInputStream { input ->
+        byte[] buffer = new byte[1024 * 1024]
+        int read
+        while ((read = input.read(buffer)) >= 0) {
+            if (read > 0) digest.update(buffer, 0, read)
+        }
+    }
+    digest.digest().collect { String.format("%02x", it & 0xff) }.join()
+}
+
+def havocZipBytes = { java.util.zip.ZipFile zip, String name ->
+    def entry = zip.getEntry(name)
+    if (entry == null || entry.isDirectory()) return null
+    zip.getInputStream(entry).withCloseable { it.readAllBytes() }
+}
+
+def havocAtlasBaseForFont = { String fileName ->
+    int dot = fileName.lastIndexOf('.')
+    dot > 0 ? fileName.substring(0, dot) : fileName
+}
+
+def havocValidateAtlas = { java.util.zip.ZipFile zip, String fontFile ->
+    String baseName = havocAtlasBaseForFont(fontFile)
+    String jsonName = "assets/havoc/font/msdf/${baseName}.json"
+    String pngName = "assets/havoc/font/msdf/${baseName}.png"
+    def jsonEntry = zip.getEntry(jsonName)
+    def pngEntry = zip.getEntry(pngName)
+
+    if (jsonEntry == null && pngEntry == null) return null
+    if (jsonEntry == null || pngEntry == null) {
+        throw new GradleException("Incomplete MSDF atlas for ${fontFile}: expected both ${jsonName} and ${pngName}")
+    }
+
+    byte[] jsonBytes = havocZipBytes(zip, jsonName)
+    byte[] pngBytes = havocZipBytes(zip, pngName)
+    def metadata
+    try {
+        metadata = new groovy.json.JsonSlurper().parseText(new String(jsonBytes, java.nio.charset.StandardCharsets.UTF_8))
+    } catch (Throwable t) {
+        throw new GradleException("Invalid MSDF metadata ${jsonName}", t)
+    }
+
+    def image
+    try {
+        image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(pngBytes))
+    } catch (Throwable t) {
+        throw new GradleException("Invalid MSDF texture ${pngName}", t)
+    }
+    if (image == null || image.width <= 0 || image.height <= 0) {
+        throw new GradleException("Unreadable/empty MSDF texture ${pngName}")
+    }
+
+    def atlas = metadata instanceof Map ? metadata.atlas : null
+    if (atlas instanceof Map) {
+        int metadataWidth = atlas.width instanceof Number ? atlas.width.intValue() : image.width
+        int metadataHeight = atlas.height instanceof Number ? atlas.height.intValue() : image.height
+        if (metadataWidth != image.width || metadataHeight != image.height) {
+            throw new GradleException("MSDF atlas dimensions disagree for ${baseName}: metadata=${metadataWidth}x${metadataHeight}, png=${image.width}x${image.height}")
+        }
+        if (atlas.distanceRange instanceof Number && atlas.distanceRange.doubleValue() <= 0.0d) {
+            throw new GradleException("MSDF distanceRange must be > 0 for ${baseName}")
+        }
+    }
+
+    def glyphs = metadata instanceof Map ? metadata.glyphs : null
+    if (!(glyphs instanceof Collection) || glyphs.isEmpty()) {
+        throw new GradleException("MSDF atlas ${jsonName} has no glyph records")
+    }
+
+    String requiredName = "assets/havoc/font/msdf/${baseName}.required-glyphs.txt"
+    def requiredEntry = zip.getEntry(requiredName)
+    int requiredGlyphCount = 0
+    String requiredGlyphsSha256 = ''
+    if (requiredEntry != null) {
+        def present = new HashSet<Integer>()
+        glyphs.each { glyph ->
+            if (glyph instanceof Map && glyph.unicode instanceof Number) {
+                present.add(glyph.unicode.intValue())
+            }
+        }
+        byte[] requiredBytes = havocZipBytes(zip, requiredName)
+        requiredGlyphsSha256 = havocSha256(requiredBytes)
+        String requiredText = new String(requiredBytes, java.nio.charset.StandardCharsets.UTF_8)
+        requiredText.readLines().each { raw ->
+            String token = raw.trim()
+            if (token.isEmpty() || token.startsWith('#')) return
+            int codePoint
+            if (token.toUpperCase(java.util.Locale.ROOT).startsWith('U+')) {
+                codePoint = Integer.parseInt(token.substring(2), 16)
+            } else if (token.startsWith('0x') || token.startsWith('0X')) {
+                codePoint = Integer.parseInt(token.substring(2), 16)
+            } else if (token.codePointCount(0, token.length()) == 1 && !token.matches('^[0-9]+$')) {
+                codePoint = token.codePointAt(0)
+            } else {
+                codePoint = Integer.parseInt(token)
+            }
+            requiredGlyphCount++
+            if (!present.contains(codePoint)) {
+                throw new GradleException(String.format(java.util.Locale.ROOT,
+                        "MSDF atlas %s is missing required glyph U+%04X", baseName, codePoint))
+            }
+        }
+    }
+
+    return [
+            font             : fontFile,
+            atlas            : baseName,
+            width            : image.width,
+            height           : image.height,
+            glyphs           : glyphs.size(),
+            requiredGlyphs   : requiredGlyphCount,
+            requiredGlyphsSha256: requiredGlyphsSha256,
+            metadataSha256   : havocSha256(jsonBytes),
+            textureSha256    : havocSha256(pngBytes),
+            validatorVersion : 2
+    ]
+}
+
+def havocFontSnapshotFile = layout.buildDirectory.file("generated/release/font-msdf-snapshot.json")
+def havocPrepareFontSnapshot = tasks.register('prepareReleaseFontSnapshot') {
+    group = 'release'
+    description = 'Validates releasable MSDF font atlases and writes a content-addressed pruning snapshot.'
+    dependsOn tasks.named('jar')
+    inputs.file(tasks.named('jar').flatMap { it.archiveFile })
+    inputs.property('validatorVersion', 2)
+    inputs.property('generatorContract', 'havoc-msdf-v2')
+    def generatorScript = rootProject.file('tools/msdf/GenerateFontMsdf.ps1')
+    if (generatorScript.exists()) {
+        inputs.file(generatorScript)
+    }
+    outputs.file(havocFontSnapshotFile)
+    outputs.cacheIf { true }
+
+    doLast {
+        File inputJar = tasks.named('jar').get().archiveFile.get().asFile
+        File outputFile = havocFontSnapshotFile.get().asFile
+        outputFile.parentFile.mkdirs()
+
+        def prunableFonts = new LinkedHashSet<String>()
+        def atlases = new ArrayList<Map>()
+        new java.util.zip.ZipFile(inputJar).withCloseable { inputZip ->
+            def entryNames = new LinkedHashSet<String>()
+            inputZip.entries().each { entry ->
+                if (!entry.isDirectory()) entryNames.add(entry.name)
+            }
+            entryNames.findAll { name ->
+                if (!name.startsWith(havocBuiltinFontRoot)) return false
+                String relative = name.substring(havocBuiltinFontRoot.length())
+                if (relative.contains('/')) return false
+                String lower = relative.toLowerCase(java.util.Locale.ROOT)
+                return lower.endsWith('.ttf') || lower.endsWith('.otf')
+            }.sort().each { sourceName ->
+                String fontFile = sourceName.substring(havocBuiltinFontRoot.length())
+                def atlasSnapshot = havocValidateAtlas(inputZip, fontFile)
+                if (atlasSnapshot != null) {
+                    atlasSnapshot.sourceSha256 = havocSha256(havocZipBytes(inputZip, sourceName))
+                    prunableFonts.add(fontFile)
+                    atlases.add(atlasSnapshot)
+                }
+            }
+        }
+
+        def snapshot = new LinkedHashMap<String, Object>()
+        snapshot.validatorVersion = 2
+        snapshot.generatorContract = 'havoc-msdf-v2'
+        snapshot.generatorProfile = 'icons-symbols-default'
+        snapshot.generatorScriptSha256 = generatorScript.isFile() ? havocFileSha256(generatorScript) : ''
+        snapshot.inputJarSha256 = havocFileSha256(inputJar)
+        snapshot.prunableFonts = new ArrayList<>(prunableFonts)
+        snapshot.atlases = atlases
+        outputFile.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(snapshot)) + '\n', 'UTF-8')
+    }
+}
+
+def havocResolveJavetNativeNames = { String target ->
+    String moduleName = havocJavetModuleByTarget[target]
+    if (moduleName == null) return [] as Set
+    def artifact = configurations.javetNativeBundle.resolvedConfiguration.resolvedArtifacts.find {
+        it.moduleVersion.id.name == moduleName
+    }
+    if (artifact == null) {
+        throw new GradleException("Javet native artifact for ${target} was not resolved (${moduleName}:${project.ext.havocJavetVersion})")
+    }
+    def names = new LinkedHashSet<String>()
+    new java.util.zip.ZipFile(artifact.file).withCloseable { zip ->
+        zip.entries().each { entry ->
+            if (entry.isDirectory()) return
+            String lower = entry.name.toLowerCase(java.util.Locale.ROOT)
+            if (lower.endsWith('.dll') || lower.endsWith('.so') || lower.endsWith('.dylib')) {
+                names.add(entry.name.tokenize('/').last())
+            }
+        }
+    }
+    if (names.isEmpty()) {
+        throw new GradleException("Javet native artifact ${artifact.file.name} contains no native library")
+    }
+    return names
+}
+
+def havocArchiveEntries = { configuration ->
+    def entries = new LinkedHashSet<String>()
+    configuration.resolve().each { file ->
+        if (file.isDirectory()) {
+            file.eachFileRecurse { child ->
+                if (child.isFile()) {
+                    entries.add(file.toPath().relativize(child.toPath()).toString().replace('\\', '/'))
+                }
+            }
+            return
+        }
+        try {
+            new java.util.zip.ZipFile(file).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    if (!entry.isDirectory()) entries.add(entry.name)
+                }
+            }
+        } catch (java.util.zip.ZipException ignored) {
+            // Non-archive dependency; no shaded entries to classify.
+        }
+    }
+    return entries
+}
+
+def havocShouldDropPlatformEntry = { String name, String target ->
+    boolean windows = target.startsWith('windows-')
+    boolean linux = target.startsWith('linux-')
+
+    if (!linux) {
+        if (name.startsWith('havoc/client/util/media/impl/linux/')) return true
+        if (name.startsWith('org/freedesktop/dbus/')) return true
+        if (name.startsWith('META-INF/services/org.freedesktop.dbus.')) return true
+        if (name.startsWith('META-INF/maven/com.github.hypfvieh/dbus-java')) return true
+    }
+    if (!windows) {
+        if (name.startsWith('havoc/client/util/media/impl/win/')) return true
+        if (name.startsWith('mediaplayerinfo/natives/win/')) return true
+    }
+
+    if (name.startsWith('havoc/nativeguard/')) {
+        String relative = name.substring('havoc/nativeguard/'.length())
+        if (!relative.startsWith(target + '/')) return true
+    }
+    return false
+}
+
+
+def registerHavocReleaseProfile = { String taskName, Map spec ->
+    def taskProvider = tasks.register(taskName) {
+        group = 'release'
+        description = "Builds Havoc release distribution '${spec.profile}' (${spec.target}, fonts=${spec.fontProfile})."
+        dependsOn tasks.named('jar'), havocPrepareFontSnapshot
+        inputs.file(tasks.named('jar').flatMap { it.archiveFile })
+        inputs.file(havocFontSnapshotFile)
+        inputs.files(configurations.javetNativeBundle)
+        inputs.files(configurations.linuxBundledLibrary)
+        inputs.property('distributionProfile', spec.profile)
+        inputs.property('distributionTarget', spec.target)
+        inputs.property('fontProfile', spec.fontProfile)
+        outputs.file(havocReleaseDir.map { dir -> dir.file("${project.archives_base_name}-${project.version}-${spec.outputSuffix}.jar") })
+        outputs.file(havocReleaseReportDir.map { dir -> dir.file("${spec.outputSuffix}.json") })
+        outputs.cacheIf { true }
+
+        doFirst {
+            if (havocReleaseDevEnabled.get()) {
+                throw new GradleException('Havoc release artifacts cannot be built with havocDev/dev/devBuild enabled.')
+            }
+            if (havocReleaseVulkanDebugEnabled.get()) {
+                throw new GradleException('Havoc release artifacts cannot be built with havocVulkanDebug enabled.')
+            }
+        }
+
+        doLast {
+            if (!(spec.fontProfile in ['full', 'base'])) {
+                throw new GradleException("Unsupported Havoc font profile '${spec.fontProfile}'. Supported: full, base")
+            }
+            if (spec.target != 'universal' && !havocSupportedSlimTargets.contains(spec.target)) {
+                throw new GradleException("Unsupported Havoc release target '${spec.target}'")
+            }
+
+            File inputJar = tasks.named('jar').get().archiveFile.get().asFile
+            File outputDir = havocReleaseDir.get().asFile
+            File reportDir = havocReleaseReportDir.get().asFile
+            outputDir.mkdirs()
+            reportDir.mkdirs()
+            File outputJar = new File(outputDir, "${project.archives_base_name}-${project.version}-${spec.outputSuffix}.jar")
+            File reportFile = new File(reportDir, "${spec.outputSuffix}.json")
+            File tempJar = new File(outputDir, outputJar.name + '.tmp')
+            if (tempJar.exists()) tempJar.delete()
+
+            def prunedEntries = new ArrayList<String>()
+            def prunedSourceFonts = new LinkedHashSet<String>()
+            def atlasSnapshots = new ArrayList<Map>()
+            def includedJavetNatives = new LinkedHashSet<String>()
+            def includedNativeResources = new LinkedHashSet<String>()
+            def mediaTargets = new LinkedHashSet<String>()
+            def mediaOmittedTargets = new LinkedHashSet<String>()
+            def javetTargets = new LinkedHashSet<String>()
+            def javetOmittedTargets = new LinkedHashSet<String>()
+            def resolvedFontCoverage = new LinkedHashSet<String>()
+            def selectedJavetNames = spec.target == 'universal'
+                    ? null
+                    : havocResolveJavetNativeNames(spec.target)
+            if (spec.target != 'universal') {
+                javetOmittedTargets.addAll(havocSupportedSlimTargets.findAll { it != spec.target })
+                mediaOmittedTargets.addAll(havocMediaTargets.findAll { it != spec.target })
+            }
+
+            def linuxOnlyDependencyEntries = new LinkedHashSet<String>()
+            if (spec.target != 'universal' && !spec.target.startsWith('linux-')) {
+                linuxOnlyDependencyEntries.addAll(havocArchiveEntries(configurations.linuxBundledLibrary))
+                // Never prune an entry also supplied by a cross-platform bundled dependency.
+                linuxOnlyDependencyEntries.removeAll(havocArchiveEntries(configurations.bundledLibrary))
+            }
+
+            long inputBytes = inputJar.length()
+            int includedFiles = 0
+
+            new java.util.zip.ZipFile(inputJar).withCloseable { inputZip ->
+                def entryNames = new LinkedHashSet<String>()
+                inputZip.entries().each { entry ->
+                    if (!entry.isDirectory()) entryNames.add(entry.name)
+                }
+
+                File fontSnapshotSource = havocFontSnapshotFile.get().asFile
+                def fontSnapshot = new groovy.json.JsonSlurper().parse(fontSnapshotSource)
+                String fontSnapshotSha256 = havocFileSha256(fontSnapshotSource)
+                if (fontSnapshot.atlases instanceof Collection) {
+                    atlasSnapshots.addAll((Collection) fontSnapshot.atlases)
+                }
+                if (fontSnapshot.prunableFonts instanceof Collection) {
+                    prunedSourceFonts.addAll((fontSnapshot.prunableFonts as Collection).collect { it.toString() })
+                }
+
+                if (spec.target == 'universal') {
+                    havocSupportedSlimTargets.each { target ->
+                        def names = havocResolveJavetNativeNames(target)
+                        boolean present = names.any { nativeName -> entryNames.contains("javet/natives/${nativeName}") }
+                        if (present) javetTargets.add(target)
+                    }
+                } else if (selectedJavetNames.any { nativeName -> entryNames.contains("javet/natives/${nativeName}") }) {
+                    javetTargets.add(spec.target)
+                }
+
+                boolean windowsMediaPresent = entryNames.contains('havoc/client/util/media/impl/win/WindowsMediaPlayerInfo.class')
+                        && entryNames.contains('mediaplayerinfo/natives/win/MediaPlayerInfo.dll')
+                boolean linuxMediaPresent = entryNames.contains('havoc/client/util/media/impl/linux/LinuxMediaPlayerInfo.class')
+                        && entryNames.any { it.startsWith('org/freedesktop/dbus/') }
+                if (spec.target == 'universal') {
+                    if (windowsMediaPresent) mediaTargets.add('windows-x86_64')
+                    if (linuxMediaPresent) {
+                        mediaTargets.add('linux-x86_64')
+                        mediaTargets.add('linux-arm64')
+                    }
+                } else if (spec.target.startsWith('windows-') && windowsMediaPresent) {
+                    mediaTargets.add(spec.target)
+                } else if (spec.target.startsWith('linux-') && linuxMediaPresent) {
+                    mediaTargets.add(spec.target)
+                }
+
+                entryNames.each { name ->
+                    String lower = name.toLowerCase(java.util.Locale.ROOT)
+                    boolean nativeFile = lower.endsWith('.dll') || lower.endsWith('.so') || lower.endsWith('.dylib')
+                    if (!nativeFile) return
+                    boolean dropNative = spec.target != 'universal' && havocShouldDropPlatformEntry(name, spec.target)
+                    if (!dropNative && !linuxOnlyDependencyEntries.isEmpty() && linuxOnlyDependencyEntries.contains(name)) {
+                        dropNative = true
+                    }
+                    if (!dropNative && spec.target != 'universal' && name.startsWith('javet/natives/')) {
+                        String leaf = name.tokenize('/').last()
+                        dropNative = !selectedJavetNames.contains(leaf)
+                    }
+                    if (!dropNative) {
+                        includedNativeResources.add(name)
+                        if (name.startsWith('javet/natives/')) {
+                            includedJavetNatives.add(name.tokenize('/').last())
+                        }
+                    }
+                }
+
+                def fontCoverage = resolvedFontCoverage
+                fontCoverage.add('base')
+                if (spec.fontProfile == 'full' && entryNames.any { entry -> havocBaseFontOptionalPrefixes.any { entry.startsWith(it) } }) {
+                    fontCoverage.add('cjk')
+                }
+                if (spec.fontProfile == 'full') fontCoverage.add('full')
+
+                def properties = new LinkedHashMap<String, String>()
+                properties.release = 'true'
+                properties.profile = spec.profile as String
+                properties.target = spec.target as String
+                properties.fontProfile = spec.fontProfile as String
+                properties['javet.targets'] = javetTargets.join(',')
+                properties['javet.omittedTargets'] = javetOmittedTargets.join(',')
+                properties['media.targets'] = mediaTargets.join(',')
+                properties['media.omittedTargets'] = mediaOmittedTargets.join(',')
+                properties['font.coverage'] = fontCoverage.join(',')
+                properties['font.atlasOnlyFiles'] = prunedSourceFonts.join(',')
+                properties.version = project.version.toString()
+                String propertiesText = properties.keySet().sort().collect { key -> "${key}=${properties[key]}" }.join('\n') + '\n'
+                byte[] propertiesBytes = propertiesText.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1)
+
+                def embeddedManifest = new LinkedHashMap<String, Object>()
+                embeddedManifest.version = project.version.toString()
+                embeddedManifest.profile = spec.profile
+                embeddedManifest.target = spec.target
+                embeddedManifest.fontProfile = spec.fontProfile
+                embeddedManifest.capabilities = [
+                        javetTargets        : new ArrayList<>(javetTargets),
+                        javetOmittedTargets : new ArrayList<>(javetOmittedTargets),
+                        mediaTargets        : new ArrayList<>(mediaTargets),
+                        mediaOmittedTargets : new ArrayList<>(mediaOmittedTargets),
+                        fontCoverage        : new ArrayList<>(fontCoverage)
+                ]
+                embeddedManifest.includedNatives = new ArrayList<>(includedNativeResources)
+                embeddedManifest.includedJavetNatives = new ArrayList<>(includedJavetNatives)
+                embeddedManifest.prunedSourceFonts = new ArrayList<>(prunedSourceFonts)
+                embeddedManifest.fontAtlases = atlasSnapshots
+                embeddedManifest.fontSnapshotSha256 = fontSnapshotSha256
+                byte[] manifestBytes = (groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(embeddedManifest))
+                        + '\n').getBytes(java.nio.charset.StandardCharsets.UTF_8)
+
+                def output = new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(new FileOutputStream(tempJar)))
+                try {
+                    def entries = java.util.Collections.list(inputZip.entries())
+                            .findAll { !it.isDirectory() }
+                            .sort { a, b ->
+                                if (a.name == 'META-INF/MANIFEST.MF') return b.name == 'META-INF/MANIFEST.MF' ? 0 : -1
+                                if (b.name == 'META-INF/MANIFEST.MF') return 1
+                                return a.name <=> b.name
+                            }
+
+                    entries.each { entry ->
+                        String name = entry.name
+                        boolean drop = false
+                        if (name == 'META-INF/havoc/distribution.properties'
+                                || name == 'META-INF/havoc/release-manifest.json') {
+                            drop = true
+                        }
+                        if (!drop && havocDeadReleaseEntries.contains(name)) {
+                            drop = true
+                        }
+                        if (!drop && spec.target != 'universal' && havocShouldDropPlatformEntry(name, spec.target)) {
+                            drop = true
+                        }
+                        if (!drop && !linuxOnlyDependencyEntries.isEmpty() && linuxOnlyDependencyEntries.contains(name)) {
+                            drop = true
+                        }
+                        if (!drop && spec.target != 'universal' && name.startsWith('javet/natives/')) {
+                            String leaf = name.tokenize('/').last()
+                            if (!selectedJavetNames.contains(leaf)) drop = true
+                        }
+                        if (!drop && spec.fontProfile == 'base'
+                                && havocBaseFontOptionalPrefixes.any { name.startsWith(it) }) {
+                            drop = true
+                        }
+                        if (!drop && name.startsWith(havocBuiltinFontRoot)) {
+                            String relative = name.substring(havocBuiltinFontRoot.length())
+                            if (!relative.contains('/') && prunedSourceFonts.contains(relative)) drop = true
+                        }
+
+                        if (drop) {
+                            prunedEntries.add(name)
+                            return
+                        }
+
+                        if (name.startsWith('javet/natives/')) {
+                            includedJavetNatives.add(name.tokenize('/').last())
+                        }
+                        def newEntry = new java.util.zip.ZipEntry(name)
+                        newEntry.time = 0L
+                        output.putNextEntry(newEntry)
+                        inputZip.getInputStream(entry).withCloseable { input -> input.transferTo(output) }
+                        output.closeEntry()
+                        includedFiles++
+                    }
+
+                    [
+                            'META-INF/havoc/distribution.properties': propertiesBytes,
+                            'META-INF/havoc/release-manifest.json'   : manifestBytes
+                    ].each { name, bytes ->
+                        def entry = new java.util.zip.ZipEntry(name)
+                        entry.time = 0L
+                        output.putNextEntry(entry)
+                        output.write(bytes as byte[])
+                        output.closeEntry()
+                        includedFiles++
+                    }
+                } finally {
+                    output.close()
+                }
+            }
+
+            try {
+                java.nio.file.Files.move(tempJar.toPath(), outputJar.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+                java.nio.file.Files.move(tempJar.toPath(), outputJar.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            }
+
+            long outputBytes = outputJar.length()
+            def report = new LinkedHashMap<String, Object>()
+            report.version = project.version.toString()
+            report.profile = spec.profile
+            report.target = spec.target
+            report.fontProfile = spec.fontProfile
+            report.inputArtifact = inputJar.name
+            report.inputSha256 = havocFileSha256(inputJar)
+            report.outputArtifact = outputJar.name
+            report.inputBytes = inputBytes
+            report.outputBytes = outputBytes
+            report.savedBytes = Math.max(0L, inputBytes - outputBytes)
+            report.savedPercent = inputBytes > 0L ? Math.round((1.0d - (outputBytes / (double) inputBytes)) * 10000.0d) / 100.0d : 0.0d
+            report.sha256 = havocFileSha256(outputJar)
+            report.includedFiles = includedFiles
+            report.includedNatives = new ArrayList<>(includedNativeResources)
+            report.includedJavetNatives = new ArrayList<>(includedJavetNatives)
+            report.mediaTargets = new ArrayList<>(mediaTargets)
+            report.mediaOmittedTargets = new ArrayList<>(mediaOmittedTargets)
+            report.fontCoverage = new ArrayList<>(resolvedFontCoverage)
+            report.capabilities = [
+                    javetTargets        : new ArrayList<>(javetTargets),
+                    javetOmittedTargets : new ArrayList<>(javetOmittedTargets),
+                    mediaTargets        : new ArrayList<>(mediaTargets),
+                    mediaOmittedTargets : new ArrayList<>(mediaOmittedTargets),
+                    fontCoverage        : new ArrayList<>(resolvedFontCoverage)
+            ]
+            report.prunedSourceFonts = new ArrayList<>(prunedSourceFonts)
+            report.fontAtlases = atlasSnapshots
+            report.fontSnapshotSha256 = havocFileSha256(havocFontSnapshotFile.get().asFile)
+            report.prunedEntries = prunedEntries.sort()
+            reportFile.setText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(report))
+                    + '\n', 'UTF-8')
+
+            logger.lifecycle("Havoc release ${spec.outputSuffix}: ${outputJar.name} (${outputBytes} bytes, saved ${report.savedPercent}%)")
+        }
+    }
+    return taskProvider
+}
+
+def havocFullRelease = registerHavocReleaseProfile('releaseFull', [
+        profile     : 'full',
+        target      : 'universal',
+        fontProfile : 'full',
+        outputSuffix: 'full'
+])
+
+def havocSlimTaskByTarget = [:]
+havocSupportedSlimTargets.each { target ->
+    String camel = target.split('-').collect { token -> token.substring(0, 1).toUpperCase(java.util.Locale.ROOT) + token.substring(1) }.join('')
+    havocSlimTaskByTarget[target] = registerHavocReleaseProfile("releaseSlim${camel}", [
+            profile     : 'slim',
+            target      : target,
+            fontProfile : havocReleaseFontProfile.get(),
+            outputSuffix: "slim-${target}-${havocReleaseFontProfile.get()}"
+    ])
+}
+
+tasks.register('release') {
+    group = 'release'
+    description = 'Builds the full Havoc distribution and configured slim platform distributions.'
+    dependsOn havocFullRelease
+    doFirst {
+        if (havocReleaseDevEnabled.get()) {
+            throw new GradleException('Havoc release artifacts cannot be built with havocDev/dev/devBuild enabled.')
+        }
+        if (havocReleaseVulkanDebugEnabled.get()) {
+            throw new GradleException('Havoc release artifacts cannot be built with havocVulkanDebug enabled.')
+        }
+        def requested = havocReleaseSlimTargets.get()
+        def unknown = requested.findAll { !havocSupportedSlimTargets.contains(it) }
+        if (!unknown.isEmpty()) {
+            throw new GradleException("Unknown -PhavocReleaseSlimTargets values: ${unknown}. Supported: ${havocSupportedSlimTargets}")
+        }
+    }
+}
+
+// Wire only the configured slim targets into the aggregate release task.
+gradle.projectsEvaluated {
+    def releaseTask = tasks.named('release').get()
+    havocReleaseSlimTargets.get().each { target ->
+        def slimTask = havocSlimTaskByTarget[target]
+        if (slimTask == null) {
+            throw new GradleException("Unknown -PhavocReleaseSlimTargets value '${target}'. Supported: ${havocSupportedSlimTargets}")
+        }
+        releaseTask.dependsOn(slimTask)
+    }
+}
+
+// Gradle's task cache already keys this generator by input files. These explicit
+// semantic inputs keep the cache deterministic if the generator contract changes
+// without a source-font modification.
+tasks.named('generateFontMsdf') {
+    inputs.property('havocFontMsdfGeneratorContract', 'v1')
+    inputs.property('havocFontMsdfProfile', 'icons-symbols-default')
+    outputs.cacheIf { true }
+}

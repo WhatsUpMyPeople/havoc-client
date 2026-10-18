@@ -1,0 +1,84 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.renderer.ui;
+
+import havoc.client.render.engine.command.UiCommand;
+import havoc.client.render.engine.command.UiSemanticCommandBuffer;
+import havoc.client.render.engine.command.UiStatsSnapshot;
+import havoc.client.render.engine.core.RenderFrameContext;
+import havoc.client.render.engine.rhi.HavocRhi;
+import havoc.client.render.helpers.ClipFunction;
+import havoc.client.render.helpers.ScissorFunction;
+
+/** Coordinates UI recording, compilation, and execution. */
+public final class UiRendererSubsystem {
+    private final UiSemanticCommandBuffer semanticCommands = new UiSemanticCommandBuffer();
+    private final UiPassCompiler compiler = new UiPassCompiler();
+    private final UiPassExecutor executor = new UiPassExecutor();
+    private UiBatchPlan lastPlan = UiBatchPlan.EMPTY;
+    private boolean executing;
+
+    public UiSemanticCommandBuffer semanticCommands() {
+        return semanticCommands;
+    }
+
+    public void beginFrame(RenderFrameContext context) {
+        semanticCommands.beginFrame(context);
+    }
+
+    public void record(UiCommand command) {
+        semanticCommands.add(command, ScissorFunction.currentSnapshot(), ClipFunction.currentSnapshot());
+    }
+
+    public boolean hasPendingCommands() {
+        return semanticCommands.size() > 0 || compiler.hasPendingWork();
+    }
+
+    public void submitOrdered(OrderedUiBatcher batcher, boolean finish) {
+        if (batcher == null) return;
+        compiler.enqueueOrdered(batcher, finish);
+    }
+
+    public void submitImmediate(String label, int orderedBatchCount, UiBatchPlan.Work work) {
+        compiler.enqueue(label, orderedBatchCount, work);
+    }
+
+    public void flush(RenderFrameContext context, HavocRhi rhi) {
+        semanticCommands.beginFrame(context);
+        if (executing) return;
+        if (semanticCommands.size() == 0 && !compiler.hasPendingWork()) return;
+
+        executing = true;
+        try {
+            while (semanticCommands.size() > 0 || compiler.hasPendingWork()) {
+                UiBatchPlan compiled = compiler.compile(semanticCommands);
+
+                // Clear before execution so re-entrant semantic recording belongs to the next plan.
+                // The compiler likewise drains its work queue before returning this plan.
+                semanticCommands.clear();
+
+                UiBatchPlan executed = executor.execute(compiled, context, rhi);
+                semanticCommands.stats().addExecutionStats(
+                        executed.rhiDrawCommandCount(),
+                        executed.backendDrawCallCount()
+                );
+                lastPlan = executed;
+            }
+        } finally {
+            executing = false;
+        }
+    }
+
+    public UiBatchPlan lastPlan() {
+        return lastPlan;
+    }
+
+    public UiStatsSnapshot statsSnapshot() {
+        return semanticCommands.statsSnapshot();
+    }
+}

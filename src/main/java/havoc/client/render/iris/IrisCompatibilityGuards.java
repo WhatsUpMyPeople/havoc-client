@@ -1,0 +1,80 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.iris;
+
+import havoc.client.features.module.modules.visuals.MotionBlur;
+import havoc.client.features.module.modules.visuals.PostFX;
+import havoc.client.features.module.modules.visuals.ReimaginedVisual;
+import havoc.client.render.iris.patch.ShaderPatchEngine;
+import havoc.client.runtime.RuntimeGate;
+
+public enum IrisCompatibilityGuards {
+    ;
+
+    public static boolean suppressShaderpackMotionBlur() {
+        if (!RuntimeGate.canRunShaderBridge()) return false;
+        return IrisRuntime.isShaderpackRendererActive()
+                && IrisRuntime.supports(IrisCompatibilityFeature.MOTION_BLUR_POLICY)
+                && MotionBlur.isActiveStatic();
+    }
+
+    /**
+     * Capability query for Havoc DoF with the active shaderpack. This must not depend on
+     * transient render-resource readiness or whether Photon's optional c2 program is currently
+     * compiled: Havoc renders after Iris finalization from IrisSceneDepth.
+     */
+    public static boolean supportsHavocDepthOfField() {
+        if (!IrisRuntime.isShaderpackRendererActive()) return true;
+        IrisRuntimeSnapshot runtime = IrisRuntime.snapshot();
+        return runtime.profile().supports(IrisCompatibilityFeature.DEPTH_OF_FIELD_POLICY)
+                && "photon".equals(runtime.profile().id())
+                && !runtime.patchManifestId().isBlank();
+    }
+
+    /** Whether the active Photon adapter owns/bypasses its native DoF pass when necessary. */
+    public static boolean havocOwnsShaderpackDepthOfField() {
+        if (!IrisRuntime.isShaderpackRendererActive()
+                || !IrisRuntime.supports(IrisCompatibilityFeature.DEPTH_OF_FIELD_POLICY)) return false;
+        IrisRuntimeSnapshot runtime = IrisRuntime.snapshot();
+        return ShaderPatchEngine.applicationState(runtime.patchManifestId()).preflightAccepted();
+    }
+
+    public static boolean suppressShaderpackDepthOfField() {
+        return havocOwnsShaderpackDepthOfField() && ReimaginedVisual.isDepthOfFieldRequestedStatic();
+    }
+
+    /** Photon keeps exposure/bloom/tonemap, while Havoc PostFX owns duplicate grading/vignette/CAS. */
+    public static boolean suppressShaderpackPostFx() {
+        if (!RuntimeGate.canRunShaderBridge()) return false;
+        if (!IrisRuntime.isShaderpackRendererActive()
+                || !IrisRuntime.supports(IrisCompatibilityFeature.POST_FX_POLICY)
+                || !PostFX.isActiveStatic()) return false;
+        IrisRuntimeSnapshot runtime = IrisRuntime.snapshot();
+        String manifestId = runtime.patchManifestId();
+        // Unlike DoF, these programs are part of Photon's active post chain. Only claim their UI
+        // options after the exact grading/final targets were patched in this load session.
+        return ShaderPatchEngine.targetApplied(manifestId, "/program/c14_color_grading.fsh")
+                && ShaderPatchEngine.targetApplied(manifestId, "/program/final.fsh");
+    }
+
+    public static boolean suppressHavocTerrainShaderOverrides() {
+        if (!RuntimeGate.canRunShaderBridge()) return false;
+        return IrisRuntime.isModLoaded();
+    }
+
+    public static boolean suppressIrisHandRendering() {
+        // The visible first-person scene is submitted natively after shaderpack finalization.
+        // Keeping either Iris hand phase would draw it into Photon's world G-buffer as well.
+        return RuntimeGate.canRunShaderBridge() && IrisRuntime.isShaderpackRendererActive();
+    }
+
+    public static boolean deferIrisFinalizationForSecondHandScene() {
+        if (!RuntimeGate.canRunShaderBridge()) return false;
+        return IrisRuntime.isShaderpackRendererActive();
+    }
+}

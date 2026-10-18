@@ -1,0 +1,94 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.core;
+
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
+import org.joml.Vector2f;
+import org.joml.Vector2fc;
+import net.minecraft.world.phys.Vec3;
+
+public enum HavocWorldMatrices {
+    ;
+    private static final Matrix4f POSITION = new Matrix4f();
+    private static final Matrix4f RENDER_PROJECTION = new Matrix4f();
+    private static final Matrix4f UNJITTERED_RENDER_PROJECTION = new Matrix4f();
+    private static final Matrix4f FRUSTUM_PROJECTION = new Matrix4f();
+    private static final Vector2f JITTER_PIXELS = new Vector2f();
+    private static Vec3 CAMERA_POS;
+    private static boolean valid;
+
+    public static void reset() {
+        valid = false;
+    }
+
+    public static void capture(Matrix4fc positionMatrix, Matrix4fc renderProjectionMatrix, Matrix4fc frustumProjectionMatrix) {
+        capture(positionMatrix, renderProjectionMatrix, frustumProjectionMatrix, null);
+    }
+
+    public static void capture(Matrix4fc positionMatrix, Matrix4fc renderProjectionMatrix, Matrix4fc frustumProjectionMatrix, Vec3 cameraPos) {
+        capture(positionMatrix, renderProjectionMatrix, renderProjectionMatrix, frustumProjectionMatrix, new Vector2f(), cameraPos);
+    }
+
+    public static void capture(Matrix4fc positionMatrix, Matrix4fc renderProjectionMatrix,
+                               Matrix4fc unjitteredRenderProjectionMatrix, Matrix4fc frustumProjectionMatrix,
+                               Vector2fc jitterPixels, Vec3 cameraPos) {
+        if (positionMatrix == null || renderProjectionMatrix == null || unjitteredRenderProjectionMatrix == null
+                || frustumProjectionMatrix == null) {
+            valid = false;
+            CAMERA_POS = null;
+            return;
+        }
+
+        POSITION.set(positionMatrix);
+        RENDER_PROJECTION.set(renderProjectionMatrix);
+        UNJITTERED_RENDER_PROJECTION.set(unjitteredRenderProjectionMatrix);
+        FRUSTUM_PROJECTION.set(frustumProjectionMatrix);
+        JITTER_PIXELS.set(jitterPixels == null ? new Vector2f() : jitterPixels);
+        CAMERA_POS = cameraPos;
+        valid = true;
+    }
+
+    public static void capturePosition(Matrix4fc positionMatrix, Vec3 cameraPos) {
+        if (!valid || positionMatrix == null) {
+            return;
+        }
+        POSITION.set(positionMatrix);
+        if (cameraPos != null) {
+            CAMERA_POS = cameraPos;
+        }
+    }
+
+    public static boolean isValid() {
+        return valid;
+    }
+
+    public static Matrix4f positionMatrix() {
+        return valid ? new Matrix4f(POSITION) : null;
+    }
+
+    public static Matrix4f renderProjectionMatrix() {
+        return valid ? new Matrix4f(RENDER_PROJECTION) : null;
+    }
+
+    public static Matrix4f unjitteredRenderProjectionMatrix() {
+        return valid ? new Matrix4f(UNJITTERED_RENDER_PROJECTION) : null;
+    }
+
+    public static Vector2f jitterPixels() {
+        return valid ? new Vector2f(JITTER_PIXELS) : new Vector2f();
+    }
+
+    public static Matrix4f frustumProjectionMatrix() {
+        return valid ? new Matrix4f(FRUSTUM_PROJECTION) : null;
+    }
+
+    public static Vec3 cameraPosition() {
+        return valid ? CAMERA_POS : null;
+    }
+}

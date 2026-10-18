@@ -1,0 +1,85 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.command.impl;
+
+import havoc.client.features.command.ClientCommand;
+import havoc.client.features.command.CommandContext;
+import havoc.client.features.command.CommandInfo;
+import havoc.client.features.command.CommandOutput;
+import havoc.client.render.iris.IrisCompatibilityFeature;
+import havoc.client.render.iris.IrisCompatibilityProfile;
+import havoc.client.render.iris.IrisRuntime;
+import havoc.client.render.iris.IrisRuntimeSnapshot;
+import havoc.client.render.iris.IrisAaIntegration;
+import havoc.client.config.MainConfig;
+import havoc.client.render.iris.patch.ShaderPatchEngine;
+import havoc.client.runtime.RuntimeGate;
+
+import java.util.List;
+import java.util.stream.Collectors;
+
+@CommandInfo(
+        id = "iris",
+        aliases = "shaderpack",
+        usage = "@iris",
+        descriptionKey = "command.iris.description"
+)
+public final class IrisCommand implements ClientCommand {
+    private static String formatFeature(IrisCompatibilityFeature feature) {
+        return feature.name().toLowerCase(java.util.Locale.ROOT);
+    }
+
+    @Override
+    public boolean isAvailable() {
+        return !RuntimeGate.isPanic();
+    }
+
+    @Override
+    public boolean execute(CommandContext ctx) {
+        IrisRuntimeSnapshot snapshot = IrisRuntime.snapshot();
+        CommandOutput.send(snapshot.shortLine());
+
+        if (!snapshot.modLoaded()) {
+            return true;
+        }
+        CommandOutput.send("Iris API: " + (snapshot.apiAvailable() ? "available" : "unavailable")
+                + ", status: " + snapshot.status()
+                + ", shadow pass: " + snapshot.renderingShadowPass()
+                + ", epoch: " + snapshot.integrationEpoch()
+                + " (" + snapshot.integrationEpochReason() + ")");
+
+        IrisCompatibilityProfile profile = snapshot.profile();
+        String features = profile.features().isEmpty()
+                ? "none"
+                : profile.features().stream()
+                .map(IrisCommand::formatFeature)
+                .collect(Collectors.joining(", "));
+        CommandOutput.send("Iris profile: " + profile.getId()
+                + " (" + profile.displayName() + "), manifest: "
+                + (snapshot.patchManifestId().isBlank() ? "none" : snapshot.patchManifestId())
+                + ", features: " + features);
+        CommandOutput.send("Iris manifest capabilities: "
+                + (snapshot.patchFeatures().isEmpty() ? "none" : String.join(", ", snapshot.patchFeatures())));
+        CommandOutput.send("Iris " + IrisAaIntegration.resolve(
+                MainConfig.get().getAntialiasing3dMode()).shortLine());
+        if (!snapshot.patchManifestId().isBlank()) {
+            ShaderPatchEngine.PatchApplicationState application =
+                    ShaderPatchEngine.applicationState(snapshot.patchManifestId());
+            CommandOutput.send("Iris patch application: preflight=" + application.preflightAccepted()
+                    + ", complete=" + application.complete()
+                    + ", targets=" + application.appliedTargets() + "/" + application.expectedTargets()
+                    + ", reason=" + application.reason());
+        }
+        List<String> patchDiagnostics = ShaderPatchEngine.diagnostics();
+        CommandOutput.send("Iris patch compiler: " + (patchDiagnostics.isEmpty() ? "no session data" : "session data follows"));
+        for (String diagnostic : patchDiagnostics) {
+            CommandOutput.send("patch " + diagnostic);
+        }
+        return true;
+    }
+}

@@ -1,0 +1,137 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.mixins;
+
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import havoc.client.util.logging.DebugLog;
+import havoc.client.render.engine.rhi.backend.gl.GlNativeStateTracker;
+import havoc.client.render.iris.IrisRuntime;
+import com.mojang.blaze3d.opengl.DirectStateAccess;
+import net.minecraft.resources.Identifier;
+import org.slf4j.Logger;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+/**
+ * GlCommandEncoder is package-private in Mojang's OpenGL backend, so this mixin
+ * intentionally targets it by binary name instead of importing the class.
+ */
+@Mixin(targets = "com.mojang.blaze3d.opengl.GlCommandEncoder")
+public abstract class GlCommandEncoderMixin {
+    @Shadow
+    private RenderPipeline lastPipeline;
+
+    /**
+     * Iris unlocks its deferred depth/color masks at the head of trySetup. Blaze3D normally
+     * reapplies the pipeline immediately afterwards, but skips that work when its cached pipeline
+     * identity is unchanged. Imported geometry uses a persistent pipeline and a fresh render pass,
+     * so this cache hit could inherit depth-test/depth-write state from the preceding shaderpack
+     * pass. safeToMultiply is scoped specifically around Havoc's Iris geometry submission.
+     */
+    @Inject(method = "trySetup", at = @At("HEAD"))
+    private void havoc$reapplyImportedIrisPipelineState(CallbackInfoReturnable<Boolean> cir) {
+        // Mod-loaded check first: this mixin applies with or without Iris installed.
+        if (IrisRuntime.isImportedGeometrySubmission() && IrisRuntime.isShaderpackRendererActive()) {
+            lastPipeline = null;
+        }
+    }
+
+    /**
+     * trySetup is shared by ordinary draws, direct multi-draw and indirect draws. At RETURN the
+     * concrete Iris/Blaze3D program is selected. ExtendedShader also has a dedicated RETURN hook
+     * so injection ordering cannot leave its later custom-uniform push as the final writer.
+     */
+    @Inject(method = "trySetup", at = @At("RETURN"))
+    private void havoc$applyImportedGeometryDrawUniforms(CallbackInfoReturnable<Boolean> cir) {
+        if (Boolean.TRUE.equals(cir.getReturnValue())) {
+            IrisRuntime.applyImportedGeometryDrawUniforms();
+        }
+    }
+
+    @WrapOperation(
+            method = "trySetup",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lcom/mojang/blaze3d/opengl/GlStateManager;_glUseProgram(I)V"
+            )
+    )
+    private void havoc$trackBlaze3dProgram(int program, Operation<Void> original) {
+        original.call(program);
+        GlNativeStateTracker.recordBlaze3dProgram(program);
+    }
+
+    @WrapOperation(
+            method = "trySetup",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lorg/slf4j/Logger;warn(Ljava/lang/String;Ljava/lang/Object;)V"
+            )
+    )
+    private void havoc$wrapPipelineWarning(Logger logger,
+                                                 String format,
+                                                 Object pipelineId,
+                                                 Operation<Void> original) {
+        if (pipelineId instanceof Identifier id && "havoc".equals(id.getNamespace())) {
+            DebugLog.warn("[RenderPipeline] Render pipeline %s wants a depth texture but none was provided - this is probably a bug", id);
+            return;
+        }
+
+        original.call(logger, format, pipelineId);
+    }
+
+
+    /**
+     * Blaze3D exposes copyTextureToTexture in origin + extent form, while the OpenGL blit call
+     * consumes origin + absolute end coordinates. Convert the extents at the backend boundary so
+     * offset copies (for example atlas tiles) retain their requested size.
+     */
+    @WrapOperation(
+            method = "copyTextureToTexture",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lcom/mojang/blaze3d/opengl/DirectStateAccess;blitFrameBuffers(IIIIIIIIIIII)V"
+            )
+    )
+    private void havoc$fixTextureCopyRectangles(
+            DirectStateAccess access,
+            int readFramebuffer,
+            int drawFramebuffer,
+            int sourceX,
+            int sourceY,
+            int sourceWidth,
+            int sourceHeight,
+            int targetX,
+            int targetY,
+            int targetWidth,
+            int targetHeight,
+            int mask,
+            int filter,
+            Operation<Void> original
+    ) {
+        original.call(
+                access,
+                readFramebuffer,
+                drawFramebuffer,
+                sourceX,
+                sourceY,
+                sourceX + sourceWidth,
+                sourceY + sourceHeight,
+                targetX,
+                targetY,
+                targetX + targetWidth,
+                targetY + targetHeight,
+                mask,
+                filter
+        );
+    }
+}

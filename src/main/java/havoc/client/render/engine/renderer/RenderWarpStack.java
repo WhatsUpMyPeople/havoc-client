@@ -1,0 +1,76 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.renderer;
+
+/**
+ * Thread-local stack for screen-space UI warp while emitting 2D meshes.
+ */
+public enum RenderWarpStack {
+    ;
+    private static final int MAX_DEPTH = 16;
+    private static final ThreadLocal<State> STATE = ThreadLocal.withInitial(State::new);
+    /**
+     * Pushed warps across all threads. {@link #current()} runs once per emitted 2D vertex, and almost
+     * always with nothing pushed, so it skips the ThreadLocal lookup while this is zero.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger TOTAL_DEPTH = new java.util.concurrent.atomic.AtomicInteger();
+
+    public static RenderWarp current() {
+        if (TOTAL_DEPTH.get() == 0) return RenderWarp.IDENTITY;
+        State state = STATE.get();
+        return state.depth > 0 ? state.stack[state.depth - 1] : RenderWarp.IDENTITY;
+    }
+
+    public static boolean active() {
+        return current().active();
+    }
+
+    public static Scope push(RenderWarp warp) {
+        State state = STATE.get();
+        if (state.depth >= MAX_DEPTH) {
+            throw new IllegalStateException("Render warp stack overflow");
+        }
+        state.stack[state.depth++] = warp != null ? warp : RenderWarp.IDENTITY;
+        TOTAL_DEPTH.incrementAndGet();
+        return new Scope(state);
+    }
+
+    public static void pop() {
+        State state = STATE.get();
+        if (state.depth <= 0) {
+            throw new IllegalStateException("Render warp stack underflow");
+        }
+        state.stack[--state.depth] = null;
+        TOTAL_DEPTH.decrementAndGet();
+    }
+
+    private static final class State {
+        private final RenderWarp[] stack = new RenderWarp[MAX_DEPTH];
+        private int depth;
+    }
+
+    public static final class Scope implements AutoCloseable {
+        private final State state;
+        private boolean closed;
+
+        private Scope(State state) {
+            this.state = state;
+        }
+
+        @Override
+        public void close() {
+            if (closed) return;
+            if (state.depth <= 0) {
+                throw new IllegalStateException("Render warp scope closed after stack was emptied");
+            }
+            state.stack[--state.depth] = null;
+            TOTAL_DEPTH.decrementAndGet();
+            closed = true;
+        }
+    }
+}

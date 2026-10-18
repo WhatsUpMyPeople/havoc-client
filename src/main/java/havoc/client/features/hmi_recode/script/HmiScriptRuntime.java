@@ -1,0 +1,409 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+/* HoldMyItems Recode; original project by sapling, CC0-1.0. */
+package havoc.client.features.hmi_recode.script;
+
+import com.caoccao.javet.interop.V8Runtime;
+import com.caoccao.javet.interop.converters.JavetObjectConverter;
+import havoc.client.features.hmi_recode.HmiScriptKind;
+import havoc.client.features.hmi_recode.render.HmiModelCommand;
+import havoc.client.features.hmi_recode.render.HmiTransformCommand;
+import havoc.client.render.engine.profiler.ProfilerPhase;
+import havoc.client.render.engine.renderer.ui.runtime.script.JavetRuntimeBootstrap;
+import havoc.client.util.logging.DebugLog;
+import net.minecraft.client.Minecraft;
+import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+
+import java.io.BufferedReader;
+import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Isolated HMI V8 runtime. Resource-pack scripts receive plain JS data only;
+ * no Java object proxy is exposed to V8.
+ */
+public final class HmiScriptRuntime implements AutoCloseable {
+    private static final String BOOTSTRAP = """
+            globalThis.__hmi_registry = globalThis.__hmi_registry || Object.create(null);
+            globalThis.__hmi_commands = [];
+            globalThis.__hmi_model_commands = [];
+            globalThis.__hmi_sound_events = [];
+            globalThis.__hmi_collect_geometry = true;
+            globalThis.global = globalThis;
+            globalThis.console = globalThis.console || { log(){}, info(){}, warn(){}, error(){}, debug(){}, trace(){} };
+
+            // Keep the Java boundary compact. Positional arrays avoid materializing a Map plus a
+            // nested argument list for every tiny transform command in Javet's object converter.
+            const __hmi_cmd1 = (op, a) => {
+              if (__hmi_collect_geometry) __hmi_commands.push([op, a]);
+            };
+            const __hmi_cmd3 = (op, a, b, c) => {
+              if (__hmi_collect_geometry) __hmi_commands.push([op, a, b, c]);
+            };
+            const __hmi_rotate = (op, angle, x, y, z) => {
+              if (!__hmi_collect_geometry) return;
+              if (x === undefined || y === undefined || z === undefined) __hmi_commands.push([op, angle]);
+              else __hmi_commands.push([op, angle, x, y, z]);
+            };
+            const __hmi_model1 = (from, to, op, a) => {
+              if (__hmi_collect_geometry) __hmi_model_commands.push([from, to, op, a]);
+            };
+            const __hmi_model3 = (from, to, op, a, b, c) => {
+              if (__hmi_collect_geometry) __hmi_model_commands.push([from, to, op, a, b, c]);
+            };
+            const __hmi_model_rotate = (from, to, op, angle, x, y, z) => {
+              if (!__hmi_collect_geometry) return;
+              if (x === undefined || y === undefined || z === undefined) __hmi_model_commands.push([from, to, op, angle]);
+              else __hmi_model_commands.push([from, to, op, angle, x, y, z]);
+            };
+            const __hmi_map = () => {
+              const m = new Map();
+              m.put = (k, v) => { m.set(k, v); return v; };
+              m.getOrDefault = (k, v) => m.has(k) ? m.get(k) : v;
+              return m;
+            };
+
+            const __hmi_unpack_item = v => ({
+              id:v[0], name:v[1], empty:!!v[2], useAction:v[3], tags:v[4],
+              block:!!v[5], lantern:!!v[6], throwable:!!v[7], enchanted:!!v[8],
+              chargedCrossbow:!!v[9], cooldown:!!v[10], translate:!!v[11], customTranslate:!!v[12],
+              spearData:{canDamage:true,canDismount:true,canKnockback:true,hitImpact:false}
+            });
+            const __hmi_unpack_context = v => {
+              const p = v[0], mainItem = __hmi_unpack_item(v[1]), offItem = __hmi_unpack_item(v[2]);
+              const item = v[3] === 0 ? mainItem : (v[3] === 1 ? offItem : __hmi_unpack_item(v[4]));
+              const motion = v[19];
+              return {
+                player:{
+                  health:p[0], sneaking:!!p[1], onGround:!!p[2], swimming:!!p[3], climbing:!!p[4],
+                  crawling:!!p[5], underWater:!!p[6], inWater:!!p[7], riptide:!!p[8], usingItem:!!p[9],
+                  activeHand:p[10], x:p[11], y:p[12], z:p[13], yaw:p[14], pitch:p[15], age:p[16],
+                  swingCount:p[17], hasVehicle:!!p[18], velocity:{x:p[19],y:p[20],z:p[21]},
+                  mainItem, offItem
+                },
+                item, hand:v[5], mainHand:!!v[6], bl:!!v[7], swingProgress:v[8], rawSwingProgress:v[9],
+                mainHandSwingProgress:v[10], offHandSwingProgress:v[11], equipProgress:v[12], deltaTime:v[13],
+                swingMHand:!!v[14], swingOHand:!!v[15], mainHandSwitchEvent:!!v[16],
+                offHandSwitchEvent:!!v[17], blockBreaking:!!v[18],
+                motion:{
+                  swing:motion[0], swordSwing:motion[1], offhandSwing:motion[2], movement:motion[3],
+                  look:motion[4], switch:motion[5], use:motion[6], impact:motion[7],
+                  replaceSwing:!!motion[8], swingStyle:motion[9]
+                },
+                matrices:0, particles:[], inspectPressed:!!v[20]
+              };
+            };
+
+            globalThis.renderAsBlock = __hmi_map();
+            globalThis.translateItem = __hmi_map();
+            globalThis.itemSwingSpeed = __hmi_map();
+            globalThis.useDuration = __hmi_map();
+            globalThis.usingItem = __hmi_map();
+            globalThis.applyBlockRotation = __hmi_map();
+
+            globalThis.M = {
+              PI: Math.PI,
+              moveX: (_m,x) => __hmi_cmd1('moveX',x),
+              moveY: (_m,y) => __hmi_cmd1('moveY',y),
+              moveZ: (_m,z) => __hmi_cmd1('moveZ',z),
+              translate: (_m,x,y,z) => __hmi_cmd3('translate',x,y,z),
+              scale: (_m,x,y,z) => __hmi_cmd3('scale',x,y,z),
+              rotateX: (_m,a,x,y,z) => __hmi_rotate('rotateX',a,x,y,z),
+              rotateY: (_m,a,x,y,z) => __hmi_rotate('rotateY',a,x,y,z),
+              rotateZ: (_m,a,x,y,z) => __hmi_rotate('rotateZ',a,x,y,z),
+              shear: (_m,x,y,z) => __hmi_cmd3('shear',x,y,z),
+              push: () => { if (__hmi_collect_geometry) __hmi_commands.push(['push']); },
+              pop: () => { if (__hmi_collect_geometry) __hmi_commands.push(['pop']); },
+              sin: Math.sin,
+              cos: Math.cos,
+              floor: Math.floor,
+              ceil: Math.ceil,
+              abs: Math.abs,
+              pow: Math.pow,
+              round: Math.round,
+              clamp: (v,min,max) => Math.max(min, Math.min(max,v)),
+              lerp: (t,a,b) => a + (b-a)*t
+            };
+
+            const __hmi_easeOutBounce = x => {
+              const n1=7.5625,d1=2.75;
+              if (x < 1/d1) return n1*x*x;
+              if (x < 2/d1) { x-=1.5/d1; return n1*x*x+.75; }
+              if (x < 2.5/d1) { x-=2.25/d1; return n1*x*x+.9375; }
+              x-=2.625/d1; return n1*x*x+.984375;
+            };
+            globalThis.Easings = {
+              easeInSine:x=>1-Math.cos((x*Math.PI)/2),
+              easeOutSine:x=>Math.sin((x*Math.PI)/2),
+              easeInOutSine:x=>-(Math.cos(Math.PI*x)-1)/2,
+              easeInQuad:x=>x*x, easeOutQuad:x=>1-(1-x)*(1-x),
+              easeInOutQuad:x=>x<.5?2*x*x:1-Math.pow(-2*x+2,2)/2,
+              easeInCubic:x=>x*x*x, easeOutCubic:x=>1-Math.pow(1-x,3),
+              easeInOutCubic:x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2,
+              easeInQuart:x=>x*x*x*x, easeOutQuart:x=>1-Math.pow(1-x,4),
+              easeInOutQuart:x=>x<.5?8*x*x*x*x:1-Math.pow(-2*x+2,4)/2,
+              easeInQuint:x=>x*x*x*x*x, easeOutQuint:x=>1-Math.pow(1-x,5),
+              easeInOutQuint:x=>x<.5?16*x*x*x*x*x:1-Math.pow(-2*x+2,5)/2,
+              easeInExpo:x=>x===0?0:Math.pow(2,10*x-10),
+              easeOutExpo:x=>x===1?1:1-Math.pow(2,-10*x),
+              easeInOutExpo:x=>x===0?0:x===1?1:x<.5?Math.pow(2,20*x-10)/2:(2-Math.pow(2,-20*x+10))/2,
+              easeInCirc:x=>1-Math.sqrt(1-x*x),
+              easeOutCirc:x=>Math.sqrt(1-Math.pow(x-1,2)),
+              easeInOutCirc:x=>x<.5?(1-Math.sqrt(1-Math.pow(2*x,2)))/2:(Math.sqrt(1-Math.pow(-2*x+2,2))+1)/2,
+              easeInBack:x=>2.70158*x*x*x-1.70158*x*x,
+              easeOutBack:x=>1+2.70158*Math.pow(x-1,3)+1.70158*Math.pow(x-1,2),
+              easeInOutBack:x=>x<.5?(Math.pow(2*x,2)*((2.5949095+1)*2*x-2.5949095))/2:(Math.pow(2*x-2,2)*((2.5949095+1)*(x*2-2)+2.5949095)+2)/2,
+              easeOutBounce:__hmi_easeOutBounce,
+              easeInBounce:x=>1-__hmi_easeOutBounce(1-x),
+              easeInOutBounce:x=>x<.5?(1-__hmi_easeOutBounce(1-2*x))/2:(1+__hmi_easeOutBounce(2*x-1))/2,
+              cubicEase:x=>x*x*(3-2*x)
+            };
+
+            globalThis.Items = { get:id=>String(id) };
+            globalThis.Tags = {
+              getVanillaTag:id=>'minecraft:'+String(id),
+              getFabricTag:id=>'c:'+String(id)
+            };
+            globalThis.P = {
+              getHealth:p=>p.health,
+              isSneaking:p=>!!p.sneaking,
+              isOnGround:p=>!!p.onGround,
+              isSwimming:p=>!!p.swimming,
+              isClimbing:p=>!!p.climbing,
+              isCrawling:p=>!!p.crawling,
+              isSubmergedInWater:p=>!!p.underWater,
+              isTouchingWater:p=>!!p.inWater,
+              isUsingRiptide:p=>!!p.riptide,
+              getX:p=>p.x, getY:p=>p.y, getZ:p=>p.z,
+              getXSpeed:p=>p.velocity.x, getYSpeed:p=>p.velocity.y, getZSpeed:p=>p.velocity.z,
+              getSpeed:p=>Math.hypot(p.velocity.x,p.velocity.z),
+              isUsingItem:p=>!!p.usingItem,
+              getYaw:p=>p.yaw, getPitch:p=>p.pitch,
+              getMainItem:p=>p.mainItem, getOffhandItem:p=>p.offItem,
+              getActiveHand:p=>p.activeHand,
+              getAge:p=>p.age,
+              isItemCoolingDown:(_p,item)=>!!item.cooldown,
+              getSwingCount:p=>p.swingCount,
+              hasVehicle:p=>!!p.hasVehicle
+            };
+            globalThis.I = {
+              isOf:(item,id)=>!!item && item.id===id,
+              isIn:(item,tag)=>!!item && Array.isArray(item.tags) && item.tags.includes(tag),
+              isEmpty:item=>!item || !!item.empty,
+              getUseAction:item=>item?.useAction || 'none',
+              getName:item=>item?.id || 'minecraft:air',
+              getActualName:item=>item?.name || '',
+              isChargedCrossbow:item=>!!item?.chargedCrossbow,
+              isBlock:item=>!!item?.block,
+              shouldTranslateItem:item=>!!item?.translate,
+              isCustomTranslate:item=>!!item && !!translateItem.getOrDefault(item.id, !!item.customTranslate),
+              isLantern:item=>!!item?.lantern,
+              isThrowable:item=>!!item?.throwable,
+              isEnchanted:item=>!!item?.enchanted,
+              getSpearData:item=>item?.spearData || {canDamage:false,canDismount:true,canKnockback:true,hitImpact:false},
+              setChestOpen:()=>{}, setShulkerOpen:()=>{}
+            };
+            globalThis.Texture = { of:(namespace,path)=>String(namespace)+':' + String(path) };
+            globalThis.string = { find:(value,needle)=>String(value).includes(String(needle)) };
+            globalThis.KeyBindManager = { isKeyPressed:key=>Number(key)===74 && !!globalThis.__hmi_inspect_pressed };
+            globalThis.S = { playSound:(id,volume)=>__hmi_sound_events.push([String(id),Number(volume)||1]) };
+            globalThis.debugger = { out:()=>{} };
+            globalThis.particleManager = { addParticle:()=>{} };
+            globalThis.animator = {
+              moveX:(f,t,x)=>__hmi_model1(f,t,'moveX',x),
+              moveY:(f,t,y)=>__hmi_model1(f,t,'moveY',y),
+              moveZ:(f,t,z)=>__hmi_model1(f,t,'moveZ',z),
+              scale:(f,t,x,y,z)=>__hmi_model3(f,t,'scale',x,y,z),
+              rotateX:(f,t,a,x,y,z)=>__hmi_model_rotate(f,t,'rotateX',a,x,y,z),
+              rotateY:(f,t,a,x,y,z)=>__hmi_model_rotate(f,t,'rotateY',a,x,y,z),
+              rotateZ:(f,t,a,x,y,z)=>__hmi_model_rotate(f,t,'rotateZ',a,x,y,z)
+            };
+            globalThis.__hmi_reset_output = () => {
+              __hmi_commands.length = 0;
+              __hmi_model_commands.length = 0;
+              __hmi_sound_events.length = 0;
+            };
+            const __hmi_take_output = () => {
+              const output = [__hmi_commands, __hmi_model_commands, __hmi_sound_events];
+              globalThis.__hmi_commands = [];
+              globalThis.__hmi_model_commands = [];
+              globalThis.__hmi_sound_events = [];
+              return output;
+            };
+            const __hmi_run = name => {
+              __hmi_reset_output();
+              globalThis[name]();
+              // Transfer collector ownership instead of cloning every command array.
+              return __hmi_take_output();
+            };
+            const __hmi_run_state_only = name => {
+              __hmi_reset_output();
+              __hmi_collect_geometry = false;
+              try {
+                globalThis[name]();
+                // Sounds remain observable even when this hand has no visible geometry.
+                const output = [[], [], __hmi_sound_events];
+                globalThis.__hmi_commands = [];
+                globalThis.__hmi_model_commands = [];
+                globalThis.__hmi_sound_events = [];
+                return output;
+              } finally {
+                __hmi_collect_geometry = true;
+              }
+            };
+            globalThis.__hmi_execute_plan = (mask, packedContext) => {
+              const context = globalThis.__hmi_context = __hmi_unpack_context(packedContext);
+              globalThis.mainHandSwitchEvent = !!context.mainHandSwitchEvent;
+              globalThis.offHandSwitchEvent = !!context.offHandSwitchEvent;
+              globalThis.__hmi_inspect_pressed = !!context.inspectPressed;
+              return [
+                (mask & 1) !== 0 ? __hmi_run('__hmi_hand_pose')
+                                 : ((mask & 16) !== 0 ? __hmi_run_state_only('__hmi_hand_pose') : null),
+                (mask & 2) !== 0 ? __hmi_run('__hmi_hand_relative_pose') : null,
+                (mask & 4) !== 0 ? __hmi_run('__hmi_item_pose') : null,
+                (mask & 8) !== 0 ? __hmi_run('__hmi_item_model') : null
+              ];
+            };
+            """;
+
+    public static final int HAND_POSE = 1;
+    public static final int HAND_RELATIVE_POSE = 1 << 1;
+    public static final int ITEM_POSE = 1 << 2;
+    public static final int ITEM_MODEL = 1 << 3;
+    public static final int HAND_POSE_STATE_ONLY = 1 << 4;
+    private static final HmiScriptKind[] KINDS = HmiScriptKind.values();
+
+    private final EnumMap<HmiScriptKind, String> loadedSources = new EnumMap<>(HmiScriptKind.class);
+    private V8Runtime runtime;
+    private boolean dirty = true;
+
+    public synchronized Result execute(HmiScriptKind kind, Object[] context) {
+        Result[] results = executePlan(mask(kind), context);
+        Result result = results[kind.ordinal()];
+        return result != null ? result : Result.EMPTY;
+    }
+
+    /**
+     * Executes all requested HMI stages in one V8 call. The scripts still run in their original
+     * hand/relative/item/model order and each stage retains an isolated output collector.
+     */
+    public synchronized Result[] executePlan(int plan, Object[] context) {
+        Result[] results = new Result[KINDS.length];
+        try {
+            ensureReady();
+            if (runtime == null || plan == 0) return fillMissing(plan, results);
+
+            try (ProfilerPhase.Scope ignored = ProfilerPhase.scope("hmi:v8_execute_plan")) {
+                Object raw = runtime.getGlobalObject().invokeObject("__hmi_execute_plan", plan, context);
+                if (!(raw instanceof List<?> stages)) return fillMissing(plan, results);
+                int count = Math.min(stages.size(), results.length);
+                for (int i = 0; i < count; i++) {
+                    Object stage = stages.get(i);
+                    if (!(stage instanceof List<?> output) || output.size() < 3) continue;
+                    results[i] = new Result(
+                            HmiTransformCommand.decode(output.get(0)),
+                            HmiModelCommand.decode(output.get(1)),
+                            HmiSoundCommand.decode(output.get(2))
+                    );
+                }
+            }
+        } catch (Throwable t) {
+            DebugLog.error("[HMI] JavaScript execution failed for plan %d: %s", t, plan, t.getMessage());
+        }
+        return fillMissing(plan, results);
+    }
+
+    private static Result[] fillMissing(int plan, Result[] results) {
+        for (HmiScriptKind kind : KINDS) {
+            boolean requested = (plan & mask(kind)) != 0
+                    || kind == HmiScriptKind.HAND_POSE && (plan & HAND_POSE_STATE_ONLY) != 0;
+            if (requested && results[kind.ordinal()] == null) {
+                results[kind.ordinal()] = Result.EMPTY;
+            }
+        }
+        return results;
+    }
+
+    private static int mask(HmiScriptKind kind) {
+        return switch (kind) {
+            case HAND_POSE -> HAND_POSE;
+            case HAND_RELATIVE_POSE -> HAND_RELATIVE_POSE;
+            case ITEM_POSE -> ITEM_POSE;
+            case ITEM_MODEL -> ITEM_MODEL;
+        };
+    }
+
+    public synchronized void invalidate() {
+        dirty = true;
+    }
+
+    private void ensureReady() throws Exception {
+        if (!dirty && runtime != null) return;
+        closeRuntime();
+        JavetRuntimeBootstrap.installNativeLoader();
+        runtime = JavetRuntimeBootstrap.createRuntime(this);
+        runtime.setConverter(new JavetObjectConverter());
+        runtime.setMemorySaverModeEnabled(false);
+        runtime.setBatterySaverModeEnabled(false);
+        runtime.getExecutor(BOOTSTRAP).setResourceName("havoc:hmi/bootstrap.js").executeVoid();
+        ResourceManager manager = Minecraft.getInstance().getResourceManager();
+        loadedSources.clear();
+        for (HmiScriptKind kind : KINDS) {
+            String source = loadStack(manager, kind);
+            loadedSources.put(kind, source);
+            String function = "__hmi_" + kind.name().toLowerCase();
+            String wrapped = "globalThis." + function + " = function() {\n" +
+                    "const " + kind.argumentName() + " = globalThis.__hmi_context;\n" +
+                    source + "\n};\n" +
+                    "globalThis." + function + "_ready = true;";
+            runtime.getExecutor(wrapped).setResourceName(kind.resourceId().toString()).executeVoid();
+        }
+        dirty = false;
+    }
+
+    private static String loadStack(ResourceManager manager, HmiScriptKind kind) {
+        List<String> chunks = new ArrayList<>();
+        manager.getResource(kind.resourceId()).ifPresent(resource -> readResource(kind.resourceId().toString(), resource, chunks));
+        for (Resource addon : manager.getResourceStack(kind.addonResourceId())) {
+            readResource(kind.addonResourceId().toString(), addon, chunks);
+        }
+        return String.join("\n", chunks);
+    }
+
+    private static void readResource(String id, Resource resource, List<String> chunks) {
+        try (BufferedReader reader = resource.openAsReader()) {
+            chunks.add(reader.lines().collect(Collectors.joining("\n")));
+        } catch (Exception e) {
+            DebugLog.error("[HMI] Failed to load %s from %s", e, id, resource.sourcePackId());
+        }
+    }
+
+    @Override
+    public synchronized void close() {
+        closeRuntime();
+        dirty = true;
+    }
+
+    private void closeRuntime() {
+        if (runtime == null) return;
+        try {
+            JavetRuntimeBootstrap.closeRuntime(this, runtime);
+        } catch (Throwable ignored) {
+        } finally {
+            runtime = null;
+        }
+    }
+
+    public record Result(List<HmiTransformCommand> commands, List<HmiModelCommand> modelCommands,
+                          List<HmiSoundCommand> sounds) {
+        public static final Result EMPTY = new Result(List.of(), List.of(), List.of());
+    }
+}

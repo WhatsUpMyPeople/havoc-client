@@ -1,0 +1,386 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.rhi.backend.gl.clip;
+
+import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.opengl.GlStateManager;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import org.jetbrains.annotations.Nullable;
+import org.lwjgl.opengl.GL11C;
+import havoc.client.render.engine.rhi.clip.ShapeClipBackend;
+import havoc.client.render.engine.rhi.backend.gl.GlValidation;
+import havoc.client.render.engine.rhi.backend.gl.GlNativeStateTracker;
+import havoc.client.render.engine.rhi.clip.ShapeClipRenderPassContract;
+import havoc.client.render.engine.profiler.UiPipelineTelemetry;
+import havoc.client.util.logging.DebugLog;
+
+/**
+ * GL implementation of shape clipping using a render-pass-bound stencil attachment.
+ */
+public final class GlStencilShapeClipBackend implements ShapeClipBackend {
+    private final GlStencilFramebufferSupport framebuffers = new GlStencilFramebufferSupport(this);
+    private Mode mode = Mode.DISABLED;
+    private int reference;
+    private int compareReference;
+    private boolean stencilAvailable;
+    private boolean renderPassAttachmentRequired;
+    private boolean clearRequested;
+    private String attachmentReason = "none";
+    private String clearReason = "none";
+    private @Nullable GpuTextureView currentColorView;
+    private @Nullable GpuTextureView currentDepthView;
+    private String currentPassLabel = "<no-pass>";
+    private boolean currentPassPrepared;
+    private ShapeClipRenderPassContract currentPipelineContract = ShapeClipRenderPassContract.NONE;
+    private @Nullable RenderPipeline currentPipeline;
+    private String currentPipelineName = "<no-pipeline>";
+    private static final java.util.Map<RenderPipeline, String> PIPELINE_NAMES = new java.util.IdentityHashMap<>();
+    private String lastFailure = "none";
+
+    private static int clampRef(int value) {
+        if (value < 0) return 0;
+        return Math.min(255, value);
+    }
+
+    private static String describeView(@Nullable GpuTextureView view) {
+        if (view == null) return "null";
+        try {
+            return view.getClass().getSimpleName()
+                    + "["
+                    + view.getWidth(0)
+                    + "x"
+                    + view.getHeight(0)
+                    + ", closed="
+                    + view.isClosed()
+                    + "]";
+        } catch (Throwable t) {
+            return view.getClass().getSimpleName() + "[describe failed: " + t.getClass().getSimpleName() + "]";
+        }
+    }
+
+    @Override
+    public boolean supported() {
+        return framebuffers.supported();
+    }
+
+    @Override
+    public boolean isActive() {
+        return mode != Mode.DISABLED;
+    }
+
+    @Override
+    public void requireRenderPassAttachment(String reason) {
+        renderPassAttachmentRequired = true;
+        attachmentReason = reason == null ? "unspecified" : reason;
+    }
+
+    @Override
+    public void requestClear(String reason) {
+        clearRequested = true;
+        clearReason = reason == null ? "unspecified" : reason;
+    }
+
+    @Override
+    public void beginRenderPass(String label, @Nullable GpuTextureView colorView, @Nullable GpuTextureView depthView) {
+        currentPassLabel = label == null ? "<unnamed-pass>" : label;
+        currentColorView = colorView;
+        currentDepthView = depthView;
+        currentPassPrepared = false;
+
+        boolean shouldPrepare = renderPassAttachmentRequired || mode != Mode.DISABLED || clearRequested;
+        if (!shouldPrepare) {
+            checkGlErrors("beginRenderPass(no-clip)");
+            return;
+        }
+        UiPipelineTelemetry.recordStencilRenderPass();
+
+        if (!prepareCurrentPassTarget("beginRenderPass")) {
+            DebugLog.errorOnChange("shapeclip.renderpass.prepare.failed", currentPassLabel + "|" + attachmentReason + "|" + lastFailureReason(), "[ShapeClip/GL] render pass stencil prepare failed: pass=%s reason=%s lastFailure=%s", currentPassLabel, attachmentReason, lastFailureReason());
+            checkGlErrors("beginRenderPass(prepare-failed)");
+            return;
+        }
+
+        if (clearRequested) {
+            boolean cleared = framebuffers.clear(currentColorView, currentDepthView);
+            if (cleared) UiPipelineTelemetry.recordStencilClear();
+            if (!cleared) {
+                lastFailure = "clear failed: " + framebuffers.lastFailure();
+                DebugLog.errorOnChange("shapeclip.renderpass.clear.failed", currentPassLabel + "|" + clearReason + "|" + lastFailure, "[ShapeClip/GL] render pass stencil clear failed: pass=%s reason=%s lastFailure=%s", currentPassLabel, clearReason, lastFailure);
+            }
+            clearRequested = false;
+            clearReason = "none";
+        }
+
+        checkGlErrors("beginRenderPass");
+    }
+
+    @Override
+    public void endRenderPass() {
+        resetNativeStateOnly();
+        currentColorView = null;
+        currentDepthView = null;
+        currentPassLabel = "<no-pass>";
+        currentPassPrepared = false;
+        currentPipelineContract = ShapeClipRenderPassContract.NONE;
+        currentPipeline = null;
+        currentPipelineName = "<no-pipeline>";
+        renderPassAttachmentRequired = false;
+        attachmentReason = "none";
+        checkGlErrors("endRenderPass");
+    }
+
+    @Override
+    public void bindPipeline(RenderPipeline pipeline, ShapeClipRenderPassContract contract) {
+        // Identifier.toString() builds a new string per call and this runs per draw; pipelines are a
+        // small fixed set, so remember each one's name (endRenderPass clears currentPipeline every pass).
+        currentPipelineName = pipeline == null ? "<unknown>"
+                : PIPELINE_NAMES.computeIfAbsent(pipeline, p -> p.getLocation() == null ? "<unknown>" : p.getLocation().toString());
+        currentPipeline = pipeline;
+        currentPipelineContract = contract == null ? ShapeClipRenderPassContract.NONE : contract;
+        if (mode != Mode.DISABLED && currentPipelineContract == ShapeClipRenderPassContract.NONE) {
+            DebugLog.warnOnce(
+                    "shapeclip.stale.pipeline.contract." + currentPipelineName,
+                    "[ShapeClip/GL] stale clip state risk: active mode=%s ref=%d but pipeline has no shape-clip contract. pipeline=%s pass=%s",
+                    mode,
+                    reference,
+                    currentPipelineName,
+                    currentPassLabel
+            );
+        }
+        if (currentPipelineContract.requiresAttachment(mode != Mode.DISABLED || renderPassAttachmentRequired)) {
+            requireRenderPassAttachment("pipeline contract " + currentPipelineContract + " for " + currentPipelineName);
+            if (currentColorView != null && !currentPassPrepared) {
+                prepareCurrentPassTarget("bindPipeline");
+            }
+        }
+    }
+
+
+    void setStencilAvailable(boolean available) {
+        stencilAvailable = available;
+        if (!available) {
+            mode = Mode.DISABLED;
+            reference = 0;
+            compareReference = 0;
+        }
+    }
+
+    @Override
+    public void beginWrite(int parentReference, int newReference) {
+        mode = Mode.WRITE;
+        compareReference = clampRef(parentReference);
+        reference = clampRef(newReference);
+        requireRenderPassAttachment("mask write parent=" + compareReference + " ref=" + reference);
+    }
+
+    @Override
+    public void beginRestore(int currentReference, int parentReference) {
+        mode = Mode.RESTORE;
+        compareReference = clampRef(currentReference);
+        reference = clampRef(parentReference);
+        requireRenderPassAttachment("mask restore current=" + compareReference + " parent=" + reference);
+    }
+
+    @Override
+    public void beginTest(int activeReference) {
+        mode = Mode.TEST;
+        reference = clampRef(activeReference);
+        compareReference = reference;
+        requireRenderPassAttachment("content test ref=" + reference);
+    }
+
+    @Override
+    public void disable() {
+        resetNativeStateOnly();
+        mode = Mode.DISABLED;
+        reference = 0;
+        compareReference = 0;
+        stencilAvailable = false;
+        renderPassAttachmentRequired = false;
+        clearRequested = false;
+        attachmentReason = "none";
+        clearReason = "none";
+        framebuffers.restoreActiveAttachments();
+        checkGlErrors("disable");
+    }
+
+    @Override
+    public void applyNativeState() {
+        if (mode == Mode.DISABLED) {
+            resetNativeStateOnly();
+            checkGlErrors("applyNativeState(disabled)");
+            return;
+        }
+
+        if (!prepareCurrentPassTarget("applyNativeState")) {
+            resetNativeStateOnly();
+            DebugLog.errorOnChange(
+                    "shapeclip.apply.prepare.failed",
+                    currentPassLabel + "|" + currentPipelineName + "|" + mode + "|" + reference + "|" + lastFailureReason(),
+                    "[ShapeClip/GL] cannot apply stencil state: pass=%s pipeline=%s mode=%s ref=%d reason=%s lastFailure=%s",
+                    currentPassLabel,
+                    currentPipelineName,
+                    mode,
+                    reference,
+                    attachmentReason,
+                    lastFailureReason()
+            );
+            checkGlErrors("applyNativeState(prepare-failed)");
+            return;
+        }
+
+        GlStateManager._disableDepthTest();
+        GlStateManager._depthMask(false);
+        GlNativeStateTracker.stencilEnabled(true);
+
+        switch (mode) {
+            case WRITE -> {
+                GlStateManager._disableCull();
+                GlNativeStateTracker.stencilMask(0xFF);
+                int compareFunc = compareReference == 0 ? GL11C.GL_ALWAYS : GL11C.GL_EQUAL;
+                GlNativeStateTracker.stencilFunc(compareFunc, compareReference, 0xFF);
+                // The stack model stores child = parent + 1. GL_REPLACE cannot express
+                // "compare against parent but write child", because REPLACE writes the
+                // same ref value supplied to glStencilFunc. Increment/decrement keeps the
+                // compare ref independent from the value transition.
+                GlNativeStateTracker.stencilOp(GL11C.GL_KEEP, GL11C.GL_INCR, GL11C.GL_INCR);
+                GlStateManager._colorMask(0);
+            }
+            case RESTORE -> {
+                GlStateManager._disableCull();
+                GlNativeStateTracker.stencilMask(0xFF);
+                GlNativeStateTracker.stencilFunc(GL11C.GL_EQUAL, compareReference, 0xFF);
+                GlNativeStateTracker.stencilOp(GL11C.GL_KEEP, GL11C.GL_DECR, GL11C.GL_DECR);
+                GlStateManager._colorMask(0);
+            }
+            case TEST -> {
+                restorePipelineCullState();
+                GlNativeStateTracker.stencilMask(0x00);
+                GlNativeStateTracker.stencilFunc(GL11C.GL_EQUAL, reference, 0xFF);
+                GlNativeStateTracker.stencilOp(GL11C.GL_KEEP, GL11C.GL_KEEP, GL11C.GL_KEEP);
+                restorePipelineColorMask();
+            }
+            case DISABLED -> resetNativeStateOnly();
+        }
+
+        checkGlErrors("applyNativeState(" + mode + ")");
+    }
+
+    private boolean prepareCurrentPassTarget(String source) {
+        if (currentColorView == null) {
+            lastFailure = "no current render pass target while " + source + " requested stencil state";
+            DebugLog.warnOnChange("shapeclip.no.current.pass", lastFailure, "[ShapeClip/GL] stale state: %s", lastFailure);
+            return false;
+        }
+        if (currentPassPrepared && stencilAvailable) return true;
+        boolean ok = framebuffers.ensure(currentColorView, currentDepthView);
+        currentPassPrepared = ok;
+        stencilAvailable = ok;
+        if (!ok) {
+            lastFailure = framebuffers.lastFailure();
+            DebugLog.errorOnChange("shapeclip.prepare.current.target.failed", source + "|" + currentPassLabel + "|" + describeView(currentColorView) + "|" + describeView(currentDepthView) + "|" + lastFailure, "[ShapeClip/GL] prepareCurrentPassTarget failed from=%s pass=%s targetColor=%s targetDepth=%s failure=%s",
+                    source, currentPassLabel, describeView(currentColorView), describeView(currentDepthView), lastFailure);
+            return false;
+        }
+        lastFailure = "none";
+        return true;
+    }
+
+    private void resetNativeStateOnly() {
+        GlNativeStateTracker.stencilEnabled(false);
+        GlNativeStateTracker.stencilMask(0x00);
+        GlNativeStateTracker.stencilFunc(GL11C.GL_ALWAYS, 0, 0xFF);
+        GlNativeStateTracker.stencilOp(GL11C.GL_KEEP, GL11C.GL_KEEP, GL11C.GL_KEEP);
+        restorePipelineDepthState();
+        restorePipelineCullState();
+        restorePipelineColorMask();
+    }
+
+    /**
+     * Restore shared GL state from the current Blaze3D pipeline contract instead of querying the
+     * driver. These states are owned/cached by GlStateManager, so mutating through it also keeps
+     * Mojang's shadow state coherent after Havoc's temporary clip override.
+     */
+    private void restorePipelineDepthState() {
+        RenderPipeline pipeline = currentPipeline;
+        if (pipeline == null || pipeline.getDepthStencilState() == null) {
+            GlStateManager._disableDepthTest();
+            GlStateManager._depthMask(false);
+            return;
+        }
+        GlStateManager._enableDepthTest();
+        GlStateManager._depthMask(pipeline.getDepthStencilState().writeDepth());
+    }
+
+    private void restorePipelineCullState() {
+        RenderPipeline pipeline = currentPipeline;
+        if (pipeline != null && pipeline.isCull()) {
+            GlStateManager._enableCull();
+        } else {
+            GlStateManager._disableCull();
+        }
+    }
+
+    private void restorePipelineColorMask() {
+        RenderPipeline pipeline = currentPipeline;
+        if (pipeline == null || pipeline.getColorTargetStates().length == 0 || pipeline.getColorTargetState() == null) {
+            GlStateManager._colorMask(15);
+            return;
+        }
+        GlStateManager._colorMask(pipeline.getColorTargetState().writeMask());
+    }
+
+    @Override
+    public String debugState() {
+        return toString();
+    }
+
+    @Override
+    public String lastFailureReason() {
+        if (!"none".equals(lastFailure)) return lastFailure;
+        return framebuffers.lastFailure();
+    }
+
+    @Override
+    public String toString() {
+        return "GlStencilShapeClipBackend{"
+                + "mode=" + mode
+                + ", ref=" + reference
+                + ", compareRef=" + compareReference
+                + ", stencilAvailable=" + stencilAvailable
+                + ", passPrepared=" + currentPassPrepared
+                + ", pass='" + currentPassLabel + '\''
+                + ", pipeline='" + currentPipelineName + '\''
+                + ", contract=" + currentPipelineContract
+                + ", attachmentRequired=" + renderPassAttachmentRequired
+                + ", clearRequested=" + clearRequested
+                + ", supported=" + supported()
+                + ", framebuffer=" + framebuffers.describe()
+                + '}';
+    }
+
+    public String lastFailure() {
+        return lastFailureReason();
+    }
+
+    private void checkGlErrors(String where) {
+        if (!GlValidation.errorsEnabled()) return;
+        int guard = 0;
+        int error;
+        while ((error = GL11C.glGetError()) != GL11C.GL_NO_ERROR && guard++ < 16) {
+            DebugLog.errorOnChange("shapeclip.gl.error", where + "|" + error, "[ShapeClip/GL] gl error at %s: 0x%s state=%s", where, Integer.toHexString(error), this);
+        }
+    }
+
+    private enum Mode {
+        DISABLED,
+        WRITE,
+        RESTORE,
+        TEST
+    }
+}

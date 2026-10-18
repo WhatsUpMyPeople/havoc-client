@@ -1,0 +1,28 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ * Licensed under the GNU General Public License v3.0.
+ */
+package havoc.client.features.maplink.model;
+
+import java.util.UUID;
+
+/** Immutable exact web-map location observation published by the backend. */
+public record MapLinkObservation(
+        String profileId,
+        MapLinkProviderType providerType,
+        String rawPlayerName,
+        UUID resolvedUuid,
+        String providerWorld,
+        String mappedWorld,
+        double x,
+        double y,
+        double z,
+        long fetchTimestamp,
+        long providerTimestamp,
+        String revision
+) {
+    public boolean worldMapped() {
+        return mappedWorld != null && !mappedWorld.isBlank();
+    }
+}

@@ -1,0 +1,53 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.rhi.backend.gl;
+
+import java.util.Locale;
+
+/**
+ * Expensive driver-query validation for Havoc-owned native GL paths.
+ *
+ * <p>Production defaults to {@link Mode#OFF}. Use
+ * {@code -Dhavoc.rhi.gl.validation=errors} to drain/report GL errors at explicit
+ * native RHI boundaries, or {@code full} to additionally enable expensive framebuffer
+ * preflight/completeness checks.</p>
+ */
+public final class GlValidation {
+    public enum Mode {
+        OFF,
+        ERRORS,
+        FULL
+    }
+
+    private static final Mode MODE = resolveMode();
+
+    private GlValidation() {
+    }
+
+    private static Mode resolveMode() {
+        String raw = System.getProperty("havoc.rhi.gl.validation", "").trim().toLowerCase(Locale.ROOT);
+        return switch (raw) {
+            case "full" -> Mode.FULL;
+            case "errors", "error", "on", "true", "1" -> Mode.ERRORS;
+            case "off", "false", "0" -> Mode.OFF;
+            default -> Mode.OFF;
+        };
+    }
+
+    public static Mode mode() {
+        return MODE;
+    }
+
+    public static boolean errorsEnabled() {
+        return MODE != Mode.OFF;
+    }
+
+    public static boolean fullEnabled() {
+        return MODE == Mode.FULL;
+    }
+}

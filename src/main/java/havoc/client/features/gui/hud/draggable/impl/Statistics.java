@@ -1,0 +1,870 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.hud.draggable.impl;
+
+
+import havoc.client.util.text.FastFormat;
+import havoc.client.render.engine.renderer.ui.runtime.script.UiScriptColor;
+import havoc.client.render.engine.text.TextSizing;
+import havoc.client.render.engine.text.BuiltinFontCatalog;
+import havoc.client.config.SettingDef;
+import havoc.client.config.values.BooleanMapValue;
+import havoc.client.config.values.BooleanValue;
+import havoc.client.config.values.ModeValue;
+import havoc.client.config.values.NumberValue;
+import havoc.client.config.values.RGBAColorValue;
+import havoc.client.config.values.RGBColorValue;
+import havoc.client.features.gui.hud.HudElementRegister;
+import havoc.client.features.gui.hud.HudGlobalConfig;
+import havoc.client.features.gui.hud.HudRenderUtil;
+import havoc.client.features.gui.hud.HudTextEffects;
+import havoc.client.features.gui.hud.draggable.DraggableHudElement;
+import havoc.client.features.gui.hud.draggable.DraggableHudElementRegistry;
+import havoc.client.features.module.Modules;
+import havoc.client.features.module.modules.visuals.BedwarsESP;
+import havoc.client.features.module.modules.visuals.BlockESP;
+import havoc.client.render.engine.animation.AnimationUtility;
+import havoc.client.render.engine.math.HudScale;
+import havoc.client.render.engine.renderer.Renderer2D;
+import havoc.client.render.engine.text.TextRenderer;
+import havoc.client.util.session.SessionStatisticsTracker;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.util.Util;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.scores.DisplaySlot;
+import net.minecraft.world.scores.Objective;
+import net.minecraft.world.scores.PlayerScoreEntry;
+import net.minecraft.world.scores.PlayerTeam;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+import static havoc.client.features.theme.Theme.theme;
+
+@HudElementRegister(order = 210)
+public final class Statistics extends DraggableHudElement {
+    private static final float BASE_WIDTH = 145.0f;
+    private static final float STATS_HEIGHT = 64.0f;
+    private static final float GRAPH_HEIGHT = 54.0f;
+    private static final float GRAPH_GAP = 5.0f;
+    private static final float PANEL_RADIUS = 4.0f;
+    private static final String COLOR_THEME = "Theme";
+    private static final String COLOR_CUSTOM = "Custom";
+    private static final String EFFECT_NONE = "None";
+    private static final String EFFECT_BLUR = "Blur";
+    private static final String INFO_GAMES = "games";
+    private static final String INFO_KD = "kd";
+    private static final String INFO_KILLS = "kills";
+    private static final String INFO_DEATHS = "deaths";
+    private static final String INFO_PLAY_TIME = "play_time";
+    private static final String INFO_AVERAGE_SPEED = "average_speed";
+    private static final String INFO_BEDWARS_IRON = "bedwars_iron";
+    private static final String INFO_BEDWARS_GOLD = "bedwars_gold";
+    private static final String INFO_BEDWARS_DIAMONDS = "bedwars_diamonds";
+    private static final String INFO_BEDWARS_EMERALDS = "bedwars_emeralds";
+    private static final String INFO_BLOCKESP_TOTAL = "blockesp_total";
+    private static final String INFO_BLOCKESP_VISIBLE = "blockesp_visible";
+    private static final String INFO_BLOCKESP_BREAKDOWN = "blockesp_breakdown";
+    private static final int MAX_BLOCKESP_ROWS = 6;
+    private static final int GRAPH_HISTORY_POINTS = 100;
+    private static final float GRAPH_CEILING_BPS = 24.0f;
+    private static final float GRAPH_ZERO_EPSILON_BPS = 0.01f;
+
+    {
+        defaultLayout(20.0f, 150.0f);
+    }
+
+    private final Minecraft mc = Minecraft.getInstance();
+    private final HudGlobalConfig hud = HudGlobalConfig.get();
+    private final ScriptedStatisticsHudPanel scriptedPanel = new ScriptedStatisticsHudPanel();
+    private final SessionStatisticsTracker statistics = SessionStatisticsTracker.INSTANCE;
+
+    private final NumberValue<Double> scaleValue =
+            new NumberValue<>("statistics_scale", 1.0, HudPanelLayoutModes.SCALE_MIN, HudPanelLayoutModes.SCALE_MAX);
+    private final ModeValue layoutMode =
+            new ModeValue("statistics_layout", "Unified Divider",
+                    HudPanelLayoutModes.SPLIT_HEADER, HudPanelLayoutModes.UNIFIED_DIVIDER);
+    private final BooleanMapValue information =
+            new BooleanMapValue("statistics_information", defaultInformationModes());
+    private final BooleanValue showSpeedGraph =
+            new BooleanValue("statistics_show_speed_graph", true);
+    private final BooleanValue separateGraph =
+            new BooleanValue("statistics_separate_graph", true);
+    private final ModeValue colorMode =
+            new ModeValue("statistics_color_mode", "Theme", COLOR_THEME, COLOR_CUSTOM);
+    private final ModeValue panelStyle =
+            new ModeValue("statistics_panel_style", HudRenderUtil.PANEL_STYLE_DEFAULT,
+                    HudRenderUtil.PANEL_STYLE_DEFAULT, HudRenderUtil.PANEL_STYLE_ACCENT,
+                    HudRenderUtil.PANEL_STYLE_GRADIENT);
+    private final NumberValue<Integer> themeGradientStrength =
+            new NumberValue<>("statistics_theme_gradient_strength", 72, 0, 100);
+    private final ModeValue bgEffect =
+            new ModeValue("statistics_bg_effect", "Blur", EFFECT_NONE, EFFECT_BLUR);
+    private final RGBAColorValue bg =
+            new RGBAColorValue("statistics_bg", "#F7343434");
+    private final RGBAColorValue bg2 =
+            new RGBAColorValue("statistics_bg_secondary", "#F7161616");
+    private final NumberValue<Integer> bgAlpha =
+            new NumberValue<>("statistics_bg_alpha", 194, 0, 255);
+    private final BooleanValue strokeEnabled =
+            new BooleanValue("statistics_stroke_enabled", false);
+    private final RGBColorValue stroke =
+            new RGBColorValue("statistics_stroke", "#5A5A5A");
+    private final NumberValue<Integer> strokeAlpha =
+            new NumberValue<>("statistics_stroke_alpha", 160, 0, 255);
+    private final BooleanValue strokeGradient =
+            new BooleanValue("statistics_stroke_gradient", true);
+    private final BooleanValue shadowEnabled =
+            new BooleanValue("statistics_shadow_enabled", true);
+    private final ModeValue shadowMode =
+            new ModeValue("statistics_shadow_mode", HudRenderUtil.SHADOW_MODE_BLACK,
+                    HudRenderUtil.SHADOW_MODE_BLACK, HudRenderUtil.SHADOW_MODE_THEME);
+    private final NumberValue<Integer> themeShadowStrength =
+            new NumberValue<>("statistics_theme_shadow_strength", 100, 0, 100);
+    private final NumberValue<Integer> shadowAlpha =
+            new NumberValue<>("statistics_shadow_alpha", 38, 0, 255);
+    private final RGBColorValue text =
+            new RGBColorValue("statistics_text", "#FFFFFF");
+    private final RGBColorValue muted =
+            new RGBColorValue("statistics_muted", "#A5A5A5");
+    private final NumberValue<Integer> blurAlpha =
+            new NumberValue<>("statistics_blur_alpha", 255, 0, 255);
+    private final BooleanValue headerIconPulse =
+            new BooleanValue("statistics_header_icon_pulse", true);
+    private final NumberValue<Integer> headerIconPulseSpeed =
+            new NumberValue<>("statistics_header_icon_pulse_speed", 16, 1, 60);
+    private final NumberValue<Integer> headerIconPulseIntensity =
+            new NumberValue<>("statistics_header_icon_pulse_intensity", 100, 0, 100);
+
+    private float displayWidth = -1.0f;
+    private float displayHeight = -1.0f;
+    private float visibilityAnim;
+    private int uiHeaderLeft;
+    private int uiHeaderRight;
+    private int uiBodyLeft;
+    private int uiBodyRight;
+    private int uiOutline;
+    private int uiText;
+    private int uiMuted;
+    private int uiCounter;
+    private int uiTitleText;
+    private int uiDivider;
+    private int uiBlurTint;
+    private final Map<String, LinkedHashMap<String, Object>> lastInformationRows = new LinkedHashMap<>();
+    private final Map<String, Float> informationRowAnimations = new LinkedHashMap<>();
+    private long lastBedWarsContextCheckMs;
+    private long bedWarsContextUntilMs;
+
+    public Statistics() {
+        super("statistics", "Statistics", "hud.draggable.statistics.description", true);
+    }
+
+    @Override
+    protected void defineSettings(List<SettingDef> defs) {
+        defs.add(SettingDef.number(scaleValue));
+        defs.add(SettingDef.mode(layoutMode));
+        defs.add(SettingDef.group("statistics_information", information));
+        defs.add(SettingDef.bool(showSpeedGraph));
+        defs.add(SettingDef.bool(separateGraph).visibleWhen(showSpeedGraph::get));
+        defs.add(SettingDef.mode(colorMode));
+        defs.add(SettingDef.mode(panelStyle).visibleWhen(this::isThemeMode));
+        defs.add(SettingDef.number(themeGradientStrength).visibleWhen(this::isGradientPanelStyle));
+        defs.add(SettingDef.color(bg).visibleWhen(this::isCustomMode));
+        defs.add(SettingDef.color(bg2).visibleWhen(this::isCustomMode));
+        defs.add(SettingDef.number(bgAlpha).visibleWhen(this::isThemeMode));
+        defs.add(SettingDef.bool(strokeEnabled));
+        defs.add(SettingDef.colorNoAlpha(stroke).visibleWhen(() -> strokeEnabled.get() && isCustomMode()));
+        defs.add(SettingDef.number(strokeAlpha).visibleWhen(strokeEnabled::get));
+        defs.add(SettingDef.bool(strokeGradient).visibleWhen(() -> strokeEnabled.get() && isThemeMode()));
+        defs.add(SettingDef.bool(shadowEnabled));
+        defs.add(SettingDef.mode(shadowMode).visibleWhen(() -> shadowEnabled.get() && isThemeMode()));
+        defs.add(SettingDef.number(themeShadowStrength).visibleWhen(this::isThemeShadow));
+        defs.add(SettingDef.number(shadowAlpha).visibleWhen(shadowEnabled::get));
+        defs.add(SettingDef.colorNoAlpha(text).visibleWhen(this::isCustomMode));
+        defs.add(SettingDef.colorNoAlpha(muted).visibleWhen(this::isCustomMode));
+        defs.add(SettingDef.mode(bgEffect));
+        defs.add(SettingDef.number(blurAlpha).visibleWhen(this::hasEffect));
+        defs.add(SettingDef.bool(headerIconPulse));
+        defs.add(SettingDef.number(headerIconPulseSpeed).visibleWhen(headerIconPulse::get));
+        defs.add(SettingDef.number(headerIconPulseIntensity).visibleWhen(headerIconPulse::get));
+    }
+
+    @Override
+    public void applyDefaultPosition(int screenW, int screenH) {
+        x = 20.0f;
+        y = Math.min(150.0f, Math.max(8.0f, screenH - 140.0f));
+    }
+
+    @Override
+    public boolean usesEngineRenderer() {
+        return true;
+    }
+
+    @Override
+    public void renderEngine(Renderer2D renderer,
+                             TextRenderer textRenderer,
+                             GuiGraphicsExtractor ctx,
+                             float tickDelta,
+                             int screenW,
+                             int screenH) {
+        boolean forceVisible = DraggableHudElementRegistry.isForceVisible();
+        boolean showWidget = forceVisible || (mc != null && mc.player != null);
+        visibilityAnim = HudRenderUtil.animateVisibility(visibilityAnim, showWidget);
+        float widgetScale = HudRenderUtil.visibilityScale(visibilityAnim);
+        if (!showWidget && visibilityAnim <= 0.0f) {
+            width = 0.0f;
+            height = 0.0f;
+            return;
+        }
+
+        updatePalette();
+        SessionStatisticsTracker.Snapshot snapshot = statistics.snapshot();
+        boolean exampleData = forceVisible && (mc == null || mc.player == null);
+        List<LinkedHashMap<String, Object>> infoRows = animateInformationRows(
+                collectInformationRows(snapshot, exampleData)
+        );
+        boolean showPlayTime = information.get(INFO_PLAY_TIME);
+
+        TextRenderer fallback = textRenderer != null ? textRenderer : TextRenderer.get();
+        TextRenderer headerTextRenderer = BuiltinFontCatalog.INTER_BOLD.renderer(fallback);
+        TextRenderer rowTextRenderer = BuiltinFontCatalog.ONEST_MEDIUM.renderer(fallback);
+        if (headerTextRenderer == null) headerTextRenderer = fallback;
+        if (rowTextRenderer == null) rowTextRenderer = fallback;
+
+        float baseScale = HudScale.scale(screenW, screenH) * 1.1f * HudPanelLayoutModes.effectiveScale(scaleValue);
+        float fontScale = 0.98f * TextSizing.scaleForSize(hud.getFontSize());
+
+        headerTextRenderer.begin(fontScale, false, false);
+        float headerTextH = (float) headerTextRenderer.getHeight(false);
+        headerTextRenderer.end();
+        rowTextRenderer.begin(fontScale, false, false);
+        float rowTextH = (float) rowTextRenderer.getHeight(false);
+        float maxRowPairWidth = 0.0f;
+        for (Map<String, Object> row : infoRows) {
+            String label = String.valueOf(row.getOrDefault("label", ""));
+            String value = String.valueOf(row.getOrDefault("value", ""));
+            maxRowPairWidth = Math.max(maxRowPairWidth,
+                    (float) rowTextRenderer.getWidth(label, false)
+                            + (float) rowTextRenderer.getWidth(value, false));
+        }
+        rowTextRenderer.end();
+
+        boolean graphVisible = showSpeedGraph.get();
+        boolean graphSeparated = graphVisible && separateGraph.get();
+        float animatedRowsHeight = 0.0f;
+        for (Map<String, Object> row : infoRows) {
+            animatedRowsHeight += 12.0f * rowAnimation(row);
+        }
+        float statsHeightUnits = Math.max(
+                showPlayTime ? STATS_HEIGHT : 28.0f,
+                28.0f + animatedRowsHeight
+        );
+        float targetHeightUnits = statsHeightUnits;
+        if (graphVisible) {
+            targetHeightUnits += GRAPH_HEIGHT + (graphSeparated ? GRAPH_GAP : 0.0f);
+        }
+        float targetWidth = Math.max(
+                BASE_WIDTH * baseScale,
+                maxRowPairWidth + (showPlayTime ? 84.0f : 24.0f) * baseScale
+        );
+        float targetHeight = targetHeightUnits * baseScale;
+        displayWidth = HudRenderUtil.animateDimension(displayWidth, targetWidth);
+        displayHeight = HudRenderUtil.animateDimension(displayHeight, targetHeight);
+        width = displayWidth;
+        height = displayHeight;
+
+        float drawScale = Math.max(0.0f, widgetScale);
+        float drawWidth = displayWidth * drawScale;
+        float drawHeight = displayHeight * drawScale;
+        if (drawWidth <= 0.0f || drawHeight <= 0.0f) {
+            width = 0.0f;
+            height = 0.0f;
+            return;
+        }
+
+        float drawX = x + (displayWidth - drawWidth) * 0.5f;
+        float drawY = y + (displayHeight - drawHeight) * 0.5f;
+        float drawBaseScale = baseScale * drawScale;
+        float drawFontScale = fontScale * drawScale;
+        float statsHeight = statsHeightUnits * drawBaseScale;
+        float drawMainHeight;
+        float drawGraphHeight;
+        float drawGraphGap;
+        if (!graphVisible) {
+            drawMainHeight = drawHeight;
+            drawGraphHeight = 0.0f;
+            drawGraphGap = 0.0f;
+        } else if (graphSeparated) {
+            drawMainHeight = Math.min(drawHeight, statsHeight);
+            float remainder = Math.max(0.0f, drawHeight - drawMainHeight);
+            drawGraphGap = Math.min(GRAPH_GAP * drawBaseScale, remainder);
+            drawGraphHeight = Math.max(0.0f, remainder - drawGraphGap);
+        } else {
+            drawMainHeight = drawHeight;
+            drawGraphGap = 0.0f;
+            drawGraphHeight = Math.max(0.0f, drawHeight - statsHeight);
+        }
+
+        int resolvedHeaderIconColor = uiCounter;
+        if (headerIconPulse.get()) {
+            int pulsed = HudTextEffects.animatedColor(
+                    uiCounter,
+                    HudTextEffects.Effect.PULSE,
+                    headerIconPulseSpeed.get(),
+                    (float) (Util.getMillis() / 1000.0),
+                    0.0f
+            );
+            resolvedHeaderIconColor = HudRenderUtil.mixColor(
+                    uiCounter,
+                    pulsed,
+                    headerIconPulseIntensity.get() / 100.0f
+            );
+        }
+
+        HudRenderUtil.ThemeGradient headerIconGradient = isThemeMode()
+                ? HudRenderUtil.themeForegroundGradient(255)
+                : new HudRenderUtil.ThemeGradient(resolvedHeaderIconColor, resolvedHeaderIconColor, 45.0f);
+        if (isThemeMode() && headerIconPulse.get()) {
+            headerIconGradient = HudTextEffects.animatedGradient(
+                    headerIconGradient,
+                    HudTextEffects.Effect.PULSE,
+                    headerIconPulseSpeed.get(),
+                    (float) (Util.getMillis() / 1000.0),
+                    0.0f,
+                    headerIconPulseIntensity.get() / 100.0f
+            );
+        }
+
+        if (shadowEnabled.get()) {
+            boolean themeShadow = isThemeShadow();
+            HudRenderUtil.drawHudShadow(
+                    renderer, drawX, drawY, drawWidth, drawMainHeight,
+                    PANEL_RADIUS * drawBaseScale, drawBaseScale,
+                    themeShadow, shadowAlpha.get(), drawScale,
+                    themeShadowStrength.get() / 100.0f
+            );
+            if (graphSeparated && drawGraphHeight > 0.0f) {
+                HudRenderUtil.drawHudShadow(
+                        renderer,
+                        drawX,
+                        drawY + drawMainHeight + drawGraphGap,
+                        drawWidth,
+                        drawGraphHeight,
+                        PANEL_RADIUS * drawBaseScale,
+                        drawBaseScale,
+                        themeShadow,
+                        shadowAlpha.get(),
+                        drawScale,
+                        themeShadowStrength.get() / 100.0f
+                );
+            }
+        }
+
+        long elapsedMs = snapshot.elapsedMs();
+        String playTime = formatPlayTime(elapsedMs);
+        float hourProgress = (elapsedMs % 3_600_000L) / 3_600_000.0f;
+        float arcEndAngle = -90.0f + 360.0f * hourProgress;
+        // Completed hours become virtual color strata in the same arc draw. The shader keeps a
+        // fixed rolling hash window, so historic hours never allocate additional arc geometry.
+        float arcHashTime = elapsedMs / 3_600_000.0f;
+        List<Float> graphValues = buildGraphValues(
+                snapshot.speedSamples(),
+                forceVisible && snapshot.speedSamples().size() < 2
+        );
+        HudRenderUtil.ThemeGradient accent = HudRenderUtil.themeAccentGradient(255);
+        int accentStart = isThemeMode()
+                ? accent.start()
+                : HudRenderUtil.mixColor(text.getArgb(), muted.getArgb(), 0.12f);
+        int accentEnd = isThemeMode()
+                ? accent.end()
+                : HudRenderUtil.mixColor(text.getArgb(), muted.getArgb(), 0.45f);
+
+        // Script layout stays in canonical logical units. HUD/user/widget scale is applied once
+        // by UiRenderTransform at paint time instead of being baked into every authored number.
+        float scriptRenderScale = Math.max(0.0001f, drawBaseScale);
+        float scriptWidth = drawWidth / scriptRenderScale;
+        float scriptHeight = drawHeight / scriptRenderScale;
+        float scriptMainHeight = drawMainHeight / scriptRenderScale;
+        float scriptGraphHeight = drawGraphHeight / scriptRenderScale;
+        float scriptGraphGap = drawGraphGap / scriptRenderScale;
+        float scriptFontSize = TextSizing.sizeForScale(drawFontScale / scriptRenderScale);
+        float scriptHeaderTextHeight = (headerTextH * drawScale) / scriptRenderScale;
+        float scriptRowTextHeight = (rowTextH * drawScale) / scriptRenderScale;
+
+        scriptedPanel.render(
+                renderer,
+                fallback,
+                ctx,
+                tickDelta,
+                new ScriptedStatisticsHudPanel.Panel(
+                        drawX,
+                        drawY,
+                        scriptWidth,
+                        scriptHeight,
+                        scriptMainHeight,
+                        scriptGraphHeight,
+                        scriptGraphGap,
+                        scriptRenderScale,
+                        scriptFontSize,
+                        scriptHeaderTextHeight,
+                        scriptRowTextHeight,
+                        playTime,
+                        FastFormat.twoDecimals(snapshot.averageBps()) + " BPS",
+                        arcEndAngle,
+                        arcHashTime,
+                        showPlayTime,
+                        graphVisible,
+                        graphSeparated,
+                        hasEffect(),
+                        Math.min(1.0f, (blurAlpha.get() / 255.0f) * (isThemeMode() ? 1.15f : 1.0f)),
+                        HudPanelLayoutModes.current(layoutMode),
+                        strokeEnabled.get(),
+                        strokeAlpha.get() / 255.0f,
+                        isThemeMode() && strokeGradient.get(),
+                        resolveStrokeGradientStart(),
+                        resolveStrokeGradientEnd(),
+                        accentStart,
+                        accentEnd,
+                        resolvedHeaderIconColor,
+                        isThemeMode(),
+                        headerIconGradient.start(),
+                        headerIconGradient.end(),
+                        headerIconGradient.angleDeg(),
+                        true,
+                        new ScriptedListHudPanel.Palette(
+                                uiHeaderLeft, uiHeaderRight, uiBodyLeft, uiBodyRight,
+                                uiOutline, uiText, uiMuted, uiCounter, uiTitleText, uiDivider, uiBlurTint
+                        ),
+                        infoRows,
+                        GRAPH_CEILING_BPS,
+                        graphValues
+                )
+        );
+    }
+
+    private static Map<String, Boolean> defaultInformationModes() {
+        LinkedHashMap<String, Boolean> defaults = new LinkedHashMap<>();
+        defaults.put(INFO_GAMES, true);
+        defaults.put(INFO_KD, true);
+        defaults.put(INFO_KILLS, true);
+        defaults.put(INFO_DEATHS, false);
+        defaults.put(INFO_PLAY_TIME, true);
+        defaults.put(INFO_AVERAGE_SPEED, false);
+        defaults.put(INFO_BEDWARS_IRON, false);
+        defaults.put(INFO_BEDWARS_GOLD, false);
+        defaults.put(INFO_BEDWARS_DIAMONDS, false);
+        defaults.put(INFO_BEDWARS_EMERALDS, false);
+        defaults.put(INFO_BLOCKESP_TOTAL, true);
+        defaults.put(INFO_BLOCKESP_VISIBLE, false);
+        defaults.put(INFO_BLOCKESP_BREAKDOWN, false);
+        return defaults;
+    }
+
+    private List<LinkedHashMap<String, Object>> collectInformationRows(SessionStatisticsTracker.Snapshot snapshot,
+                                                                        boolean exampleData) {
+        List<LinkedHashMap<String, Object>> rows = new ArrayList<>();
+        if (information.get(INFO_GAMES)) {
+            rows.add(infoRow(INFO_GAMES, "Games", Integer.toString(snapshot.gamesPlayed()), uiCounter));
+        }
+        if (information.get(INFO_KD)) {
+            String kd = snapshot.deaths() == 0
+                    ? Integer.toString(snapshot.kills())
+                    : FastFormat.twoDecimals(snapshot.kd());
+            rows.add(infoRow(INFO_KD, "K/D", kd, uiText));
+        }
+        if (information.get(INFO_KILLS)) {
+            rows.add(infoRow(INFO_KILLS, "Kills", Integer.toString(snapshot.kills()), uiText));
+        }
+        if (information.get(INFO_DEATHS)) {
+            rows.add(infoRow(INFO_DEATHS, "Deaths", Integer.toString(snapshot.deaths()), uiText));
+        }
+        if (information.get(INFO_AVERAGE_SPEED)) {
+            rows.add(infoRow(INFO_AVERAGE_SPEED, "Average Speed",
+                    FastFormat.twoDecimals(snapshot.averageBps()) + " BPS", uiCounter));
+        }
+
+        if (exampleData || isBedWarsContext()) {
+            addResourceRow(rows, INFO_BEDWARS_IRON, "Iron", Items.IRON_INGOT, 0xFFD8D8D8, exampleData ? 32 : -1);
+            addResourceRow(rows, INFO_BEDWARS_GOLD, "Gold", Items.GOLD_INGOT, 0xFFFFD45A, exampleData ? 14 : -1);
+            addResourceRow(rows, INFO_BEDWARS_DIAMONDS, "Diamonds", Items.DIAMOND, 0xFF55E3F0, exampleData ? 4 : -1);
+            addResourceRow(rows, INFO_BEDWARS_EMERALDS, "Emeralds", Items.EMERALD, 0xFF57D987, exampleData ? 2 : -1);
+        }
+
+        BlockESP blockEsp = Modules.get(BlockESP.class);
+        boolean blockEspActive = blockEsp != null && blockEsp.isEnabled();
+        if (!blockEspActive && !exampleData) return rows;
+
+        BlockESP.DetectionSnapshot detections = blockEspActive
+                ? blockEsp.detectionSnapshot()
+                : new BlockESP.DetectionSnapshot(22, 16, 6, List.of(
+                new BlockESP.BlockDetection("minecraft:diamond_ore", "Diamond Ore", 14, 9, 5),
+                new BlockESP.BlockDetection("minecraft:ancient_debris", "Ancient Debris", 8, 7, 1)
+        ));
+        if (information.get(INFO_BLOCKESP_TOTAL)) {
+            rows.add(infoRow(INFO_BLOCKESP_TOTAL, "Detected Blocks", Integer.toString(detections.total()), uiCounter));
+        }
+        if (information.get(INFO_BLOCKESP_VISIBLE)) {
+            rows.add(infoRow(INFO_BLOCKESP_VISIBLE, "Visible Blocks",
+                    detections.visible() + " / " + detections.total(), uiText));
+        }
+        if (information.get(INFO_BLOCKESP_BREAKDOWN)) {
+            int shown = 0;
+            int remainder = 0;
+            for (BlockESP.BlockDetection detection : detections.blocks()) {
+                if (shown < MAX_BLOCKESP_ROWS) {
+                    rows.add(infoRow(
+                            "blockesp:" + detection.id(),
+                            compactLabel(detection.name()),
+                            Integer.toString(detection.total()),
+                            uiCounter
+                    ));
+                    shown++;
+                } else {
+                    remainder += detection.total();
+                }
+            }
+            if (remainder > 0) {
+                rows.add(infoRow("blockesp:other", "Other Blocks", Integer.toString(remainder), uiMuted));
+            }
+        }
+        return rows;
+    }
+
+    private List<LinkedHashMap<String, Object>> animateInformationRows(
+            List<LinkedHashMap<String, Object>> currentRows) {
+        LinkedHashMap<String, LinkedHashMap<String, Object>> current = new LinkedHashMap<>();
+        for (LinkedHashMap<String, Object> row : currentRows) {
+            current.put(String.valueOf(row.getOrDefault("key", "row")), row);
+        }
+
+        LinkedHashMap<String, LinkedHashMap<String, Object>> merged = new LinkedHashMap<>();
+        for (Map.Entry<String, LinkedHashMap<String, Object>> entry : lastInformationRows.entrySet()) {
+            merged.put(entry.getKey(), current.getOrDefault(entry.getKey(), entry.getValue()));
+        }
+        for (Map.Entry<String, LinkedHashMap<String, Object>> entry : current.entrySet()) {
+            merged.putIfAbsent(entry.getKey(), entry.getValue());
+        }
+        List<Map.Entry<String, LinkedHashMap<String, Object>>> ordered = new ArrayList<>(merged.entrySet());
+        ordered.sort((left, right) -> Integer.compare(
+                informationRowOrder(left.getKey()),
+                informationRowOrder(right.getKey())
+        ));
+        lastInformationRows.clear();
+        for (Map.Entry<String, LinkedHashMap<String, Object>> entry : ordered) {
+            lastInformationRows.put(entry.getKey(), entry.getValue());
+        }
+
+        List<String> remove = new ArrayList<>();
+        List<LinkedHashMap<String, Object>> animated = new ArrayList<>();
+        float dt = AnimationUtility.deltaTime();
+        for (Map.Entry<String, LinkedHashMap<String, Object>> entry : lastInformationRows.entrySet()) {
+            String key = entry.getKey();
+            float target = current.containsKey(key) ? 1.0f : 0.0f;
+            float progress = informationRowAnimations.getOrDefault(key, 0.0f);
+            progress = AnimationUtility.approach(progress, target, dt, target > progress ? 13.0f : 10.0f);
+            progress = AnimationUtility.snap(progress, target, 0.015f);
+            if (progress <= 0.0f && target <= 0.0f) {
+                remove.add(key);
+                continue;
+            }
+
+            informationRowAnimations.put(key, progress);
+            LinkedHashMap<String, Object> row = new LinkedHashMap<>(entry.getValue());
+            row.put("animation", AnimationUtility.smoothstep(progress));
+            animated.add(row);
+        }
+        for (String key : remove) {
+            informationRowAnimations.remove(key);
+            lastInformationRows.remove(key);
+        }
+        return animated;
+    }
+
+    private static int informationRowOrder(String key) {
+        if (INFO_GAMES.equals(key)) return 10;
+        if (INFO_KD.equals(key)) return 20;
+        if (INFO_KILLS.equals(key)) return 30;
+        if (INFO_DEATHS.equals(key)) return 40;
+        if (INFO_AVERAGE_SPEED.equals(key)) return 50;
+        if (INFO_BEDWARS_IRON.equals(key)) return 100;
+        if (INFO_BEDWARS_GOLD.equals(key)) return 110;
+        if (INFO_BEDWARS_DIAMONDS.equals(key)) return 120;
+        if (INFO_BEDWARS_EMERALDS.equals(key)) return 130;
+        if (INFO_BLOCKESP_TOTAL.equals(key)) return 200;
+        if (INFO_BLOCKESP_VISIBLE.equals(key)) return 210;
+        if (INFO_BLOCKESP_BREAKDOWN.equals(key)) return 220;
+        if (key != null && key.startsWith("blockesp:")) return 230;
+        return 1_000;
+    }
+
+    private boolean isBedWarsContext() {
+        long now = Util.getMillis();
+        if (now - lastBedWarsContextCheckMs < 500L) {
+            return now < bedWarsContextUntilMs;
+        }
+        lastBedWarsContextCheckMs = now;
+
+        boolean detected = hasBedWarsScoreboard();
+        BedwarsESP bedwarsEsp = Modules.get(BedwarsESP.class);
+        detected |= bedwarsEsp != null && bedwarsEsp.isEnabled();
+        if (detected) {
+            // Scoreboards briefly disappear between rounds and during respawn.
+            bedWarsContextUntilMs = now + 5_000L;
+        }
+        return now < bedWarsContextUntilMs;
+    }
+
+    private boolean hasBedWarsScoreboard() {
+        Objective objective = resolveSidebarObjective();
+        if (objective == null) return false;
+        if (containsBedWarsMarker(objective.getDisplayName().getString())) return true;
+
+        int inspected = 0;
+        for (PlayerScoreEntry entry : objective.getScoreboard().listPlayerScores(objective)) {
+            if (entry == null || entry.isHidden()) continue;
+            PlayerTeam team = objective.getScoreboard().getPlayersTeam(entry.owner());
+            String label = PlayerTeam.formatNameForTeam(team, entry.ownerName()).getString();
+            if (containsBedWarsMarker(label)) return true;
+            if (++inspected >= 20) break;
+        }
+        return false;
+    }
+
+    private Objective resolveSidebarObjective() {
+        if (mc == null || mc.level == null || mc.player == null) return null;
+        net.minecraft.world.scores.Scoreboard scoreboard = mc.level.getScoreboard();
+        PlayerTeam team = scoreboard.getPlayersTeam(mc.player.getScoreboardName());
+        if (team != null) {
+            DisplaySlot slot = team.getColor().map(net.minecraft.world.scores.TeamColor::displaySlot).orElse(null);
+            if (slot != null) {
+                Objective teamObjective = scoreboard.getDisplayObjective(slot);
+                if (teamObjective != null) return teamObjective;
+            }
+        }
+        return scoreboard.getDisplayObjective(DisplaySlot.SIDEBAR);
+    }
+
+    private static boolean containsBedWarsMarker(String text) {
+        if (text == null || text.isBlank()) return false;
+        String normalized = text.toLowerCase(Locale.ROOT);
+        return normalized.contains("bed wars")
+                || normalized.contains("bedwars")
+                || normalized.contains("final kill")
+                || normalized.contains("beds broken")
+                || normalized.contains("bed destroyed");
+    }
+
+    private void addResourceRow(List<LinkedHashMap<String, Object>> rows,
+                                String option,
+                                String label,
+                                Item item,
+                                int color,
+                                int exampleCount) {
+        if (!information.get(option)) return;
+        int count = exampleCount >= 0 ? exampleCount : countInventoryItem(item);
+        rows.add(infoRow(option, label, Integer.toString(count), color));
+    }
+
+    private int countInventoryItem(Item item) {
+        if (mc == null || mc.player == null || item == null) return 0;
+        int count = 0;
+        for (int slot = 0; slot < mc.player.getInventory().getContainerSize(); slot++) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (stack != null && !stack.isEmpty() && stack.is(item)) {
+                count += stack.getCount();
+            }
+        }
+        return count;
+    }
+
+    private static LinkedHashMap<String, Object> infoRow(String key, String label, String value, int valueColor) {
+        LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+        row.put("key", key != null ? key : "row");
+        row.put("label", label != null ? label : "");
+        row.put("value", value != null ? value : "");
+        row.put("valueColor", UiScriptColor.hex(valueColor));
+        return row;
+    }
+
+    private static float rowAnimation(Map<String, Object> row) {
+        Object value = row != null ? row.get("animation") : null;
+        return value instanceof Number number
+                ? Math.max(0.0f, Math.min(1.0f, number.floatValue()))
+                : 1.0f;
+    }
+
+    private static String compactLabel(String label) {
+        if (label == null || label.isBlank()) return "Block";
+        return label.length() <= 22 ? label : label.substring(0, 21) + "…";
+    }
+
+    private List<Float> buildGraphValues(List<Float> samples, boolean preview) {
+        if (preview) {
+            List<Float> values = new ArrayList<>(GRAPH_HISTORY_POINTS);
+            for (int i = 0; i < GRAPH_HISTORY_POINTS; i++) {
+                values.add(previewGraphValue(i));
+            }
+            return values;
+        }
+
+        int sampleCount = samples != null ? Math.min(samples.size(), GRAPH_HISTORY_POINTS) : 0;
+        if (sampleCount < 2) return baselineGraphValues();
+
+        int sourceStart = samples.size() - sampleCount;
+        boolean hasMotion = false;
+        for (int i = 0; i < sampleCount; i++) {
+            if (graphSample(samples.get(sourceStart + i)) > GRAPH_ZERO_EPSILON_BPS) {
+                hasMotion = true;
+                break;
+            }
+        }
+        if (!hasMotion) return baselineGraphValues();
+
+        // Keep only semantic samples here. Bounds/domain -> path geometry now belongs to the UI path
+        // primitive, so Java HUD code no longer manufactures renderer-space x/y maps.
+        List<Float> values = new ArrayList<>(sampleCount);
+        for (int i = 0; i < sampleCount; i++) {
+            float previous = graphSample(samples.get(sourceStart + Math.max(0, i - 1)));
+            float current = graphSample(samples.get(sourceStart + i));
+            float next = graphSample(samples.get(sourceStart + Math.min(sampleCount - 1, i + 1)));
+            values.add((previous + current * 2.0f + next) * 0.25f);
+        }
+        return values;
+    }
+
+    private static float graphSample(Float value) {
+        return value != null && Float.isFinite(value) ? Math.max(0.0f, value) : 0.0f;
+    }
+
+    private static float previewGraphValue(int index) {
+        return Math.max(0.0f, 3.4f + (float) Math.sin(index * 0.28f) * 1.6f
+                + (float) Math.sin(index * 0.09f) * 0.8f);
+    }
+
+    private static List<Float> baselineGraphValues() {
+        List<Float> values = new ArrayList<>(GRAPH_HISTORY_POINTS);
+        for (int i = 0; i < GRAPH_HISTORY_POINTS; i++) values.add(0.0f);
+        return values;
+    }
+
+    private static String formatPlayTime(long elapsedMs) {
+        long totalSeconds = Math.max(0L, elapsedMs / 1000L);
+        long seconds = totalSeconds % 60L;
+        long minutes = (totalSeconds / 60L) % 60L;
+        long hours = totalSeconds / 3600L;
+        if (hours > 0L) {
+            return hours + ":" + FastFormat.clock(minutes, seconds);
+        }
+        return FastFormat.clock(minutes, seconds);
+    }
+
+    private void updatePalette() {
+        if (isThemeMode()) {
+            int alpha = bgAlpha.get();
+            int window = HudRenderUtil.setAlpha(theme().windowBg(), alpha);
+            int header = HudRenderUtil.setAlpha(
+                    HudRenderUtil.mixColor(theme().windowHeader(), theme().surface(), 0.18f),
+                    Math.min(255, alpha + 14)
+            );
+            int surface = HudRenderUtil.setAlpha(
+                    HudRenderUtil.mixColor(theme().surface(), theme().windowBg(), 0.22f),
+                    Math.min(255, alpha + 6)
+            );
+            int deep = HudRenderUtil.setAlpha(
+                    HudRenderUtil.mixColor(theme().surface(), theme().windowHeader(), 0.42f),
+                    Math.min(255, alpha + 18)
+            );
+            uiHeaderLeft = HudRenderUtil.mixColor(header, window, 0.22f);
+            uiHeaderRight = HudRenderUtil.mixColor(surface, header, 0.52f);
+            uiBodyLeft = HudRenderUtil.mixColor(window, surface, 0.24f);
+            uiBodyRight = HudRenderUtil.mixColor(deep, surface, 0.18f);
+            if (isAccentPanelStyle()) {
+                uiHeaderLeft = HudRenderUtil.accentSurface(uiHeaderLeft, 0.20f);
+                uiHeaderRight = HudRenderUtil.accentSurface(uiHeaderRight, 0.27f);
+                uiBodyLeft = HudRenderUtil.accentSurface(uiBodyLeft, 0.18f);
+                uiBodyRight = HudRenderUtil.accentSurface(uiBodyRight, 0.26f);
+            } else if (isGradientPanelStyle()) {
+                float strength = themeGradientStrength.get() / 100.0f;
+                HudRenderUtil.ThemeGradient gradient = HudRenderUtil.themePanelGradient(255);
+                uiHeaderLeft = HudRenderUtil.gradientSurface(uiHeaderLeft, gradient.start(), strength);
+                uiHeaderRight = HudRenderUtil.gradientSurface(uiHeaderRight, gradient.end(), strength);
+                uiBodyLeft = HudRenderUtil.gradientSurface(uiBodyLeft, gradient.start(), strength * 0.92f);
+                uiBodyRight = HudRenderUtil.gradientSurface(uiBodyRight, gradient.end(), strength);
+            }
+            uiOutline = HudRenderUtil.setAlpha(
+                    HudRenderUtil.mixColor(theme().windowStroke(), theme().strokeSoft(), 0.18f),
+                    Math.min(255, Math.max(182, alpha + 36))
+            );
+            uiText = theme().textPrimary();
+            uiTitleText = HudRenderUtil.mixColor(theme().textPrimary(), theme().accent(), 0.14f);
+            uiMuted = HudRenderUtil.mixColor(theme().textMuted(), theme().textPrimary(), 0.16f);
+            uiCounter = HudRenderUtil.mixColor(theme().accent(), theme().textPrimary(), 0.38f);
+            uiDivider = HudRenderUtil.scaleAlpha(uiMuted, 0.68f);
+            uiBlurTint = HudRenderUtil.mixColor(
+                    HudRenderUtil.mixColor(uiHeaderRight, uiBodyRight, 0.5f),
+                    theme().accent(),
+                    0.14f
+            );
+            return;
+        }
+
+        uiHeaderLeft = bg.getArgb();
+        uiHeaderRight = bg2.getArgb();
+        uiBodyLeft = HudRenderUtil.mixColor(bg.getArgb(), bg2.getArgb(), 0.15f);
+        uiBodyRight = bg2.getArgb();
+        uiOutline = stroke.getArgb();
+        uiText = text.getArgb();
+        uiTitleText = uiText;
+        uiMuted = muted.getArgb();
+        uiCounter = HudRenderUtil.mixColor(text.getArgb(), 0xFFE1E1FF, 0.20f);
+        uiDivider = HudRenderUtil.scaleAlpha(uiMuted, 0.55f);
+        uiBlurTint = HudRenderUtil.mixColor(uiHeaderLeft, uiBodyRight, 0.5f);
+    }
+
+    private boolean isThemeMode() {
+        return COLOR_THEME.equals(colorMode.get());
+    }
+
+    private boolean isCustomMode() {
+        return COLOR_CUSTOM.equals(colorMode.get());
+    }
+
+    private boolean isAccentPanelStyle() {
+        return isThemeMode() && HudRenderUtil.PANEL_STYLE_ACCENT.equals(panelStyle.get());
+    }
+
+    private boolean isGradientPanelStyle() {
+        return isThemeMode() && HudRenderUtil.PANEL_STYLE_GRADIENT.equals(panelStyle.get());
+    }
+
+    private boolean isThemeShadow() {
+        return shadowEnabled.get() && isThemeMode()
+                && HudRenderUtil.SHADOW_MODE_THEME.equals(shadowMode.get());
+    }
+
+    private boolean hasEffect() {
+        return !EFFECT_NONE.equals(bgEffect.get());
+    }
+
+    private int resolveStrokeGradientStart() {
+        if (isThemeMode()) return HudRenderUtil.themeAccentGradient(255).start();
+        return stroke.getArgb() | 0xFF000000;
+    }
+
+    private int resolveStrokeGradientEnd() {
+        if (isThemeMode()) return HudRenderUtil.themeAccentGradient(255).end();
+        return stroke.getArgb() | 0xFF000000;
+    }
+
+}

@@ -1,0 +1,64 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.renderer.ui;
+
+import havoc.client.render.engine.core.RenderFrameContext;
+import havoc.client.render.engine.rhi.HavocRhi;
+
+/** Executes compiled UI passes. */
+public final class UiPassExecutor {
+    private UiBatchPlan lastPlan = UiBatchPlan.EMPTY;
+
+    public UiBatchPlan execute(UiBatchPlan plan, RenderFrameContext context, HavocRhi rhi) {
+        UiBatchPlan compiled = plan != null ? plan : UiBatchPlan.EMPTY;
+        if (rhi == null || compiled.passes().isEmpty()) {
+            lastPlan = compiled;
+            return compiled;
+        }
+
+        int submittedRhiCommands = 0;
+        for (UiBatchPlan.Pass pass : compiled.passes()) {
+            if (pass != null && !pass.drawCommands().isEmpty()) {
+                submittedRhiCommands = saturatingAdd(submittedRhiCommands, pass.drawCommands().size());
+            }
+        }
+
+        long drawsBefore = rhi.stats().drawCalls();
+        try {
+            for (UiBatchPlan.Pass pass : compiled.passes()) {
+                if (pass == null) continue;
+                for (havoc.client.render.engine.rhi.resource.TransientTargetDescriptor target
+                        : pass.transientTargets()) {
+                    rhi.resources().frameTransient(target);
+                }
+                if (!pass.drawCommands().isEmpty()) {
+                    rhi.drawMeshes(pass.drawCommands());
+                }
+                pass.executeWork(context, rhi);
+            }
+        } finally {
+            long backendDraws = Math.max(0L, rhi.stats().drawCalls() - drawsBefore);
+            lastPlan = compiled.withExecutionStats(submittedRhiCommands, saturatingInt(backendDraws));
+        }
+        return lastPlan;
+    }
+
+    public UiBatchPlan lastPlan() {
+        return lastPlan;
+    }
+
+    private static int saturatingInt(long value) {
+        return value >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) Math.max(0L, value);
+    }
+
+    private static int saturatingAdd(int current, int delta) {
+        if (delta <= 0) return current;
+        long sum = (long) current + delta;
+        return sum >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) sum;
+    }
+}

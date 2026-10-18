@@ -1,0 +1,1014 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.hud.draggable.impl;
+
+
+import havoc.client.util.text.FastFormat;
+import havoc.client.render.engine.text.TextSizing;
+import havoc.client.render.engine.text.BuiltinFontCatalog;
+import havoc.client.config.values.*;
+import havoc.client.util.screen.ClientScreen;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.screens.ChatScreen;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Util;
+import havoc.client.config.SettingDef;
+import havoc.client.events.impl.RenderPrewarmCollectEvent;
+import havoc.client.features.gui.hud.HudElementRegister;
+import havoc.client.features.gui.hud.HudGlobalConfig;
+import havoc.client.features.gui.hud.HudRenderUtil;
+import havoc.client.features.gui.hud.draggable.DraggableHudElement;
+import havoc.client.features.gui.hud.draggable.DraggableHudElementRegistry;
+import havoc.client.render.engine.color.RenderColor;
+import havoc.client.render.engine.math.HudScale;
+import havoc.client.render.engine.renderer.Renderer2D;
+import havoc.client.render.engine.renderer.ui.draw.UiGlassOpticsSpec;
+import havoc.client.render.engine.renderer.ui.runtime.core.UiMaterialInteractionState;
+import havoc.client.render.engine.svg.SvgRenderOptions;
+import havoc.client.render.engine.text.FontInfo;
+import havoc.client.render.engine.text.TextRenderer;
+import havoc.client.util.media.MediaInfo;
+import havoc.client.util.media.MediaSessionService;
+import havoc.client.util.media.RepeatMode;
+
+import java.util.List;
+
+import static havoc.client.features.theme.Theme.theme;
+
+@HudElementRegister(order = 70)
+public final class MediaPlayer extends DraggableHudElement {
+
+    {
+        defaultLayout(12.0f, 82.30222f);
+    }
+
+
+    private static final float BASE_PADDING = 6f;
+    private static final float BASE_GAP = 6f;
+    private static final float BASE_ART_SIZE = 30f;
+    private static final float BASE_ART_BOOST = 3f;
+    private static final float BASE_ART_OVERHANG = 4f;
+    private static final float BASE_RADIUS = 6f;
+    private static final float BASE_BAR_H = 2.4f;
+    private static final float BASE_BUTTON_SIZE = 16f;
+    private static final float BASE_BUTTON_GAP = 8f;
+    private static final float BASE_TEXT_GAP = 2f;
+    private static final float BASE_BAR_GAP = 4f;
+    private static final float BASE_BOTTOM_GAP = 4f;
+    private static final float BASE_TITLE_SCROLL_SPEED = 22f;
+    private static final float BASE_TITLE_SCROLL_GAP = 14f;
+    private static final float BASE_TITLE_FADE = 12f;
+    private static final float TITLE_SCROLL_PAUSE_SEC = 0.8f;
+    private static final String EFFECT_NONE = "None";
+    private static final String EFFECT_BLUR = "Blur";
+    private static final String EFFECT_GLASS = "Glass";
+
+    private static final float BASE_CONTENT_W = 170f;
+
+    private static final int ICON_PAUSE = 0xEA02;
+    private static final int ICON_PLAY = 0xEA03;
+    private static final int ICON_PREV = 0xEA04;
+    private static final int ICON_NEXT = 0xEA05;
+    private static final int ICON_SHUFFLE = 0xEA06;
+
+    private final UiMaterialInteractionState glassFluid = new UiMaterialInteractionState();
+    private static final UiGlassOpticsSpec MEDIA_GLASS = UiGlassOpticsSpec.LIQUID
+            .withRefraction(0.022f).withBevel(0.22f, 0.130f)
+            .withFluid(0.68f, 0.78f).withCleanReveal(0.76f)
+            .withInteractionStrength(0.52f).withChromaticAberration(0.75f)
+            .withMagnification(1.012f).withShapeDeformation(false).withSpecular(false)
+            .withChromaticMotion(UiGlassOpticsSpec.ChromaticMotion.FLOW);
+    private static final UiGlassOpticsSpec MEDIA_TIME_GLASS = MEDIA_GLASS
+            .withRefraction(0.006f).withBevel(0.24f, 0.030f)
+            .withFluid(0.55f, 0.82f).withInteractionStrength(0.30f)
+            .withChromaticAberration(0.24f).withMagnification(1.008f);
+    private static final UiGlassOpticsSpec MEDIA_HOVER_GLASS = MEDIA_GLASS
+            .withRefraction(0.007f).withBevel(0.28f, 0.034f)
+            .withFluid(0.72f, 0.72f).withInteractionStrength(0.42f)
+            .withChromaticAberration(0.28f).withMagnification(1.010f);
+
+    private final Minecraft mc = Minecraft.getInstance();
+    private final HudGlobalConfig hud = HudGlobalConfig.get();
+    private final MediaSessionService mediaService = MediaSessionService.get();
+    private final NumberValue<Double> scale =
+            new NumberValue<>("media_player_scale", 1.51, 0.5, 5.0);
+    private final BooleanValue syncTheme =
+            new BooleanValue("media_player_sync_theme", true);
+    private final ModeValue panelStyle =
+            new ModeValue("media_player_panel_style", HudRenderUtil.PANEL_STYLE_DEFAULT,
+                    HudRenderUtil.PANEL_STYLE_DEFAULT, HudRenderUtil.PANEL_STYLE_ACCENT,
+                    HudRenderUtil.PANEL_STYLE_GRADIENT);
+    private final NumberValue<Integer> themeMix =
+            new NumberValue<>("media_player_theme_mix", 100, 0, 100);
+    private final NumberValue<Integer> themeGradientStrength =
+            new NumberValue<>("media_player_theme_gradient_strength", 72, 0, 100);
+    private final RGBAColorValue bg =
+            new RGBAColorValue("media_player_bg", "#60000000");
+    private final NumberValue<Integer> bgAlpha =
+            new NumberValue<>("media_player_bg_alpha", 124, 0, 255);
+    private final RGBColorValue accent =
+            new RGBColorValue("media_player_accent", "#FF2F2F");
+    private final RGBColorValue stroke =
+            new RGBColorValue("media_player_stroke", "#5A5A5A");
+    private final BooleanValue strokeEnabled =
+            new BooleanValue("media_player_stroke_enabled", false);
+    private final NumberValue<Integer> strokeAlpha =
+            new NumberValue<>("media_player_stroke_alpha", 160, 0, 255);
+    private final BooleanValue strokeGradient =
+            new BooleanValue("media_player_stroke_gradient", true);
+    private final BooleanValue shadowEnabled =
+            new BooleanValue("media_player_shadow_enabled", false);
+    private final ModeValue shadowMode =
+            new ModeValue("media_player_shadow_mode", HudRenderUtil.SHADOW_MODE_BLACK,
+                    HudRenderUtil.SHADOW_MODE_BLACK, HudRenderUtil.SHADOW_MODE_THEME);
+    private final NumberValue<Integer> themeShadowStrength =
+            new NumberValue<>("media_player_theme_shadow_strength", 100, 0, 100);
+    private final NumberValue<Integer> shadowAlpha =
+            new NumberValue<>("media_player_shadow_alpha", 96, 0, 255);
+    private final RGBColorValue text =
+            new RGBColorValue("media_player_text", "#FFFFFF");
+    private final ModeValue bgEffect =
+            new ModeValue("media_player_bg_effect", "None", EFFECT_NONE, EFFECT_BLUR, EFFECT_GLASS);
+    private final NumberValue<Integer> blurAlpha =
+            new NumberValue<>("media_player_blur_alpha", 255, 0, 255);
+    private final BooleanValue gradient =
+            new BooleanValue("media_player_gradient", true);
+    private float anim = 0f;
+    private MediaSessionService.Snapshot currentSnapshot = MediaSessionService.Snapshot.empty(MediaSessionService.isMediaAvailable());
+
+    private final UiMaterialInteractionState timeLensFluid = new UiMaterialInteractionState();
+    private final UiMaterialInteractionState playLensFluid = new UiMaterialInteractionState();
+    private final UiMaterialInteractionState shuffleLensFluid = new UiMaterialInteractionState();
+    private final UiMaterialInteractionState prevLensFluid = new UiMaterialInteractionState();
+    private final UiMaterialInteractionState nextLensFluid = new UiMaterialInteractionState();
+    private final UiMaterialInteractionState repeatLensFluid = new UiMaterialInteractionState();
+    private boolean transportInitialized;
+    private boolean lastTransportPlaying;
+    private String lastTransportTrack = "";
+    private long lastTransportPosition;
+
+    private void updateGlassTransport(MediaSessionService.Snapshot snapshot) {
+        if (snapshot == null || !snapshot.hasSession()) {
+            transportInitialized = false;
+            return;
+        }
+        boolean playing = snapshot.isPlaying();
+        String track = snapshot.owner() + "\u0000" + snapshot.title() + "\u0000" + snapshot.artist();
+        long position = snapshot.predictedPositionSeconds();
+        if (playing) {
+            glassFluid.opticalActivity(0.34f);
+            timeLensFluid.opticalActivity(0.18f);
+        }
+        if (transportInitialized) {
+            if (!track.equals(lastTransportTrack)) {
+                glassFluid.opticalActivity(0.95f);
+                playLensFluid.opticalImpulse(0.5f, 0.5f, 0.75f);
+            } else if (playing != lastTransportPlaying) {
+                glassFluid.opticalActivity(playing ? 0.82f : 0.52f);
+                playLensFluid.opticalImpulse(0.5f, 0.5f, 0.78f);
+            } else if (Math.abs(position - lastTransportPosition) > 3) {
+                glassFluid.opticalActivity(0.55f);
+            }
+        }
+        transportInitialized = true;
+        lastTransportPlaying = playing;
+        lastTransportTrack = track;
+        lastTransportPosition = position;
+    }
+    private float playHover;
+    private float shuffleHover;
+    private float prevHover;
+    private float nextHover;
+    private float repeatHover;
+    private float progressHover;
+    private float progressPress;
+
+    private float shuffleX;
+    private float shuffleY;
+    private float playX;
+    private float playY;
+    private float prevX;
+    private float prevY;
+    private float nextX;
+    private float nextY;
+    private float repeatX;
+    private float repeatY;
+    private float progressX;
+    private float progressY;
+    private float progressW;
+    private float progressH;
+    private float buttonSize;
+    private int uiAccent;
+    private int uiAccentSoft;
+    private int uiText;
+    private int uiTextMuted;
+
+    public MediaPlayer() {
+        super("media_player", "Media Player", "hud.draggable.media_player.description", false);
+    }
+
+    private static String iconString(int codepoint) {
+        return new String(Character.toChars(codepoint));
+    }
+
+    private static TextRenderer getMediaIcons(TextRenderer fallback) {
+        return BuiltinFontCatalog.MEDIA_PLAYER.renderer(fallback);
+    }
+
+    public void onResourceReload() {
+        mediaService.onResourceReload();
+        currentSnapshot = MediaSessionService.Snapshot.empty(MediaSessionService.isMediaAvailable());
+        transportInitialized = false;
+    }
+
+    @Override
+    protected void defineSettings(List<SettingDef> defs) {
+        defs.add(SettingDef.number(scale));
+        defs.add(SettingDef.bool(syncTheme));
+        defs.add(SettingDef.mode(panelStyle).visibleWhen(syncTheme::get));
+        defs.add(SettingDef.number(themeMix).visibleWhen(syncTheme::get));
+        defs.add(SettingDef.number(themeGradientStrength).visibleWhen(this::isGradientPanelStyle));
+        defs.add(SettingDef.color(bg).visibleWhen(() -> !syncTheme.get() && !isGlassEffect()));
+        defs.add(SettingDef.number(bgAlpha).visibleWhen(() -> syncTheme.get() && !isGlassEffect()));
+        defs.add(SettingDef.colorNoAlpha(accent).visibleWhen(() -> !syncTheme.get()));
+        defs.add(SettingDef.colorNoAlpha(text).visibleWhen(() -> !syncTheme.get()));
+        defs.add(SettingDef.mode(bgEffect));
+        defs.add(SettingDef.number(blurAlpha).visibleWhen(this::isBlurEffect));
+        defs.add(SettingDef.bool(gradient).visibleWhen(() -> syncTheme.get() && !isGlassEffect()));
+        defs.add(SettingDef.bool(strokeEnabled));
+        defs.add(SettingDef.colorNoAlpha(stroke).visibleWhen(() -> strokeEnabled.get() && !syncTheme.get()));
+        defs.add(SettingDef.number(strokeAlpha).visibleWhen(strokeEnabled::get));
+        defs.add(SettingDef.bool(strokeGradient).visibleWhen(() -> strokeEnabled.get() && syncTheme.get()));
+        defs.add(SettingDef.bool(shadowEnabled));
+        defs.add(SettingDef.mode(shadowMode).visibleWhen(() -> shadowEnabled.get() && syncTheme.get()));
+        defs.add(SettingDef.number(themeShadowStrength).visibleWhen(this::isThemeShadow));
+        defs.add(SettingDef.number(shadowAlpha).visibleWhen(shadowEnabled::get));
+    }
+
+    @Override
+    public void applyDefaultPosition(int screenW, int screenH) {
+        float scale = HudScale.scale(screenW, screenH) * this.scale.get().floatValue();
+        this.x = 20f * scale;
+        this.y = 20f * scale;
+    }
+
+    @Override
+    public boolean usesEngineRenderer() {
+        return true;
+    }
+
+    @Override
+    public boolean isMouseOverInteractive(float mx, float my) {
+        if (!(ClientScreen.current() instanceof ChatScreen)) return false;
+        boolean hasSession = currentSnapshot != null && currentSnapshot.hasSession();
+        if (!hasSession) return false;
+        boolean seekHit = currentSnapshot.supportsSeek() && progressW > 0f
+                && hit(mx, my, progressX - 2f, progressY - 5f, progressW + 4f, progressH + 10f);
+        if (buttonSize <= 0f) return seekHit;
+        boolean showShuffle = currentSnapshot.supportsShuffle();
+        boolean showRepeat = currentSnapshot.supportsRepeat();
+        return seekHit
+                || hit(mx, my, playX, playY, buttonSize, buttonSize)
+                || (showShuffle && hit(mx, my, shuffleX, shuffleY, buttonSize, buttonSize))
+                || hit(mx, my, prevX, prevY, buttonSize, buttonSize)
+                || hit(mx, my, nextX, nextY, buttonSize, buttonSize)
+                || (showRepeat && hit(mx, my, repeatX, repeatY, buttonSize, buttonSize));
+    }
+
+    @Override
+    public boolean onMouseClicked(float mx, float my, int button) {
+        if (!(ClientScreen.current() instanceof ChatScreen)) return false;
+        if (currentSnapshot == null || !currentSnapshot.hasSession()) return false;
+        if (button != 0) return false;
+
+        boolean consumed = false;
+        try {
+            if (currentSnapshot.supportsSeek() && progressW > 0f
+                    && hit(mx, my, progressX - 2f, progressY - 5f, progressW + 4f, progressH + 10f)) {
+                long duration = Math.max(0L, currentSnapshot.durationSeconds());
+                if (duration > 0L) {
+                    float fraction = clamp01((mx - progressX) / progressW);
+                    mediaService.seekTo(Math.round(duration * fraction));
+                    progressPress = 1.0f;
+                    consumed = true;
+                }
+            } else if (currentSnapshot.supportsShuffle() && hit(mx, my, shuffleX, shuffleY, buttonSize, buttonSize)) {
+                mediaService.toggleShuffle();
+                consumed = true;
+            } else if (hit(mx, my, playX, playY, buttonSize, buttonSize)) {
+                mediaService.playPause();
+                consumed = true;
+            } else if (hit(mx, my, prevX, prevY, buttonSize, buttonSize)) {
+                mediaService.previous();
+                consumed = true;
+            } else if (hit(mx, my, nextX, nextY, buttonSize, buttonSize)) {
+                mediaService.next();
+                consumed = true;
+            } else if (currentSnapshot.supportsRepeat() && hit(mx, my, repeatX, repeatY, buttonSize, buttonSize)) {
+                mediaService.cycleRepeatMode();
+                consumed = true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return consumed;
+    }
+
+    @Override
+    public void renderEngine(Renderer2D renderer,
+                             TextRenderer textRenderer,
+                             GuiGraphicsExtractor ctx,
+                             float tickDelta,
+                             int screenW,
+                             int screenH) {
+        if (mc == null) return;
+        boolean chatOpen = ClientScreen.current() instanceof ChatScreen;
+        boolean preview = DraggableHudElementRegistry.isForceVisible();
+
+        MediaSessionService.Snapshot snapshot = mediaService.snapshot();
+        currentSnapshot = snapshot;
+        if (isGlassEffect()) updateGlassTransport(snapshot);
+        MediaInfo media = snapshot.media();
+        boolean hasSession = snapshot.hasSession();
+        boolean mediaAvailable = snapshot.mediaAvailable();
+        boolean shouldShow = hasSession || chatOpen || preview;
+
+        float target = shouldShow ? 1.0f : 0.0f;
+        anim = lerp(anim, target, 0.25f);
+        if (!shouldShow && anim <= 0.02f) {
+            width = 0f;
+            height = 0f;
+            updateButtons();
+            return;
+        }
+
+        TextRenderer titleRenderer = BuiltinFontCatalog.INTER_BOLD.renderer(textRenderer);
+        TextRenderer artistRenderer = BuiltinFontCatalog.INTER_MEDIUM.renderer(textRenderer);
+        TextRenderer metaRenderer = BuiltinFontCatalog.INTER_REGULAR.renderer(textRenderer);
+        TextRenderer iconRenderer = getMediaIcons(textRenderer);
+
+        float mediaScale = scale.get().floatValue();
+        float baseScale = HudScale.scale(screenW, screenH) * mediaScale;
+        float fontScale = TextSizing.scaleForSize(hud.getFontSize()) * mediaScale;
+        float padding = BASE_PADDING * baseScale;
+        float gap = BASE_GAP * baseScale;
+        float artBase = BASE_ART_SIZE * baseScale;
+        float artBoost = BASE_ART_BOOST * baseScale;
+        float artOverhang = BASE_ART_OVERHANG * baseScale;
+        float radius = BASE_RADIUS * baseScale;
+        float barH = BASE_BAR_H * baseScale;
+        float textGap = BASE_TEXT_GAP * baseScale;
+        float barGap = BASE_BAR_GAP * baseScale;
+        float bottomGap = BASE_BOTTOM_GAP * baseScale;
+        float buttonGap = BASE_BUTTON_GAP * baseScale;
+        float contentW = BASE_CONTENT_W * baseScale;
+
+        float titleScale = 0.95f * fontScale;
+        float artistScale = 0.78f * fontScale;
+        float metaScale = 0.70f * fontScale;
+        float iconScale = 0.9f * fontScale;
+
+        String title = hasSession ? safe(media.title()) : "";
+        String artist = hasSession ? safe(media.artist()) : "";
+        String owner = hasSession && snapshot.session() != null ? safe(snapshot.session().getOwner()) : "";
+        long predictedPos = hasSession ? snapshot.predictedPositionSeconds() : 0L;
+        long predictedDur = hasSession ? snapshot.durationSeconds() : 0L;
+        String timeText = hasSession ? formatTime(predictedPos) : "";
+
+        final boolean showShuffle = hasSession && snapshot.supportsShuffle();
+        final boolean showRepeat = hasSession && snapshot.supportsRepeat();
+        final int activeControls = 3 + (showShuffle ? 1 : 0) + (showRepeat ? 1 : 0);
+        final float btnSizeBase = BASE_BUTTON_SIZE * baseScale;
+
+        String titleText = hasSession ? title : "";
+        String artistText = hasSession ? trimText(artistRenderer, artist, contentW, artistScale) : "";
+
+        titleRenderer.begin(titleScale, false, false);
+        float titleW = hasSession ? (float) titleRenderer.getWidth(titleText, false) : 0f;
+        float titleH = (float) titleRenderer.getHeight(false);
+        titleRenderer.end();
+
+        artistRenderer.begin(artistScale, false, false);
+        if (hasSession) {
+            artistRenderer.getWidth(artistText, false);
+        }
+        float artistH = (float) artistRenderer.getHeight(false);
+        artistRenderer.end();
+
+        metaRenderer.begin(metaScale, false, false);
+        float metaH = (float) metaRenderer.getHeight(false);
+        metaRenderer.end();
+
+        float contentH = titleH + textGap + artistH + barGap + barH + bottomGap + metaH;
+        float artSize = Math.max(artBase, contentH + artBoost);
+        float leftPad = padding + artOverhang;
+
+        float bodyH = Math.max(contentH, artSize);
+
+        float boxW = leftPad + padding + artSize + gap + contentW;
+        float boxH = padding * 2f + bodyH;
+
+        width = boxW;
+        height = boxH;
+
+        float scale = Math.max(0f, Math.min(1f, anim));
+        float drawX = x + (boxW - boxW * scale) * 0.5f;
+        float drawY = y + (boxH - boxH * scale) * 0.5f;
+
+        boolean useSyncTheme = syncTheme.get();
+        boolean accentPanel = useSyncTheme && HudRenderUtil.PANEL_STYLE_ACCENT.equals(panelStyle.get());
+        boolean gradientPanel = isGradientPanelStyle();
+        float themeBlend = themeMix.get() / 100.0f;
+        boolean blurEnabled = isBlurEffect();
+        boolean glassEnabled = isGlassEffect();
+        int baseRgb = glassEnabled ? HudRenderUtil.glassBackgroundRgb()
+                : (useSyncTheme ? (theme().windowBg() & 0x00FFFFFF) : (bg.getArgb() & 0x00FFFFFF));
+        int bgAlpha = getBgAlpha();
+        int bg = (bgAlpha << 24) | baseRgb;
+        int accent = useSyncTheme ? theme().accent() : (this.accent.getArgb() | 0xFF000000);
+        int accentSoft = useSyncTheme
+                ? theme().accentSoft()
+                : HudRenderUtil.mixColor(accent, bg, 0.55f);
+        int borderColor = useSyncTheme
+                ? HudRenderUtil.mixColor(theme().windowStroke(), theme().strokeSoft(), 0.35f)
+                : (stroke.getArgb() | 0xFF000000);
+        uiAccent = accent;
+        uiAccentSoft = accentSoft;
+        uiText = useSyncTheme ? theme().textPrimary() : (text.getArgb() | 0xFF000000);
+        uiTextMuted = useSyncTheme ? theme().textMuted() : HudRenderUtil.mixColor(uiText, bg, 0.6f);
+
+        if (shadowEnabled.get()) {
+            HudRenderUtil.drawHudShadow(
+                    renderer, drawX, drawY, boxW * scale, boxH * scale, radius * scale, baseScale * scale,
+                    isThemeShadow(),
+                    shadowAlpha.get(), scale,
+                    themeShadowStrength.get() / 100.0f
+            );
+        }
+
+        if (glassEnabled) {
+            drawGlass(drawX, drawY, boxW * scale, boxH * scale, radius * scale, baseScale * scale, uiAccentSoft);
+        } else if (blurEnabled) {
+            drawBlur(drawX, drawY, boxW * scale, boxH * scale, radius * scale, bg);
+        }
+
+        int bgScaled = glassEnabled
+                ? HudRenderUtil.glassPanelBackground(scale)
+                : HudRenderUtil.scaleAlpha(bg, scale);
+        boolean useGradient = !glassEnabled && useSyncTheme && gradient.get();
+        if (!glassEnabled && gradientPanel) {
+            float strength = (themeGradientStrength.get() / 100.0f) * themeBlend;
+            HudRenderUtil.ThemeGradient themeGradient = HudRenderUtil.themePanelGradient(255);
+            int topBase = HudRenderUtil.setAlpha(theme().windowBg(), bgAlpha);
+            int bottomBase = HudRenderUtil.setAlpha(
+                    HudRenderUtil.mixColor(theme().surface(), theme().windowHeader(), 0.32f), bgAlpha
+            );
+            int top = HudRenderUtil.scaleAlpha(
+                    HudRenderUtil.gradientSurface(topBase, themeGradient.start(), strength), scale
+            );
+            int bottom = HudRenderUtil.scaleAlpha(
+                    HudRenderUtil.gradientSurface(bottomBase, themeGradient.end(), strength), scale
+            );
+            renderer.roundedRectGradient(drawX, drawY, boxW * scale, boxH * scale, radius * scale, 1.0f,
+                    top, bottom, themeGradient.angleDeg());
+        } else if (!glassEnabled && accentPanel) {
+            int top = HudRenderUtil.scaleAlpha(
+                    HudRenderUtil.accentSurface(HudRenderUtil.setAlpha(theme().windowBg(), bgAlpha), 0.18f * themeBlend), scale
+            );
+            int bottom = HudRenderUtil.scaleAlpha(
+                    HudRenderUtil.accentSurface(
+                            HudRenderUtil.setAlpha(HudRenderUtil.mixColor(theme().surface(), theme().windowHeader(), 0.32f), bgAlpha),
+                            0.30f * themeBlend
+                    ), scale
+            );
+            renderer.roundedRectGradient(drawX, drawY, boxW * scale, boxH * scale, radius * scale, 1.0f, top, bottom, 90.0f);
+        } else if (!glassEnabled) {
+            HudRenderUtil.drawHudBackground(renderer, drawX, drawY, boxW * scale, boxH * scale, radius * scale, 1.0f, bgScaled, useGradient);
+        }
+        if (strokeEnabled.get()) {
+            HudRenderUtil.drawHudStroke(
+                    renderer, drawX, drawY, boxW * scale, boxH * scale, radius * scale, 1.0f,
+                    Math.max(0.5f, 0.9f * baseScale * scale), borderColor,
+                    useSyncTheme && strokeGradient.get(), strokeAlpha.get(), scale
+            );
+        }
+
+        float contentY = padding + (bodyH - contentH) * 0.5f;
+
+        if (!hasSession) {
+            String statusKey;
+            if (mediaAvailable) {
+                statusKey = "hud.media_player.available";
+            } else if (MediaSessionService.isMediaIntentionallyOmitted()) {
+                statusKey = "hud.media_player.unavailable_profile";
+            } else {
+                statusKey = "hud.media_player.unavailable";
+            }
+            String status = I18n.get(statusKey);
+
+            metaRenderer.begin(metaScale * scale, false, false);
+            float statusW = (float) metaRenderer.getWidth(status, false);
+            float statusH = (float) metaRenderer.getHeight(false);
+            metaRenderer.end();
+
+            float sx = drawX + (boxW * scale - statusW) * 0.5f;
+            float sy = drawY + (boxH * scale - statusH) * 0.5f;
+
+            metaRenderer.begin(metaScale * scale, false, false);
+            metaRenderer.render(status, sx, sy, new RenderColor(HudRenderUtil.scaleAlpha(uiTextMuted, scale)), false);
+            metaRenderer.end();
+            updateButtons();
+            return;
+        }
+
+        float artX = leftPad - (2f * baseScale);
+        float artY = padding + (bodyH - artSize) * 0.5f;
+        float textX = leftPad + artSize + gap;
+        float artistY = contentY + titleH + textGap;
+        float barY = artistY + artistH + barGap;
+        float bottomY = barY + barH + bottomGap;
+
+        float drawArtX = drawX + artX * scale;
+        float drawArtY = drawY + artY * scale;
+        float drawArtSize = artSize * scale;
+        float artRadius = Math.min(radius * 1.2f, artSize * 0.22f) * scale;
+
+        Identifier artworkTexture = snapshot.artworkTexture();
+        if (artworkTexture != null) {
+            Renderer2D.TEXTURE.roundedTexRect(drawArtX, drawArtY, drawArtSize, drawArtSize, artRadius,
+                    1.0f, HudRenderUtil.scaleAlpha(0xFFFFFFFF, scale), artworkTexture);
+        } else {
+            renderer.roundedRect(drawArtX, drawArtY, drawArtSize, drawArtSize, artRadius,
+                    1.0f, HudRenderUtil.scaleAlpha(0x44111111, scale));
+            renderer.roundedRectStroke(drawArtX, drawArtY, drawArtSize, drawArtSize, artRadius,
+                    1.0f, 0.9f * baseScale * scale, HudRenderUtil.scaleAlpha(uiAccentSoft, scale * 0.9f));
+        }
+
+        float titleRenderX = drawX + textX * scale;
+        float titleRenderY = drawY + contentY * scale;
+        float titleRenderW = contentW * scale;
+        float titleRenderH = titleH * scale;
+        boolean titleScroll = titleW > contentW * 1.01f;
+
+        if (titleScroll) {
+            drawScrollingTitle(titleRenderer, titleText, titleRenderX, titleRenderY, titleW * scale, titleRenderW,
+                    titleScale * scale, baseScale, scale);
+        } else {
+            titleRenderer.begin(titleScale * scale, false, false);
+            titleRenderer.render(titleText, titleRenderX, titleRenderY, new RenderColor(HudRenderUtil.scaleAlpha(uiText, scale)), false);
+            titleRenderer.end();
+        }
+
+        artistRenderer.begin(artistScale * scale, false, false);
+        artistRenderer.render(artistText, drawX + textX * scale, drawY + artistY * scale,
+                new RenderColor(HudRenderUtil.scaleAlpha(uiTextMuted, scale)), false);
+        artistRenderer.end();
+
+        float barX = drawX + textX * scale;
+        float barW = contentW * scale;
+        float baseBarY = drawY + barY * scale;
+        float baseBarH = Math.max(0.8f, barH * scale);
+        float progress = predictedDur > 0 ? Math.min(1.0f, Math.max(0.0f,
+                (float) predictedPos / (float) predictedDur)) : 0f;
+
+        buttonSize = btnSizeBase * scale;
+        float controlsReservedW = btnSizeBase * activeControls + buttonGap * Math.max(0, activeControls - 1);
+        float controlsX = textX + (contentW - controlsReservedW) * 0.5f;
+        float controlsY = bottomY + (metaH - btnSizeBase) * 0.5f;
+        float cursorX = controlsX;
+
+        if (showShuffle) {
+            shuffleX = drawX + cursorX * scale;
+            shuffleY = drawY + controlsY * scale;
+            cursorX += btnSizeBase + buttonGap;
+        } else {
+            shuffleX = shuffleY = 0f;
+        }
+
+        prevX = drawX + cursorX * scale;
+        prevY = drawY + controlsY * scale;
+        cursorX += btnSizeBase + buttonGap;
+
+        playX = drawX + cursorX * scale;
+        playY = prevY;
+        cursorX += btnSizeBase + buttonGap;
+
+        nextX = drawX + cursorX * scale;
+        nextY = prevY;
+        cursorX += btnSizeBase + buttonGap;
+
+        if (showRepeat) {
+            repeatX = drawX + cursorX * scale;
+            repeatY = prevY;
+        } else {
+            repeatX = repeatY = 0f;
+        }
+
+        progressX = barX;
+        progressY = baseBarY;
+        progressW = barW;
+        progressH = baseBarH;
+        progressPress = lerp(progressPress, 0f, 0.18f);
+        updateHover(chatOpen, showShuffle, showRepeat);
+
+        float progressFocus = Math.max(progressHover, progressPress);
+        float hoverExtra = 1.45f * baseScale * scale * progressFocus;
+        float drawBarH = baseBarH + hoverExtra;
+        float drawBarY = baseBarY - hoverExtra * 0.5f;
+        float barRadius = Math.max(1f, drawBarH * 0.5f);
+        int barBg = HudRenderUtil.scaleAlpha(0x55000000, scale);
+        int barFill = HudRenderUtil.scaleAlpha(uiAccent, scale);
+        renderer.roundedRect(barX, drawBarY, barW, drawBarH, barRadius, 1.0f, barBg);
+        renderer.roundedRect(barX, drawBarY, barW * progress, drawBarH, barRadius, 1.0f, barFill);
+
+        if (snapshot.supportsSeek() && progressFocus > 0.015f && barW > 0f) {
+            float thumbSize = Math.max(5.2f * baseScale * scale, drawBarH + 2.0f * baseScale * scale);
+            float thumbRadius = thumbSize * 0.5f;
+            float thumbX = barX + barW * progress;
+            float thumbY = drawBarY + drawBarH * 0.5f;
+            renderer.roundedRect(
+                    thumbX - thumbRadius,
+                    thumbY - thumbRadius,
+                    thumbSize,
+                    thumbSize,
+                    thumbRadius,
+                    1.0f,
+                    HudRenderUtil.scaleAlpha(uiAccent, scale * progressFocus)
+            );
+        }
+
+        float timeX = drawX + textX * scale;
+        float timeY = drawY + bottomY * scale;
+        metaRenderer.begin(metaScale * scale, false, false);
+        float timeW = (float) metaRenderer.getWidth(timeText, false);
+        float timeH = (float) metaRenderer.getHeight(false);
+        metaRenderer.end();
+        if (glassEnabled && timeW > 0f) {
+            float timePadX = 3.2f * baseScale * scale;
+            float timePadY = 1.8f * baseScale * scale;
+            float lensX = timeX - timePadX;
+            float lensY = timeY - timePadY;
+            float lensW = timeW + timePadX * 2f;
+            float lensH = timeH + timePadY * 2f;
+            HudRenderUtil.drawReactiveGlass(lensX, lensY, lensW, lensH, lensH * 0.5f,
+                    Math.max(0.12f, baseScale * scale), false,
+                    1f, scale, timeLensFluid, MEDIA_TIME_GLASS, true, 0f, 0.4f);
+        }
+
+        metaRenderer.begin(metaScale * scale, false, false);
+        metaRenderer.render(timeText, timeX, timeY,
+                new RenderColor(HudRenderUtil.scaleAlpha(uiTextMuted, scale)), false);
+        metaRenderer.end();
+
+        float ownerGap = 3.0f * baseScale;
+        float ownerAreaX = controlsX + controlsReservedW + ownerGap;
+        float ownerAreaW = Math.max(0f, textX + contentW - ownerAreaX);
+        if (ownerAreaW > 1f && !owner.isEmpty()) {
+            String ownerRowText = trimText(metaRenderer, owner, ownerAreaW, metaScale);
+            metaRenderer.begin(metaScale, false, false);
+            float ownerRowW = (float) metaRenderer.getWidth(ownerRowText, false);
+            metaRenderer.end();
+            metaRenderer.begin(metaScale * scale, false, false);
+            float ownerX = drawX + (textX + contentW - ownerRowW) * scale;
+            metaRenderer.render(ownerRowText, ownerX, drawY + bottomY * scale,
+                    new RenderColor(HudRenderUtil.scaleAlpha(uiTextMuted, scale)), false);
+            metaRenderer.end();
+        }
+
+        float controlIconScale = iconScale * 1.05f;
+
+        if (showShuffle) {
+            drawControl(renderer, iconRenderer, iconString(ICON_SHUFFLE),
+                    shuffleX, shuffleY, buttonSize, shuffleHover, scale, controlIconScale,
+                    shuffleColor(snapshot, scale), glassEnabled, shuffleLensFluid);
+        }
+
+        drawControl(renderer, iconRenderer, iconString(ICON_PREV),
+                prevX, prevY, buttonSize, prevHover, scale, controlIconScale,
+                HudRenderUtil.scaleAlpha(uiText, scale), glassEnabled, prevLensFluid);
+
+        drawControl(renderer, iconRenderer,
+                iconString(snapshot.isPlaying() ? ICON_PAUSE : ICON_PLAY),
+                playX, playY, buttonSize, playHover, scale, controlIconScale,
+                HudRenderUtil.scaleAlpha(uiText, scale), glassEnabled, playLensFluid);
+
+        drawControl(renderer, iconRenderer, iconString(ICON_NEXT),
+                nextX, nextY, buttonSize, nextHover, scale, controlIconScale,
+                HudRenderUtil.scaleAlpha(uiText, scale), glassEnabled, nextLensFluid);
+
+        if (showRepeat) {
+            drawRepeatControl(renderer, snapshot, repeatX, repeatY, buttonSize, repeatHover, scale,
+                    glassEnabled, repeatLensFluid);
+        }
+    }
+
+    private void drawControl(Renderer2D renderer,
+                             TextRenderer iconRenderer,
+                             String icon,
+                             float x,
+                             float y,
+                             float size,
+                             float hover,
+                             float alpha,
+                             float iconScale,
+                             int iconColor,
+                             boolean glassEnabled,
+                             UiMaterialInteractionState lensFluid) {
+        if (size <= 0f) return;
+        float radius = size * 0.5f;
+        float hoverEase = clamp01(hover);
+        if (hoverEase > 0.01f) {
+            if (glassEnabled) {
+                drawHoverLens(x, y, size, hoverEase, alpha, lensFluid);
+            } else {
+                int bg = HudRenderUtil.scaleAlpha(uiAccentSoft, hoverEase * 0.45f * alpha);
+                renderer.roundedRect(x, y, size, size, radius, 1.0f, bg);
+            }
+        }
+
+        iconRenderer.begin(iconScale * alpha, false, false);
+        float iw = (float) iconRenderer.getWidth(icon, false);
+        float ih = (float) iconRenderer.getHeight(false);
+        float ix = x + (size - iw) * 0.5f;
+        float iy = y + (size - ih) * 0.5f;
+        iconRenderer.render(icon, ix, iy, new RenderColor(iconColor), false);
+        iconRenderer.end();
+    }
+
+    private void drawRepeatControl(Renderer2D renderer,
+                                   MediaSessionService.Snapshot snapshot,
+                                   float x,
+                                   float y,
+                                   float size,
+                                   float hover,
+                                   float alpha,
+                                   boolean glassEnabled,
+                                   UiMaterialInteractionState lensFluid) {
+        if (size <= 0f) return;
+        float radius = size * 0.5f;
+        float hoverEase = clamp01(hover);
+        if (hoverEase > 0.01f) {
+            if (glassEnabled) {
+                drawHoverLens(x, y, size, hoverEase, alpha, lensFluid);
+            } else {
+                int bg = HudRenderUtil.scaleAlpha(uiAccentSoft, hoverEase * 0.45f * alpha);
+                renderer.roundedRect(x, y, size, size, radius, 1.0f, bg);
+            }
+        }
+
+        String icon = repeatSvg(snapshot);
+        int color = repeatColor(snapshot, alpha);
+        float iconSize = size * 0.78f;
+        float ix = x + (size - iconSize) * 0.5f;
+        float iy = y + (size - iconSize) * 0.5f;
+        renderer.svg(icon, ix, iy, iconSize, iconSize, SvgRenderOptions.overrideColor(color));
+    }
+
+    private void drawHoverLens(float x, float y, float size, float hover, float alpha,
+                               UiMaterialInteractionState lensFluid) {
+        float eased = hover * hover * (3f - 2f * hover);
+        float lensSize = size * (0.72f + 0.28f * eased);
+        float lensX = x + (size - lensSize) * 0.5f;
+        float lensY = y + (size - lensSize) * 0.5f;
+        HudRenderUtil.drawReactiveGlass(lensX, lensY, lensSize, lensSize, lensSize * 0.5f,
+                Math.max(0.12f, lensSize / BASE_BUTTON_SIZE), false,
+                1f, eased * alpha, lensFluid, MEDIA_HOVER_GLASS, true, 0f, 0.65f);
+    }
+
+    private void updateHover(boolean chatOpen, boolean showShuffle, boolean showRepeat) {
+        if (!chatOpen) {
+            playHover = lerp(playHover, 0f, 0.2f);
+            shuffleHover = lerp(shuffleHover, 0f, 0.2f);
+            prevHover = lerp(prevHover, 0f, 0.2f);
+            nextHover = lerp(nextHover, 0f, 0.2f);
+            repeatHover = lerp(repeatHover, 0f, 0.2f);
+            progressHover = lerp(progressHover, 0f, 0.2f);
+            return;
+        }
+        int fbw = mc.getWindow().getWidth();
+        int fbh = mc.getWindow().getHeight();
+        float uiScale = HudScale.scale(fbw, fbh);
+        float mx = HudScale.toVirtual((float) mc.mouseHandler.xpos(), uiScale);
+        float my = HudScale.toVirtual((float) mc.mouseHandler.ypos(), uiScale);
+        shuffleHover = lerp(shuffleHover, showShuffle && hit(mx, my, shuffleX, shuffleY, buttonSize, buttonSize) ? 1f : 0f, 0.25f);
+        playHover = lerp(playHover, hit(mx, my, playX, playY, buttonSize, buttonSize) ? 1f : 0f, 0.25f);
+        prevHover = lerp(prevHover, hit(mx, my, prevX, prevY, buttonSize, buttonSize) ? 1f : 0f, 0.25f);
+        nextHover = lerp(nextHover, hit(mx, my, nextX, nextY, buttonSize, buttonSize) ? 1f : 0f, 0.25f);
+        repeatHover = lerp(repeatHover, showRepeat && hit(mx, my, repeatX, repeatY, buttonSize, buttonSize) ? 1f : 0f, 0.25f);
+        boolean seekHover = currentSnapshot != null && currentSnapshot.supportsSeek() && progressW > 0f
+                && hit(mx, my, progressX - 2f, progressY - 5f, progressW + 4f, progressH + 10f);
+        progressHover = lerp(progressHover, seekHover ? 1f : 0f, 0.25f);
+    }
+
+    private void updateButtons() {
+        shuffleX = (float) 0.0;
+        shuffleY = (float) 0.0;
+        playX = (float) 0.0;
+        playY = (float) 0.0;
+        prevX = (float) 0.0;
+        prevY = (float) 0.0;
+        nextX = (float) 0.0;
+        nextY = (float) 0.0;
+        repeatX = (float) 0.0;
+        repeatY = (float) 0.0;
+        progressX = 0f;
+        progressY = 0f;
+        progressW = 0f;
+        progressH = 0f;
+        buttonSize = (float) 0.0;
+        playHover = 0f;
+        shuffleHover = 0f;
+        prevHover = 0f;
+        nextHover = 0f;
+        repeatHover = 0f;
+        progressHover = 0f;
+        progressPress = 0f;
+    }
+
+    private int shuffleColor(MediaSessionService.Snapshot snapshot, float alpha) {
+        if (snapshot == null || !snapshot.supportsShuffle()) {
+            return HudRenderUtil.scaleAlpha(0xFF000000, 0.36f * alpha);
+        }
+        return snapshot.isShuffleActive()
+                ? HudRenderUtil.scaleAlpha(0xFFFFFFFF, alpha)
+                : HudRenderUtil.scaleAlpha(0xFFB7BEC8, 0.48f * alpha);
+    }
+
+    private int repeatColor(MediaSessionService.Snapshot snapshot, float alpha) {
+        if (snapshot == null || !snapshot.supportsRepeat()) {
+            return HudRenderUtil.scaleAlpha(0xFF000000, 0.36f * alpha);
+        }
+        RepeatMode mode = snapshot.repeatMode();
+        return mode == RepeatMode.ALL || mode == RepeatMode.ONE
+                ? HudRenderUtil.scaleAlpha(0xFFFFFFFF, alpha)
+                : HudRenderUtil.scaleAlpha(0xFFB7BEC8, 0.48f * alpha);
+    }
+
+    private String repeatSvg(MediaSessionService.Snapshot snapshot) {
+        if (snapshot == null || !snapshot.supportsRepeat()) {
+            return "repeat-off";
+        }
+        return snapshot.repeatMode() == RepeatMode.ONE ? "repeat-1" : "repeat";
+    }
+
+    private String formatTime(long seconds) {
+        long sec = Math.max(0L, seconds);
+        long m = sec / 60L;
+        long s = sec % 60L;
+        return FastFormat.minutesSeconds(m, s);
+    }
+
+    private String safe(String value) {
+        if (value == null) return "";
+        String v = value.trim();
+        return v.isEmpty() ? "" : v;
+    }
+
+    private float lerp(float a, float b, float t) {
+        return a + (b - a) * t;
+    }
+
+    private boolean hit(float mx, float my, float x, float y, float w, float h) {
+        return mx >= x && mx <= x + w && my >= y && my <= y + h;
+    }
+
+    private float clamp01(float v) {
+        return Math.max(0f, Math.min(1f, v));
+    }
+
+    private void drawScrollingTitle(TextRenderer renderer,
+                                    String text,
+                                    float x,
+                                    float y,
+                                    float fullWidth,
+                                    float viewWidth,
+                                    float scale,
+                                    float baseScale,
+                                    float alpha) {
+        float speed = BASE_TITLE_SCROLL_SPEED * baseScale;
+        float gap = BASE_TITLE_SCROLL_GAP * baseScale;
+        if (speed <= 0f) return;
+        float cycleDistance = fullWidth + gap;
+        float cycleTime = TITLE_SCROLL_PAUSE_SEC + (cycleDistance / speed);
+        if (cycleTime <= 0f) return;
+
+        float now = Util.getMillis() / 1000f;
+        float t = now % cycleTime;
+        float offset = 0f;
+        if (t > TITLE_SCROLL_PAUSE_SEC) {
+            offset = -(t - TITLE_SCROLL_PAUSE_SEC) * speed;
+        }
+
+        int color = HudRenderUtil.scaleAlpha(uiText, alpha);
+        RenderColor renderColor = new RenderColor(color);
+        float fade = Math.min(viewWidth * 0.25f, BASE_TITLE_FADE * baseScale);
+        renderer.begin(scale, false, false);
+        try {
+            renderer.renderHorizontalFadeClipped(text, x + offset, y, renderColor, x, x + viewWidth, fade, fade, false);
+            if (cycleDistance > viewWidth * 0.5f) {
+                renderer.renderHorizontalFadeClipped(text, x + offset + cycleDistance, y, renderColor,
+                        x, x + viewWidth, fade, fade, false);
+            }
+        } finally {
+            renderer.end();
+        }
+    }
+
+    private float getTextHeight(TextRenderer renderer, float scale) {
+        renderer.begin(scale, false, false);
+        try {
+            return (float) renderer.getHeight(false);
+        } finally {
+            renderer.end();
+        }
+    }
+
+    private String trimText(TextRenderer tr, String text, float maxWidth, float scale) {
+        if (text == null || text.isEmpty()) return "";
+        tr.begin(scale, false, false);
+        try {
+            if (tr.getWidth(text, false) <= maxWidth) return text;
+            String value = text;
+            while (!value.isEmpty()) {
+                String candidate = value + "...";
+                if (tr.getWidth(candidate, false) <= maxWidth) return candidate;
+                value = value.substring(0, value.length() - 1);
+            }
+            return "";
+        } finally {
+            tr.end();
+        }
+    }
+
+    private void drawBlur(float x, float y, float w, float h, float radius, int tintRgb) {
+        float quality = hud.getBlurRadius();
+        float brightness = 1.0f;
+        float alpha = blurAlpha.get() / 255f;
+        Renderer2D.COLOR.blurRect(x, y, w, h, radius, quality, brightness, alpha, 0xFFFFFF);
+    }
+
+    private void drawGlass(float x, float y, float w, float h, float radius, float scale, int accentSoft) {
+        HudRenderUtil.drawReactiveGlass(x, y, w, h, radius, scale, true,
+                1f, anim, glassFluid, MEDIA_GLASS, false, 0f, 0.55f);
+        if (isGradientPanelStyle()) {
+            float strength = (themeGradientStrength.get() / 100.0f) * (themeMix.get() / 100.0f);
+            HudRenderUtil.ThemeGradient panelGradient = HudRenderUtil.themePanelGradient(Math.round(34.0f * strength * anim));
+            Renderer2D.COLOR.roundedRectGradient(
+                    x, y, w, h, radius, 1.0f,
+                    panelGradient.start(), panelGradient.end(), panelGradient.angleDeg()
+            );
+        } else if (syncTheme.get() && HudRenderUtil.PANEL_STYLE_ACCENT.equals(panelStyle.get())) {
+            HudRenderUtil.ThemeGradient accentGradient = HudRenderUtil.themeAccentGradient(
+                    Math.round(24.0f * (themeMix.get() / 100.0f) * anim));
+            Renderer2D.COLOR.roundedRectGradient(
+                    x, y, w, h, radius, 1.0f,
+                    accentGradient.start(), accentGradient.end(), accentGradient.angleDeg()
+            );
+        }
+    }
+
+    private boolean hasEffect() {
+        return !EFFECT_NONE.equals(bgEffect.get());
+    }
+
+    private boolean isBlurEffect() {
+        return EFFECT_BLUR.equals(bgEffect.get());
+    }
+
+    private boolean isGlassEffect() {
+        return EFFECT_GLASS.equals(bgEffect.get());
+    }
+
+    private boolean isGradientPanelStyle() {
+        return syncTheme.get() && HudRenderUtil.PANEL_STYLE_GRADIENT.equals(panelStyle.get());
+    }
+
+    private boolean isThemeShadow() {
+        return shadowEnabled.get() && syncTheme.get()
+                && HudRenderUtil.SHADOW_MODE_THEME.equals(shadowMode.get());
+    }
+
+    private int getBgAlpha() {
+        if (syncTheme.get()) {
+            return bgAlpha.get();
+        }
+        return (bg.getArgb() >>> 24) & 0xFF;
+    }
+    @Override
+    public void collectRenderPrewarm(RenderPrewarmCollectEvent event) {
+        super.collectRenderPrewarm(event);
+        event.font("MediaPlayer", FontInfo.Type.Regular)
+                .font("Inter", FontInfo.Type.Bold)
+                .font("InterMedium", FontInfo.Type.Regular)
+                .svg("repeat")
+                .svg("repeat-1")
+                .svg("repeat-off");
+    }
+
+}

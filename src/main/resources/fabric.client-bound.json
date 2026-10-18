@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "suppressLoaderLogs": true,
+  "suppressLifecycleLogs": true,
+  "hideFromModList": true,
+  "nativeMemoryGuard": "havoc.client.runtime.nativeguard.NativeMemoryGuard"
+}

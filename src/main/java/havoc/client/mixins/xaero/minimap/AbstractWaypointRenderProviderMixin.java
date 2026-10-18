@@ -1,0 +1,68 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.mixins.xaero.minimap;
+
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Pseudo;
+import org.spongepowered.asm.mixin.injection.At;
+import havoc.client.compat.xaero.XaeroIntegration;
+import havoc.client.compat.xaero.XaeroWaypointHudOverlay;
+import havoc.client.compat.xaero.XaeroMinimapIntegration;
+import xaero.common.minimap.waypoints.Waypoint;
+import xaero.hud.minimap.element.render.MinimapElementRenderLocation;
+import xaero.hud.minimap.waypoint.WaypointCollector;
+import xaero.hud.minimap.waypoint.render.AbstractWaypointRenderContext;
+import xaero.hud.minimap.waypoint.render.AbstractWaypointRenderProvider;
+import xaero.hud.minimap.waypoint.render.WaypointMapRenderContext;
+import xaero.hud.minimap.waypoint.render.world.WaypointWorldRenderContext;
+
+import java.util.List;
+
+@Pseudo
+@Mixin(AbstractWaypointRenderProvider.class)
+public abstract class AbstractWaypointRenderProviderMixin {
+
+    @WrapOperation(
+            method = "begin*",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lxaero/hud/minimap/waypoint/WaypointCollector;collect(Ljava/util/List;)V"
+            )
+    )
+    private void havoc$addWaypoints(WaypointCollector instance,
+                                        List<Waypoint> destination,
+                                        Operation<Void> original,
+                                        MinimapElementRenderLocation location,
+                                        AbstractWaypointRenderContext context) {
+        if (context instanceof WaypointWorldRenderContext
+                && XaeroWaypointHudOverlay.shouldSuppressNativeXaeroWaypoints()) {
+            // Keep Xaero's collector lifecycle intact, but discard only the entries appended by it.
+            // Havoc's world marker overlay reads the same session independently, so leaving the
+            // provider list populated would render both Xaero's native waypoint and our marker.
+            int existing = destination.size();
+            original.call(instance, destination);
+            if (destination.size() > existing) {
+                destination.subList(existing, destination.size()).clear();
+            }
+            return;
+        }
+
+        XaeroIntegration.RenderTarget target = null;
+        if (context instanceof WaypointWorldRenderContext) {
+            target = XaeroIntegration.RenderTarget.WORLD_HUD;
+        } else if (context instanceof WaypointMapRenderContext) {
+            target = XaeroIntegration.RenderTarget.MINIMAP;
+        }
+        if (target != null) {
+            destination.addAll(XaeroMinimapIntegration.waypoints(target));
+        }
+        original.call(instance, destination);
+    }
+}

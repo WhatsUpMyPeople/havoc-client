@@ -1,0 +1,258 @@
+{
+  "schemaVersion": 1,
+  "id": "photon.v1_3b",
+  "priority": 450,
+  "identity": {
+    "family": "photon",
+    "policy": "pack_name_and_structural_probes",
+    "profile": "photon",
+    "packNameRegex": ".*photon.*"
+  },
+  "compatibility": {
+    "policy": "pack_name_gated_structural_probes",
+    "verifiedShaderpackVersions": [
+      "v1.3b"
+    ],
+    "verifiedMinecraftVersions": [
+      "26.2"
+    ],
+    "verifiedIrisVersions": [
+      "1.11.4+mc26.2"
+    ],
+    "features": [
+      "fullbright",
+      "worldtweaks_fog",
+      "underwater_fog",
+      "shaderpack_motion_blur_suppression",
+      "havoc_taa_replacement",
+      "havoc_msaa_replacement",
+      "aa_option_policy",
+      "custom_geometry_gbuffer",
+      "custom_geometry_translucent",
+      "custom_geometry_shadows",
+      "shaderpack_depth_of_field_suppression",
+      "shaderpack_postfx_suppression"
+    ]
+  },
+  "integration": {
+    "aa": {
+      "temporalPass": "composite4",
+      "sceneColorTarget": 0,
+      "historyTarget": 5,
+      "colorFormat": "rgba16f",
+      "preserveHistoryAlphaOrigin": true,
+      "taaReplacement": true,
+      "msaaReplacement": true,
+      "packedTargets": [1, 2],
+      "forwardTargets": [3, 13]
+    },
+    "options": {
+      "aa": [
+        "TAA",
+        "TAAU",
+        "TAAU_RENDER_SCALE",
+        "FXAA",
+        "CAS",
+        "CAS_INTENSITY"
+      ],
+      "motionBlur": [
+        "MOTION_BLUR",
+        "MOTION_BLUR_INTENSITY"
+      ],
+      "depthOfField": [
+        "DOF",
+        "DOF_INTENSITY",
+        "DOF_SAMPLES",
+        "DOF_FOCUS"
+      ],
+      "postFx": [
+        "GRADE_BRIGHTNESS",
+        "GRADE_CONTRAST",
+        "GRADE_SATURATION",
+        "GRADE_WHITE_BALANCE",
+        "GRADE_ORANGE_SAT_BOOST",
+        "GRADE_TEAL_SAT_BOOST",
+        "GRADE_GREEN_SAT_BOOST",
+        "GRADE_GREEN_HUE_SHIFT",
+        "VIGNETTE",
+        "VIGNETTE_INTENSITY",
+        "CAS",
+        "CAS_INTENSITY"
+      ]
+    }
+  },
+  "targets": [
+    {
+      "path": "/program/c0_vl.fsh",
+      "patch": "c0_vl.patch",
+      "marker": "havocPhotonApplyWorldTweaksAirFog"
+    },
+    {
+      "path": "/program/c1_blend_layers.fsh",
+      "patch": "c1_blend_layers.patch",
+      "marker": "havocPhotonApplyWorldTweaksFogMatrix"
+    },
+    {
+      "path": "/include/lighting/diffuse_lighting.glsl",
+      "patch": "lighting.patch",
+      "marker": "havocPhotonFullbrightStrength"
+    },
+    {
+      "path": "/include/global.glsl",
+      "patch": "aa_scale.patch",
+      "marker": "HAVOC_AA_UNIFORMS"
+    },
+    {
+      "path": "/program/c16_motion_blur.fsh",
+      "patch": "motion_blur.patch",
+      "marker": "havocSuppressShaderpackMotionBlur"
+    },
+    {
+      "path": "/program/c2_dof.fsh",
+      "patch": "dof.patch",
+      "marker": "havocSuppressShaderpackDepthOfField",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/c14_color_grading.fsh",
+      "patch": "postfx_color_grading.patch",
+      "marker": "havocSuppressShaderpackPostFx",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/final.fsh",
+      "patch": "postfx_final.patch",
+      "marker": "havocSuppressShaderpackPostFx",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/c4_taa_exposure.fsh",
+      "patch": "taa_bypass.patch",
+      "marker": "havocAaOwner",
+      "ownershipCritical": true,
+      "stage": "fragment"
+    },
+    {
+      "path": "/include/utility/space_conversion.glsl",
+      "patch": "space_conversion.patch",
+      "marker": "havocAaReprojectionOffset"
+    },
+    {
+      "path": "/include/misc/raytracer.glsl",
+      "patch": "ssr_stable_raymarch.patch",
+      "marker": "havocSsrDepthTexel"
+    },
+    {
+      "path": "/include/surface/edge_highlight.glsl",
+      "patch": "edge_highlight_msaa.patch",
+      "marker": "havoc_msaa_edge_depth"
+    },
+    {
+      "path": "/include/lighting/specular_lighting.glsl",
+      "patch": "ssr_temporal_sampling.patch",
+      "marker": "HAVOC_SSR_TEMPORAL_STABILITY"
+    },
+    {
+      "path": "/program/gbuffers_all_solid.vsh",
+      "patch": "custom_geometry_solid_vertex.patch",
+      "marker": "havoc_uv1",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_all_solid.fsh",
+      "patch": "custom_geometry_solid_fragment.patch",
+      "marker": "havoc_sample_material_map",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/gbuffers_basic.vsh",
+      "patch": "jitter_clip_fullbright_basic.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_damagedblock.vsh",
+      "patch": "jitter_clip.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_damagedblock.fsh",
+      "patch": "dynamic_lod_bias.patch",
+      "marker": "HAVOC_DYNAMIC_LOD_BIAS",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/gbuffers_armor_glint.vsh",
+      "patch": "jitter_clip.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_armor_glint.fsh",
+      "patch": "dynamic_lod_bias.patch",
+      "marker": "HAVOC_DYNAMIC_LOD_BIAS",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/gbuffers_weather.vsh",
+      "patch": "jitter_clip.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/dh_terrain.vsh",
+      "patch": "jitter_clip_fullbright_dh_terrain.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/dh_water.vsh",
+      "patch": "jitter_clip_fullbright_dh_water.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_all_translucent.vsh",
+      "patch": "custom_geometry_translucent_vertex.patch",
+      "marker": "havoc_uv1",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/gbuffers_all_translucent.fsh",
+      "patch": "custom_geometry_translucent_fragment.patch",
+      "marker": "havoc_translucent_map",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/gbuffers_skytextured.vsh",
+      "patch": "jitter_sky.patch",
+      "marker": "havocTaaOffset",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/d3_ao.fsh",
+      "patch": "custom_geometry_ao.patch",
+      "marker": "havoc_material_mask",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/d4_deferred_shading.fsh",
+      "patch": "custom_geometry_deferred.patch",
+      "marker": "havoc_custom_geometry",
+      "stage": "fragment"
+    },
+    {
+      "path": "/program/shadow.vsh",
+      "patch": "custom_geometry_shadow_vertex.patch",
+      "marker": "havoc_uv1",
+      "stage": "vertex"
+    },
+    {
+      "path": "/program/shadow.fsh",
+      "patch": "custom_geometry_shadow_fragment.patch",
+      "marker": "havoc_shadow_base_color",
+      "stage": "fragment"
+    }
+  ]
+}

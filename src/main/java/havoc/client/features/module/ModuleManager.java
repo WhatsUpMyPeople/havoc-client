@@ -1,0 +1,742 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.module;
+
+import havoc.client.runtime.error.FailureBoundary;
+
+import havoc.client.runtime.error.FailureIsolation;
+import havoc.client.features.gui.chat.diagnostics.FailureDiagnostics;
+
+import havoc.client.features.gui.hud.HudRenderSpace;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import havoc.client.addon.ModuleExtensionManager;
+import havoc.client.util.screen.ClientScreen;
+import it.unimi.dsi.fastutil.objects.ObjectOpenHashSet;
+import lombok.Setter;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import havoc.client.events.Events;
+import havoc.client.render.engine.profiler.ProfilerPhase;
+import havoc.client.render.engine.profiler.RenderProfiler2D;
+import havoc.client.render.engine.profiler.RenderProfiler3D;
+import havoc.client.render.engine.renderer.Renderer2D;
+import havoc.client.render.engine.renderer.Renderer3D;
+import havoc.client.render.helpers.PlacementPreviewRenderer;
+import havoc.client.render.engine.renderer.ui.ItemBatchRenderer;
+import havoc.client.render.engine.text.TextRenderer;
+import havoc.client.runtime.RuntimeGate;
+import havoc.client.runtime.error.ErrorHandler;
+import havoc.client.runtime.RuntimeShutdownContext;
+import havoc.client.util.input.KeyManager;
+import havoc.client.util.logging.DebugLog;
+
+import java.util.*;
+import java.util.function.BooleanSupplier;
+
+public enum ModuleManager {
+    ;
+
+    private static final List<Module> modules = new ArrayList<>();
+    private static final List<Module> modulesView = Collections.unmodifiableList(modules);
+    private static final Map<String, Module> byId = new LinkedHashMap<>();
+    private static final Map<Class<? extends Module>, Module> byType = new IdentityHashMap<>();
+    private static final EnumMap<HudPhase, List<Module>> HUD_PHASE_MODULES = new EnumMap<>(HudPhase.class);
+    private static final EnumMap<HudPhase, Module[]> HUD_PHASE_SNAPSHOTS = new EnumMap<>(HudPhase.class);
+    private static final EnumMap<WorldPhase, List<Module>> WORLD_PHASE_MODULES = new EnumMap<>(WorldPhase.class);
+    private static final EnumMap<WorldPhase, Module[]> WORLD_PHASE_SNAPSHOTS = new EnumMap<>(WorldPhase.class);
+    private static final List<ModuleStateListener> listeners = new ArrayList<>();
+    private static Module[] modulesSnapshot = new Module[0];
+    private static ModuleStateListener[] listenerSnapshot = new ModuleStateListener[0];
+    private static boolean suppressToggleSound = false;
+    @Setter
+    private static boolean suppressToggleNotifications = false;
+    private static List<String> softPanicEnabledModules = Collections.emptyList();
+    private static boolean runtimeReleased = false;
+
+    static {
+        for (HudPhase phase : HudPhase.values()) {
+            HUD_PHASE_MODULES.put(phase, new ArrayList<>());
+            HUD_PHASE_SNAPSHOTS.put(phase, new Module[0]);
+        }
+        for (WorldPhase phase : WorldPhase.values()) {
+            WORLD_PHASE_MODULES.put(phase, new ArrayList<>());
+            WORLD_PHASE_SNAPSHOTS.put(phase, new Module[0]);
+        }
+    }
+
+    public static void register(Module module) {
+        if (runtimeReleased || RuntimeGate.isJarReplacementMode()) return;
+        if (module == null) {
+            DebugLog.error("Skipping null module registration");
+            return;
+        }
+
+        String id = module.name();
+        if (id == null || id.isBlank()) {
+            DebugLog.error("Skipping module with blank id: %s", null, module.getClass().getName());
+            return;
+        }
+
+        Class<? extends Module> type = module.getClass();
+        if (!hasModuleMetadata(type)) {
+            DebugLog.error("Skipping module without metadata annotation: %s", null, type.getName());
+            return;
+        }
+
+        String normalizedId = normalizeName(id);
+        Module existingById = byId.get(normalizedId);
+        if (existingById != null) {
+            DebugLog.error("Skipping duplicate module id '%s': existing=%s duplicate=%s",
+                    null, normalizedId, existingById.getClass().getName(), type.getName());
+            return;
+        }
+
+        Module existingByType = byType.get(type);
+        if (existingByType != null) {
+            DebugLog.error("Skipping duplicate module class: %s", null, type.getName());
+            return;
+        }
+
+        if (modules.contains(module)) {
+            DebugLog.error("Skipping duplicate module instance: %s", null, type.getName());
+            return;
+        }
+
+        modules.add(module);
+        byId.put(normalizedId, module);
+        byType.put(type, module);
+        cacheHudPhase(module);
+        cacheWorldPhase(module);
+        rebuildSnapshots();
+        Events.BUS.register(module);
+    }
+
+    private static boolean hasModuleMetadata(Class<? extends Module> type) {
+        return type.isAnnotationPresent(ModuleInfo.class);
+    }
+
+    private static void cacheHudPhase(Module module) {
+        if (module == null) return;
+        HudPhase phase = module.getHudPhase();
+        if (phase == null || phase == HudPhase.NONE) return;
+        HUD_PHASE_MODULES.get(phase).add(module);
+    }
+
+    private static void cacheWorldPhase(Module module) {
+        if (module == null) return;
+        WorldPhase phase = module.getWorldPhase();
+        if (phase == null || phase == WorldPhase.NONE) return;
+        WORLD_PHASE_MODULES.get(phase).add(module);
+    }
+
+    private static void rebuildSnapshots() {
+        modulesSnapshot = modules.toArray(Module[]::new);
+
+        for (HudPhase phase : HudPhase.values()) {
+            List<Module> list = HUD_PHASE_MODULES.get(phase);
+            HUD_PHASE_SNAPSHOTS.put(phase, list == null || list.isEmpty() ? new Module[0] : list.toArray(Module[]::new));
+        }
+
+        for (WorldPhase phase : WorldPhase.values()) {
+            List<Module> list = WORLD_PHASE_MODULES.get(phase);
+            WORLD_PHASE_SNAPSHOTS.put(phase, list == null || list.isEmpty() ? new Module[0] : list.toArray(Module[]::new));
+        }
+    }
+
+    public static Module get(String name) {
+        if (runtimeReleased || RuntimeGate.isJarReplacementMode()) return null;
+        if (name == null || name.isBlank()) return null;
+        Module module = byId.get(normalizeName(name));
+        if (module != null && !RuntimeGate.canRunModules() && !(module instanceof RuntimeControlModule)) return null;
+        return module;
+    }
+
+    public static <T extends Module> T get(Class<T> type) {
+        if (runtimeReleased || RuntimeGate.isJarReplacementMode()) return null;
+        if (type == null) return null;
+        Module module = byType.get(type);
+        if (module != null && !RuntimeGate.canRunModules() && !(module instanceof RuntimeControlModule)) return null;
+        return module == null ? null : type.cast(module);
+    }
+
+    public static <T extends Module> T require(Class<T> type) {
+        T module = get(type);
+        if (module == null) {
+            String typeName = type == null ? "<null>" : type.getName();
+            throw new NoSuchElementException("Module is not registered: " + typeName);
+        }
+        return module;
+    }
+
+    public static void toggle(String name) {
+        Module m = get(name);
+        if (m != null) m.toggle();
+    }
+
+    public static void toggle(String name, ModuleActivationSource source) {
+        Module m = get(name);
+        if (m != null) m.setEnabled(!m.isEnabled(), source);
+    }
+
+    // Hot per-frame loops open one profiler zone per module; only build the label when a
+    // profiler is attached, otherwise every frame paid a string concat per enabled module.
+    // The per-module section labels used to be concatenated for every enabled module on every frame even
+    // though the section is a no-op unless the dev profiler classes are on the classpath.
+    private static final boolean PROFILER_2D = RenderProfiler2D.isAvailable();
+    private static final boolean PROFILER_3D = RenderProfiler3D.isAvailable();
+
+    private static ProfilerPhase.Scope moduleScope(String prefix, Module module) {
+        return ProfilerPhase.scope(ProfilerPhase.isActive() ? prefix + module.name() : prefix);
+    }
+
+    private static void runModule(Module module, String phase, Runnable action) {
+        if (!module.isEnabled()) return;
+        try {
+            action.run();
+        } catch (RuntimeException e) {
+            FailureIsolation.reportModule(module, phase, e);
+        }
+    }
+
+    public static void tickAll() {
+        FailureIsolation.drain();
+        FailureDiagnostics.drain();
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || !RuntimeGate.canRunModules()) return;
+        if (!ProfilerPhase.isActive()) {
+            for (Module m : modulesSnapshot) runModule(m, "tick", () -> {
+                if (ModuleExtensionManager.beforeTick(m)) {
+                    m.onTick();
+                    ModuleExtensionManager.afterTick(m);
+                }
+            });
+            return;
+        }
+        try (ProfilerPhase.Scope ignored = ProfilerPhase.scope("modules:tick")) {
+            for (Module m : modulesSnapshot) {
+                if (!m.isEnabled()) continue;
+                try (ProfilerPhase.Scope scope = moduleScope("module:tick:", m)) {
+                    runModule(m, "tick", () -> {
+                        if (ModuleExtensionManager.beforeTick(m)) {
+                            m.onTick();
+                            ModuleExtensionManager.afterTick(m);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    public static void frameAll(float frameDeltaTicks) {
+        FailureIsolation.drain();
+        FailureDiagnostics.drain();
+        if (!RuntimeGate.canRunModules()) return;
+        if (!ProfilerPhase.isActive()) {
+            for (Module m : modulesSnapshot) runModule(m, "frame", () -> {
+                if (ModuleExtensionManager.beforeFrame(m, frameDeltaTicks)) {
+                    m.onFrame(frameDeltaTicks);
+                    ModuleExtensionManager.afterFrame(m, frameDeltaTicks);
+                }
+            });
+            return;
+        }
+        try (ProfilerPhase.Scope ignored = ProfilerPhase.scope("modules:frame")) {
+            for (Module m : modulesSnapshot) {
+                if (!m.isEnabled()) continue;
+                try (ProfilerPhase.Scope scope = moduleScope("module:frame:", m)) {
+                    runModule(m, "frame", () -> {
+                        if (ModuleExtensionManager.beforeFrame(m, frameDeltaTicks)) {
+                            m.onFrame(frameDeltaTicks);
+                            ModuleExtensionManager.afterFrame(m, frameDeltaTicks);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    public static void renderHud(HudPhase phase, GuiGraphicsExtractor ctx, float tickDelta) {
+        if (!RuntimeGate.canRunHud()) return;
+        Module[] phaseModules = HUD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return;
+        if (!ProfilerPhase.isActive()) {
+            for (Module m : phaseModules) {
+                runModule(m, "hud", () -> m.onRender2D(ctx, tickDelta));
+            }
+            return;
+        }
+        try (ProfilerPhase.Scope phaseScope = ProfilerPhase.scope("modules:hud_legacy:" + phase.name().toLowerCase(Locale.ROOT))) {
+            for (Module m : phaseModules) {
+                if (!m.isEnabled()) continue;
+                try (ProfilerPhase.Scope moduleScope = moduleScope("module:hud_legacy:", m)) {
+                    runModule(m, "hud", () -> m.onRender2D(ctx, tickDelta));
+                }
+            }
+        }
+    }
+
+    public static void renderHudEngine(HudPhase phase, HudRenderSpace space, Renderer2D renderer, TextRenderer textRenderer, GuiGraphicsExtractor ctx, float tickDelta) {
+        if (!RuntimeGate.canRunHud()) return;
+        Module[] phaseModules = HUD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return;
+        for (Module m : phaseModules) {
+            if (m.isEnabled() && m.getHudRenderSpace() == space) {
+                try (ProfilerPhase.Scope scope = moduleScope("module:hud:", m);
+                     RenderProfiler2D.Section ignored = RenderProfiler2D.section(PROFILER_2D ? "module:" + m.name() : null)) {
+                    runModule(m, "hud engine", () -> {
+                        if (ModuleExtensionManager.beforeHudRender(m, renderer, textRenderer, ctx, tickDelta)) {
+                            m.onRenderHudEngine(renderer, textRenderer, ctx, tickDelta);
+                            ModuleExtensionManager.afterHudRender(m, renderer, textRenderer, ctx, tickDelta);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    public static boolean hasHudEngineWork(HudPhase phase, HudRenderSpace space) {
+        return hasEnabledHudPhaseModule(phase, space);
+    }
+
+    public static void renderHudEngineForeground(HudPhase phase, HudRenderSpace space, Renderer2D renderer, TextRenderer textRenderer, GuiGraphicsExtractor ctx, float tickDelta) {
+        if (!RuntimeGate.canRunHud()) return;
+        Module[] phaseModules = HUD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return;
+        for (Module m : phaseModules) {
+            if (m.isEnabled() && m.getHudRenderSpace() == space) {
+                try (ProfilerPhase.Scope scope = moduleScope("module:hud_fg:", m);
+                     RenderProfiler2D.Section ignored = RenderProfiler2D.section(PROFILER_2D ? "module_fg:" + m.name() : null)) {
+                    runModule(m, "hud foreground", () -> m.onRenderHudEngineForeground(renderer, textRenderer, ctx, tickDelta));
+                }
+            }
+        }
+    }
+
+    public static boolean hasHudEngineForegroundWork(HudPhase phase, HudRenderSpace space) {
+        return hasEnabledHudPhaseModule(phase, space);
+    }
+
+    private static boolean hasEnabledHudPhaseModule(HudPhase phase, HudRenderSpace space) {
+        if (!RuntimeGate.canRunHud()) return false;
+        Module[] phaseModules = HUD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return false;
+
+        for (Module m : phaseModules) {
+            if (m.isEnabled() && m.getHudRenderSpace() == space) return true;
+        }
+        return false;
+    }
+
+    // ---------------------------
+    // 3D WORLD рендер
+    // ---------------------------
+
+    public static void renderWorld(WorldPhase phase, PoseStack matrices, SubmitNodeCollector consumers, float tickDelta) {
+        if (!RuntimeGate.canRunRender()) return;
+        Module[] phaseModules = WORLD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return;
+        if (!ProfilerPhase.isActive()) {
+            for (Module m : phaseModules) {
+                runModule(m, "world legacy", () -> m.onRenderWorld(matrices, consumers, tickDelta));
+            }
+            return;
+        }
+        try (ProfilerPhase.Scope phaseScope = ProfilerPhase.scope("modules:world_legacy:" + phase.name().toLowerCase(Locale.ROOT))) {
+            for (Module m : phaseModules) {
+                if (!m.isEnabled()) continue;
+                try (ProfilerPhase.Scope moduleScope = moduleScope("module:world_legacy:", m)) {
+                    runModule(m, "world legacy", () -> m.onRenderWorld(matrices, consumers, tickDelta));
+                }
+            }
+        }
+    }
+
+    public static void renderWorldEngine(WorldPhase phase, Renderer3D renderer, Renderer3D depthRenderer, float tickDelta) {
+        if (!RuntimeGate.canRunRender()) return;
+        Module[] phaseModules = WORLD_PHASE_SNAPSHOTS.get(phase);
+        if (phaseModules == null) return;
+        try {
+            for (Module m : phaseModules) {
+                if (!m.isEnabled()) continue;
+                try (ProfilerPhase.Scope scope = moduleScope("module:world:", m);
+                     RenderProfiler3D.Section ignored = RenderProfiler3D.section(PROFILER_3D ? "module:" + m.name() : null)) {
+                    runModule(m, "world engine", () -> {
+                        if (ModuleExtensionManager.beforeWorldRender(m, renderer, depthRenderer, tickDelta)) {
+                            m.onRenderWorldEngine(renderer, depthRenderer, tickDelta);
+                            ModuleExtensionManager.afterWorldRender(m, renderer, depthRenderer, tickDelta);
+                        }
+                    });
+                }
+            }
+            if (phase == WorldPhase.END_MAIN) {
+                PlacementPreviewRenderer.renderConfirmed(renderer, net.minecraft.client.Minecraft.getInstance().level);
+            }
+        } finally {
+            ItemBatchRenderer.finishWorldItemFrame();
+        }
+    }
+
+    /**
+     * Collects per-frame world-space post-process requests immediately before PRE_HAND post.
+     * This is deliberately separate from WorldPhase because a module may render normal geometry
+     * in END_MAIN and still contribute an invisible depth-tested post mask in the same frame.
+     */
+    public static void prepareWorldPostProcess(float tickDelta) {
+        if (!RuntimeGate.canRunRender()) return;
+        Module[] snapshot = modulesSnapshot;
+        for (Module m : snapshot) {
+            if (!m.isEnabled()) continue;
+            try (ProfilerPhase.Scope scope = moduleScope("module:world_post_prepare:", m)) {
+                runModule(m, "world post prepare", () -> m.onPrepareWorldPostProcess(tickDelta));
+            }
+        }
+    }
+
+    public static boolean needsEntityOnlyDepth() {
+        Module[] snapshot = modulesSnapshot;
+        for (Module module : snapshot) {
+            if (module.isEnabled() && module.needsEntityOnlyDepth()) return true;
+        }
+        return false;
+    }
+
+    // ---------------------------
+    // KEY HANDLING
+    // ---------------------------
+
+    public static void handleModuleKeybinds() {
+        if (!RuntimeGate.canRunModules()) return;
+        boolean previousSuppression = suppressToggleSound;
+        boolean soundSuppressedThisPass = previousSuppression;
+        try {
+            Module[] snapshot = modulesSnapshot;
+            for (Module m : snapshot) {
+                if (m instanceof RuntimeControlModule) continue;
+                if (KeyManager.wasPressed(m.name())) {
+                    setSuppressToggleSound(soundSuppressedThisPass);
+                    try { m.toggleFromKeybind(); }
+                    catch (RuntimeException e) { FailureIsolation.reportModule(m, "keybind", e); }
+                    soundSuppressedThisPass = true;
+                }
+            }
+        } finally {
+            setSuppressToggleSound(previousSuppression);
+        }
+    }
+
+    public static void tickRuntimeControllers() {
+        Module[] snapshot = modulesSnapshot;
+        for (Module module : snapshot) {
+            if (module instanceof RuntimeControlModule controller) {
+                try { controller.onRuntimeControlTick(); }
+                catch (RuntimeException e) { FailureIsolation.reportModule(module, "runtime control", e); }
+            }
+        }
+    }
+
+    public static List<String> getEnabledModulesNames() {
+        List<String> list = new ArrayList<>();
+        Module[] snapshot = modulesSnapshot;
+        for (int i = 0; i < snapshot.length; i++) {
+            Module m = snapshot[i];
+            if (m.isEnabled()) list.add(m.name());
+        }
+        return list;
+    }
+
+    public static List<Module> getKeybindEnabledModules() {
+        List<Module> list = new ArrayList<>();
+        Module[] snapshot = modulesSnapshot;
+        for (int i = 0; i < snapshot.length; i++) {
+            Module m = snapshot[i];
+            if (m.isEnabledFromKeybind()) list.add(m);
+        }
+        return list;
+    }
+
+    /**
+     * View of all registered modules (do not modify).
+     */
+    public static List<Module> getModules() {
+        if (runtimeReleased || RuntimeGate.isJarReplacementMode()) return List.of();
+        return modulesView;
+    }
+
+    public static void setEnabledModules(List<String> names) {
+        if (!RuntimeGate.canRunModules() && !RuntimeGate.canRunRuntimeController()) return;
+        boolean prev = suppressToggleNotifications;
+        suppressToggleNotifications = true;
+        try {
+            ObjectOpenHashSet<String> enabledNames = new ObjectOpenHashSet<>();
+            if (names != null) {
+                for (String name : names) {
+                    if (name != null && !name.isBlank()) {
+                        enabledNames.add(normalizeName(name));
+                    }
+                }
+            }
+
+            Module[] snapshot = modulesSnapshot;
+            for (int i = 0; i < snapshot.length; i++) {
+                Module m = snapshot[i];
+                boolean shouldEnable = enabledNames.contains(normalizeName(m.name()));
+                if (m.isEnabled() != shouldEnable) {
+                    m.setEnabled(shouldEnable, ModuleActivationSource.INTERNAL);
+                }
+            }
+        } finally {
+            suppressToggleNotifications = prev;
+        }
+    }
+
+    public static boolean isEnabled(String name) {
+        Module m = get(name);
+        return m != null && m.isEnabled() && (RuntimeGate.canRunModules() || m instanceof RuntimeControlModule);
+    }
+
+    public static void setEnabled(String name, boolean enabled) {
+        setEnabled(name, enabled, ModuleActivationSource.MANUAL);
+    }
+
+    public static void setEnabled(String name, boolean enabled, ModuleActivationSource source) {
+        Module m = get(name);
+        if (m == null) return;
+        if (enabled && !RuntimeGate.canRunModules() && !(m instanceof RuntimeControlModule)) return;
+
+        if (enabled && name.equals("clickgui")) {
+            if (ClientScreen.current(Minecraft.getInstance()) != null) {
+                return;
+            }
+        }
+
+        m.setEnabled(enabled, source);
+    }
+
+    public static boolean setRuntimeEnabledTransient(String name, boolean enabled) {
+        Module m = get(name);
+        if (m == null) return false;
+        m.setRuntimeEnabledTransient(enabled);
+        return true;
+    }
+
+    public static ModuleCategory getCategory(String name) {
+        Module m = get(name);
+        return m != null ? m.getCategory() : null;
+    }
+
+    /**
+     * ClickGUI expects list of module names
+     */
+    public static List<String> getAllModules() {
+        List<String> out = new ArrayList<>();
+        Module[] snapshot = modulesSnapshot;
+        for (int i = 0; i < snapshot.length; i++) {
+            out.add(snapshot[i].name());
+        }
+        return out;
+    }
+
+    public static void addListener(ModuleStateListener listener) {
+        if (listener == null) return;
+        listeners.add(listener);
+        listenerSnapshot = listeners.toArray(ModuleStateListener[]::new);
+    }
+
+    public static void notifyListeners(String name, boolean enabled) {
+        if (suppressToggleNotifications) {
+            return;
+        }
+        ModuleStateListener[] snapshot = listenerSnapshot;
+        for (int i = 0; i < snapshot.length; i++) {
+            try {
+                snapshot[i].onModuleStateChanged(name, enabled);
+            } catch (RuntimeException e) {
+                FailureBoundary.requireRecoverable(e);
+                DebugLog.error("Module state listener failed: {}", e, name);
+            }
+        }
+    }
+
+    // ====================================
+    //   Sound suppression for batched toggles
+    // ====================================
+    public static boolean isToggleSoundSuppressed() {
+        return suppressToggleSound;
+    }
+
+    private static void setSuppressToggleSound(boolean suppressed) {
+        suppressToggleSound = suppressed;
+    }
+
+    public static boolean isToggleNotificationSuppressed() {
+        return suppressToggleNotifications;
+    }
+
+    /** Runs one lifecycle transition without the ordinary module-toggle sound. */
+    public static void runWithToggleSoundSuppressed(Runnable action) {
+        if (action == null) return;
+        boolean previous = suppressToggleSound;
+        suppressToggleSound = true;
+        try {
+            action.run();
+        } finally {
+            suppressToggleSound = previous;
+        }
+    }
+
+    public static boolean callWithToggleSoundSuppressed(BooleanSupplier action) {
+        if (action == null) return false;
+        boolean previous = suppressToggleSound;
+        suppressToggleSound = true;
+        try {
+            return action.getAsBoolean();
+        } finally {
+            suppressToggleSound = previous;
+        }
+    }
+
+    /**
+     * Runs config profile application without toggle sounds or module-state notifications.
+     */
+    public static void runSilentConfigApply(Runnable action) {
+        if (action == null) return;
+        boolean prevSound = suppressToggleSound;
+        boolean prevNotifications = suppressToggleNotifications;
+        suppressToggleSound = true;
+        suppressToggleNotifications = true;
+        try {
+            action.run();
+        } finally {
+            suppressToggleSound = prevSound;
+            suppressToggleNotifications = prevNotifications;
+        }
+    }
+
+    // ============================
+    //   CONFIG ORCHESTRATION
+    // ============================
+
+    /**
+     * Loads and applies config for all modules (enabled state + settings).
+     */
+    public static void loadAllModuleConfigs() {
+        Module[] snapshot = modulesSnapshot;
+        DebugLog.config("loadAllModuleConfigs: %d modules", snapshot.length);
+        for (int i = 0; i < snapshot.length; i++) {
+            Module m = snapshot[i];
+            try {
+                DebugLog.config("Loading module config -> %s", m.name());
+                m.loadAndApplyConfig();
+            } catch (RuntimeException e) {
+                FailureIsolation.reportModule(m, "config load", e);
+            }
+        }
+    }
+
+    public static void saveAllModuleConfigs() {
+        Module[] snapshot = modulesSnapshot;
+        for (int i = 0; i < snapshot.length; i++) {
+            Module m = snapshot[i];
+            try {
+                m.saveConfig();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    public static int registeredCount() {
+        return modulesSnapshot.length;
+    }
+
+    public static void shutdownForRuntime(RuntimeShutdownContext context) {
+        if (context == null) return;
+        Module[] snapshot = modulesSnapshot;
+        List<String> enabled = new ArrayList<>();
+        int disabled = 0;
+        boolean prevNotifications = suppressToggleNotifications;
+        suppressToggleNotifications = true;
+        try {
+            for (Module module : snapshot) {
+                if (module == null) continue;
+                if (module.isEnabled()) {
+                    enabled.add(module.name());
+                    if (!(module instanceof RuntimeControlModule)) {
+                        module.setRuntimeEnabledTransient(false);
+                        disabled++;
+                    }
+                }
+            }
+        } finally {
+            suppressToggleNotifications = prevNotifications;
+        }
+        if (!context.jarReplacement()) {
+            softPanicEnabledModules = enabled;
+        }
+        context.increment("modules_disabled", disabled);
+        if (context.jarReplacement()) {
+            releaseRuntimeReferences(context);
+        }
+    }
+
+    public static void restoreAfterSoftPanic(String reason) {
+        if (runtimeReleased || RuntimeGate.isJarReplacementMode()) return;
+        List<String> restore = softPanicEnabledModules;
+        softPanicEnabledModules = Collections.emptyList();
+        if (restore == null || restore.isEmpty()) return;
+        ObjectOpenHashSet<String> enabledNames = new ObjectOpenHashSet<>();
+        for (String name : restore) {
+            if (name != null && !name.isBlank()) {
+                enabledNames.add(normalizeName(name));
+            }
+        }
+        boolean prevNotifications = suppressToggleNotifications;
+        suppressToggleNotifications = true;
+        try {
+            for (Module module : modulesSnapshot) {
+                if (module == null || module instanceof RuntimeControlModule) continue;
+                if (enabledNames.contains(normalizeName(module.name()))) {
+                    module.setRuntimeEnabledTransient(true);
+                }
+            }
+        } finally {
+            suppressToggleNotifications = prevNotifications;
+        }
+    }
+
+    private static void releaseRuntimeReferences(RuntimeShutdownContext context) {
+        runtimeReleased = true;
+        FailureIsolation.drain();
+        FailureDiagnostics.drain();
+        FailureDiagnostics.shutdown();
+        FailureIsolation.clearSession();
+        havoc.client.features.gui.clickgui.settings.SettingErrorView.clearSession();
+        int moduleCount = modules.size();
+        Events.BUS.clear();
+        modules.clear();
+        byId.clear();
+        byType.clear();
+        for (HudPhase phase : HudPhase.values()) {
+            HUD_PHASE_MODULES.get(phase).clear();
+            HUD_PHASE_SNAPSHOTS.put(phase, new Module[0]);
+        }
+        for (WorldPhase phase : WorldPhase.values()) {
+            WORLD_PHASE_MODULES.get(phase).clear();
+            WORLD_PHASE_SNAPSHOTS.put(phase, new Module[0]);
+        }
+        listeners.clear();
+        listenerSnapshot = new ModuleStateListener[0];
+        modulesSnapshot = new Module[0];
+        context.increment("module_references_released", moduleCount);
+    }
+
+    private static String normalizeName(String name) {
+        return name == null ? "" : name.toLowerCase(Locale.ROOT);
+    }
+}

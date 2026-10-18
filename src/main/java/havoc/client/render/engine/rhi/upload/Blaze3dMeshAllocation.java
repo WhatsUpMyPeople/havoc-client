@@ -1,0 +1,58 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.rhi.upload;
+
+import havoc.client.render.engine.rhi.GpuMeshHandle;
+import havoc.client.render.engine.rhi.MeshOwnership;
+import havoc.client.render.engine.uniform.MeshBuilder;
+
+
+record Blaze3dMeshAllocation(Blaze3dMeshArena arena,
+                              int vertexOffsetBytes,
+                              int indexOffsetBytes,
+                              int vertexBytes,
+                              int indexBytes,
+                              int baseVertex) {
+    static int baseVertex(int vertexOffsetBytes, int vertexStride) {
+        if (vertexStride <= 0) {
+            throw new IllegalArgumentException("Invalid vertex stride: " + vertexStride);
+        }
+        if (vertexOffsetBytes % vertexStride != 0) {
+            throw new IllegalStateException("Dynamic mesh vertex offset is not stride-aligned: offset="
+                    + vertexOffsetBytes + ", stride=" + vertexStride);
+        }
+        return vertexOffsetBytes / vertexStride;
+    }
+
+    GpuMeshHandle toHandle(MeshBuilder mesh) {
+        return GpuMeshHandle.arena(
+                arena.vertexBuffer(),
+                arena.indexBuffer(),
+                vertexOffsetBytes,
+                vertexBytes,
+                mesh.getVertexStride(),
+                baseVertex,
+                indexOffsetBytes,
+                indexBytes,
+                mesh.getIndicesCount(),
+                MeshOwnership.BACKEND_FRAME
+        );
+    }
+
+    void write(MeshBuilder mesh) {
+        mesh.validateComplete("dynamic mesh allocation write");
+        if (arena.persistentMappedWrites()) {
+            arena.writeMapped(vertexOffsetBytes, vertexBytes, indexOffsetBytes, indexBytes, mesh);
+            return;
+        }
+        arena.writeAllocation(
+                vertexOffsetBytes, vertexBytes, mesh.vertexBufferView(),
+                indexOffsetBytes, indexBytes, mesh.indexBufferView()
+        );
+    }
+}

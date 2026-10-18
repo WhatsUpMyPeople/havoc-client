@@ -1,0 +1,132 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.renderer.ui.runtime.render;
+
+import havoc.client.render.engine.renderer.Renderer2D;
+import net.minecraft.resources.Identifier;
+import havoc.client.render.engine.color.RenderColor;
+import havoc.client.render.engine.renderer.ui.runtime.asset.UiAssetKind;
+import havoc.client.render.engine.renderer.ui.runtime.asset.UiAssetRef;
+import havoc.client.render.engine.renderer.ui.runtime.core.UiBounds;
+import havoc.client.render.engine.renderer.ui.runtime.core.UiNode;
+import havoc.client.render.engine.renderer.ui.runtime.style.UiColor;
+import havoc.client.render.engine.renderer.ui.runtime.style.UiStyle;
+import havoc.client.render.engine.svg.SvgRegistry;
+import havoc.client.render.engine.svg.SvgRenderOptions;
+import havoc.client.render.helpers.GuiSpriteBatch;
+import havoc.client.render.helpers.PlayerHeadRenderer;
+
+public final class UiImageRendererBridge {
+    private static Identifier identifier(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        try {
+            return Identifier.parse(raw);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    public void render(UiNode node, UiAssetRef asset, UiBounds rawBounds, UiRenderContext context) {
+        if (node == null || asset == null || rawBounds == null || context == null) return;
+        UiBounds logicalBounds = new UiBounds(
+                node.props().number("renderX", rawBounds.x()),
+                node.props().number("renderY", rawBounds.y()),
+                Math.max(0.0f, node.props().number("renderWidth", rawBounds.width())),
+                Math.max(0.0f, node.props().number("renderHeight", rawBounds.height()))
+        );
+        UiBounds bounds = context.renderBounds(logicalBounds);
+        UiStyle style = node.style();
+        String explicitTint = node.props().string("tint", "");
+        int rawTint = UiReactiveVisual.color(
+                node, "tint", style.textColor() != null ? style.textColor() : 0xFFFFFFFF);
+        int tint = UiColor.multiplyAlpha(rawTint, context.alpha());
+        boolean reactiveTint = node.props().get("tintReactive") instanceof java.util.Map<?, ?>;
+        boolean gradientEnabled = node.props().bool("gradientEnabled", false);
+        int gradientStart = UiColor.multiplyAlpha(
+                UiColor.parse(node.props().string("gradientStartColor", ""), rawTint),
+                context.alpha());
+        int gradientEnd = UiColor.multiplyAlpha(
+                UiColor.parse(node.props().string("gradientEndColor", ""), rawTint),
+                context.alpha());
+        float gradientAngle = node.props().number("gradientAngle", 90.0f);
+        if (!gradientEnabled && (tint >>> 24) == 0) return;
+        if (gradientEnabled && ((gradientStart | gradientEnd) >>> 24) == 0) return;
+        if (asset.kind() == UiAssetKind.SVG) {
+            Identifier svgId = SvgRegistry.resolve(asset.getId());
+            if (svgId == null) return;
+            SvgRenderOptions options = gradientEnabled
+                    ? SvgRenderOptions.linearGradient(gradientStart, gradientEnd, gradientAngle)
+                    : ((explicitTint == null || explicitTint.isBlank()) && !reactiveTint
+                    ? SvgRenderOptions.DEFAULT
+                    : SvgRenderOptions.overrideColor(tint));
+            context.renderer().svg(svgId, bounds.x(), bounds.y(), bounds.width(), bounds.height(), options);
+            return;
+        }
+
+        Identifier id = identifier(asset.getId());
+        if (id == null) return;
+
+        if (asset.kind() == UiAssetKind.GUI_SPRITE) {
+            GuiSpriteBatch.draw(id, bounds.x(), bounds.y(), bounds.width(), bounds.height(), tint);
+            return;
+        }
+        if (asset.kind() == UiAssetKind.PLAYER_HEAD) {
+            PlayerHeadRenderer.drawRounded(
+                    context.drawContext(),
+                    bounds.x(),
+                    bounds.y(),
+                    Math.min(bounds.width(), bounds.height()),
+                    context.renderLength(style.radius()),
+                    id,
+                    new RenderColor(tint),
+                    node.props().bool("secondLayer", true),
+                    null,
+                    0.0f,
+                    false
+            );
+            return;
+        }
+        boolean mask = node.props().bool("mask", false) || node.props().bool("alphaMask", false);
+        if (mask) {
+            if (gradientEnabled) {
+                Renderer2D.TEXTURE.roundedTexMaskRectGradient(
+                        bounds.x(),
+                        bounds.y(),
+                        bounds.width(),
+                        bounds.height(),
+                        context.renderLength(style.radius()),
+                        0.0f,
+                        gradientStart,
+                        gradientEnd,
+                        gradientAngle,
+                        id
+                );
+            } else {
+                Renderer2D.TEXTURE.roundedTexMaskRect(
+                        bounds.x(),
+                        bounds.y(),
+                        bounds.width(),
+                        bounds.height(),
+                        context.renderLength(style.radius()),
+                        tint,
+                        id
+                );
+            }
+            return;
+        }
+        Renderer2D.TEXTURE.roundedTexRect(
+                bounds.x(),
+                bounds.y(),
+                bounds.width(),
+                bounds.height(),
+                context.renderLength(style.radius()),
+                tint,
+                id
+        );
+    }
+}

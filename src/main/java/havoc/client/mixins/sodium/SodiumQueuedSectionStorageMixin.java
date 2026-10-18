@@ -1,0 +1,87 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.mixins.sodium;
+
+import havoc.client.render.sodium.SodiumSectionStorageView;
+import it.unimi.dsi.fastutil.longs.Long2ReferenceMap;
+import it.unimi.dsi.fastutil.longs.LongSet;
+import net.caffeinemc.mods.sodium.client.render.chunk.RenderSection;
+import net.caffeinemc.mods.sodium.client.render.chunk.storage.QueuedSectionStorage;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Pseudo;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+/** Sodium 0.9.2+mc26.2 adapter. Keep private storage details out of deferred renderer code. */
+@Pseudo
+@Mixin(value = QueuedSectionStorage.class, remap = false)
+public abstract class SodiumQueuedSectionStorageMixin implements SodiumSectionStorageView {
+    @Shadow @Final
+    private Long2ReferenceMap<RenderSection> sections;
+
+    @Shadow @Final
+    private Long2ReferenceMap<RenderSection> queuedPuts;
+
+    @Shadow @Final
+    private LongSet queuedRemovals;
+
+    @Shadow
+    private boolean isQueueing;
+
+    @Unique
+    private long havoc$structuralRevision;
+
+    @Unique
+    private boolean havoc$applyChangesOnSafeReadEnd;
+
+    @Override
+    public Iterable<RenderSection> havoc$sections() {
+        return sections.values();
+    }
+
+    @Override
+    public long havoc$structuralRevision() {
+        return havoc$structuralRevision;
+    }
+
+    @Inject(method = "queuePut", at = @At("RETURN"), remap = false)
+    private void havoc$revisionAfterDirectPut(long key, RenderSection section, CallbackInfo ci) {
+        // When Sodium is in its safe-read phase this write is only queued; revision is advanced
+        // after endSafeReadPhase actually applies the topology mutation.
+        if (!isQueueing) havoc$structuralRevision++;
+    }
+
+    @Inject(method = "queueRemove", at = @At("RETURN"), remap = false)
+    private void havoc$revisionAfterDirectRemove(long key, CallbackInfoReturnable<RenderSection> cir) {
+        if (!isQueueing && cir.getReturnValue() != null) havoc$structuralRevision++;
+    }
+
+    @Inject(method = "endSafeReadPhase", at = @At("HEAD"), remap = false)
+    private void havoc$captureQueuedTopologyChange(CallbackInfo ci) {
+        havoc$applyChangesOnSafeReadEnd = isQueueing
+                && (!queuedPuts.isEmpty() || !queuedRemovals.isEmpty());
+    }
+
+    @Inject(method = "endSafeReadPhase", at = @At("RETURN"), remap = false)
+    private void havoc$revisionAfterQueuedChanges(CallbackInfo ci) {
+        if (havoc$applyChangesOnSafeReadEnd) {
+            havoc$structuralRevision++;
+            havoc$applyChangesOnSafeReadEnd = false;
+        }
+    }
+
+    @Inject(method = "deleteAll", at = @At("RETURN"), remap = false)
+    private void havoc$revisionAfterDeleteAll(CallbackInfo ci) {
+        havoc$structuralRevision++;
+    }
+}

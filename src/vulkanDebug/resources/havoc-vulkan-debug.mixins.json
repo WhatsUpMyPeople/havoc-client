@@ -1,0 +1,22 @@
+{
+  "required": true,
+  "plugin": "havoc.client.mixins.HavocMixinPlugin",
+  "minVersion": "0.8",
+  "package": "havoc.client.mixins",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "CommandEncoderDiagnosticsMixin",
+    "RenderPassWrapperDiagnosticsMixin",
+    "VulkanBackendMixin",
+    "VulkanCheckpointDiagnosticsMixin",
+    "VulkanCommandEncoderDiagnosticsMixin",
+    "VulkanDebugMessageMixin",
+    "VulkanDeviceDiagnosticsMixin",
+    "VulkanQueueSubmissionMixin",
+    "VulkanRenderPassDiagnosticsMixin",
+    "VulkanRenderPipelineDiagnosticsMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

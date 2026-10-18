@@ -1,0 +1,238 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.mixins;
+
+import net.minecraft.client.Camera;
+import net.minecraft.client.CameraType;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.world.level.material.FogType;
+import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.gen.Invoker;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import havoc.client.features.module.Modules;
+import havoc.client.features.module.modules.visuals.CameraClip;
+import havoc.client.features.module.modules.visuals.FovControl;
+import havoc.client.features.module.modules.visuals.Freecam;
+import havoc.client.features.module.modules.visuals.FreeLook;
+import havoc.client.features.module.modules.visuals.Zoom;
+import havoc.client.util.render.CameraOcclusionPolicy;
+
+@Mixin(Camera.class)
+public abstract class CameraMixin {
+
+
+    @Shadow
+    private boolean initialized;
+    @Shadow
+    private Level level;
+    @Shadow
+    private Entity entity;
+    @Shadow
+    private boolean detached;
+
+    @Unique
+    private static float havoc$getGameFov() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return 70.0f;
+        return mc.options.fov().get();
+    }
+
+    @Unique
+    private static float havoc$getFovEffectScale() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null) return 1.0f;
+        return mc.options.fovEffectScale().get().floatValue();
+    }
+
+    @Shadow
+    protected abstract void move(float surge, float heave, float sway);
+
+
+    @Inject(
+            method = "alignWithEntity",
+            at = @At(value = "INVOKE", target = "Lnet/minecraft/client/CameraType;isFirstPerson()Z"),
+            cancellable = true
+    )
+    private void havoc$freeLookCamera(float tickDelta, CallbackInfo ci) {
+        FreeLook freeLook = Modules.get(FreeLook.class);
+        Freecam freecam = Modules.get(Freecam.class);
+        if (freeLook == null || !freeLook.isCameraActive() || (freecam != null && freecam.isEnabled())) return;
+
+        CameraType cameraType = Minecraft.getInstance().options.getCameraType();
+        if (cameraType.isFirstPerson()) return;
+
+        boolean mirrored = cameraType.isMirrored();
+        float yaw = freeLook.cameraYaw() - (mirrored ? 180.0F : 0.0F);
+        float pitch = mirrored ? -freeLook.cameraPitch() : freeLook.cameraPitch();
+        this.detached = true;
+        this.setRotation(yaw, pitch);
+        this.move(-havoc$getMaxZoom(4.0F), 0.0F, 0.0F);
+        ci.cancel();
+    }
+
+    @Inject(method = "getMaxZoom(F)F", at = @At("HEAD"), cancellable = true)
+    private void havoc$disableCameraCollision(float desiredDistance, CallbackInfoReturnable<Float> cir) {
+        CameraClip mod = Modules.get(CameraClip.class);
+        if (mod != null && mod.isEnabled() && isThirdPerson()) {
+            // Skip collision shortening and apply distance multiplier
+            float dist = desiredDistance * mod.distanceMultiplier();
+            cir.setReturnValue(dist);
+        }
+    }
+
+    @Inject(method = "update", at = @At("TAIL"))
+    private void havoc$applyCameraOffsets(DeltaTracker tickCounter, CallbackInfo ci) {
+        CameraClip mod = Modules.get(CameraClip.class);
+        if (mod == null || !mod.isEnabled() || !isThirdPerson()) return;
+
+        float back = mod.backOffset();
+        float up = mod.upOffset();
+        float right = mod.rightOffset();
+
+        if (back != 0.0f || up != 0.0f || right != 0.0f) {
+            // move uses (surge, heave, sway); negative surge moves backward. Vanilla has
+            // already prepared cullFrustum before this TAIL injection, so moving the camera
+            // without rebuilding it leaves section frustum tests anchored at the old position.
+            move(-back, up, right);
+            Vec3 cameraPos = ((Camera) (Object) this).position();
+            havoc$prepareCullFrustum(
+                    getViewRotationMatrix(new Matrix4f()),
+                    havoc$createProjectionMatrixForCulling(),
+                    cameraPos
+            );
+        }
+    }
+
+    @Inject(method = "calculateFov", at = @At("RETURN"), cancellable = true)
+    private void havoc$adjustCalculatedFov(float tickDelta, CallbackInfoReturnable<Float> cir) {
+        cir.setReturnValue(havoc$adjustFovValue(cir.getReturnValue()));
+    }
+
+    @Unique
+    private float havoc$adjustFovValue(float fov) {
+        FovControl module = Modules.get(FovControl.class);
+        Zoom zoom = Modules.get(Zoom.class);
+
+        boolean hasFovControl = module != null && module.isEnabled();
+        boolean hasZoom = zoom != null && zoom.isEnabled() && zoom.shouldApplyZoom();
+        if (!hasFovControl && !hasZoom) return fov;
+
+        if (hasFovControl && module.useCustomFov()) {
+            float base = havoc$getGameFov();
+            float custom = module.getCustomFov();
+            if (base > 0.01f) {
+                fov = fov * (custom / base);
+            } else {
+                fov = custom;
+            }
+        }
+
+        if (hasFovControl && module.disableFluidFov()) {
+            FogType type = ((Camera) (Object) this).getFluidInCamera();
+            if (type == FogType.WATER || type == FogType.LAVA) {
+                float effectScale = havoc$getFovEffectScale();
+                float factor = Mth.lerp(effectScale, 1.0f, 0.85714287f);
+                if (factor > 0.0001f) {
+                    fov /= factor;
+                }
+            }
+        }
+
+        if (hasZoom) {
+            float divisor = zoom.getZoomDivisor();
+            if (divisor > 1.0f) {
+                fov /= divisor;
+            }
+        }
+
+        return fov;
+    }
+
+    @Unique
+    private boolean isThirdPerson() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.options == null) return false;
+        CameraType p = mc.options.getCameraType();
+        return p == CameraType.THIRD_PERSON_BACK || p == CameraType.THIRD_PERSON_FRONT;
+    }
+
+    @Shadow
+    protected abstract void setRotation(float yaw, float pitch);
+
+    @Shadow
+    protected abstract void setPosition(Vec3 pos);
+
+    @Shadow
+    public abstract Matrix4f getViewRotationMatrix(Matrix4f matrix);
+
+    @Invoker("getMaxZoom")
+    protected abstract float havoc$getMaxZoom(float desiredDistance);
+
+    @Invoker("createProjectionMatrixForCulling")
+    protected abstract Matrix4f havoc$createProjectionMatrixForCulling();
+
+    @Invoker("prepareCullFrustum")
+    protected abstract void havoc$prepareCullFrustum(Matrix4fc viewMatrix, Matrix4f projectionMatrix, Vec3 cameraPos);
+
+    @Inject(method = "update", at = @At("TAIL"))
+    private void freecam$override(
+            DeltaTracker tickCounter,
+            CallbackInfo ci
+    ) {
+        Freecam fc = Modules.get(Freecam.class);
+        if (fc == null || !fc.isEnabled() || fc.camEntity == null) return;
+
+        this.initialized = true;
+        if (Minecraft.getInstance().level != null) {
+            this.level = Minecraft.getInstance().level;
+        }
+        this.entity = fc.camEntity;
+
+        this.setRotation(fc.camYaw, fc.camPitch);
+
+        float tickDelta = tickCounter.getGameTimeDeltaPartialTick(true);
+        Vec3 p = fc.getCameraPos(tickDelta);
+        fc.syncCameraEntity(fc.camPos, fc.camPosPrev);
+
+        this.setPosition(p);
+        this.havoc$prepareCullFrustum(this.getViewRotationMatrix(new Matrix4f()), this.havoc$createProjectionMatrixForCulling(), p);
+    }
+
+    @Inject(method = "extractRenderState", at = @At("TAIL"))
+    private void havoc$freecamExtractRenderState(CameraRenderState renderState, float tickDelta, CallbackInfo ci) {
+        Freecam fc = Modules.get(Freecam.class);
+        if (fc == null || !fc.isEnabled() || fc.camEntity == null) return;
+
+        renderState.smartCull = false;
+    }
+
+    @Inject(method = "extractRenderState", at = @At("TAIL"))
+    private void havoc$disableInsideBlockSectionOcclusion(CameraRenderState renderState, float tickDelta, CallbackInfo ci) {
+        if (!renderState.smartCull) return;
+        if (CameraOcclusionPolicy.shouldDisableSectionOcclusion((Camera) (Object) this)) {
+            renderState.smartCull = false;
+        }
+    }
+}
+
+
+
+

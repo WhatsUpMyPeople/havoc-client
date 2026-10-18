@@ -1,0 +1,18 @@
+@patch 2
+@require_function main
+@require_ident mc_midTexCoord
+@require_ident mc_Entity
+
+@insert_zone declarations
+out vec2 combatant_uv1;
+flat out uint combatant_geometry_marker;
+uniform bool combatantCustomGeometry;
+
+@end
+
+@insert_after_function_open main
+    // Preserve Photon's native shadow entity transform and pass only the generic ENTITY marker.
+    combatant_uv1 = mc_midTexCoord;
+    combatant_geometry_marker = combatantCustomGeometry ? 1u : 0u;
+
+@end

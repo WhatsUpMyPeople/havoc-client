@@ -1,0 +1,271 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.rhi.upload;
+
+import com.mojang.blaze3d.systems.RenderSystem;
+import havoc.client.render.engine.profiler.RenderCostProfiler;
+import havoc.client.render.engine.rhi.GpuMeshHandle;
+import havoc.client.render.engine.rhi.RhiCapabilities;
+import havoc.client.render.engine.rhi.RhiStats;
+import havoc.client.render.engine.uniform.MeshBuilder;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+/**
+ * Production dynamic mesh upload path built on Blaze3D GPU buffers.
+ * <p>
+ * This backend does not use immediate uploads as the normal implementation. It owns GPU vertex/index arenas,
+ * suballocates transient meshes inside those arenas, adjusts INT indices by arena-relative base vertex, and retires
+ * used arenas behind one shared frame fence at {@link #framePresented()}.
+ * <p>
+ * Important properties:
+ * - no per-mesh GpuBuffer allocation in the normal path;
+ * - no MappableRingBuffer#getBlocking() as the normal path;
+ * - no RenderSystem.flipFrame cleanup fan-out;
+ * - spill arenas are GPU buffers too; there is no per-mesh immediate-upload fallback.
+ */
+public final class Blaze3dDynamicMeshBackend implements DynamicMeshBackend {
+    private static final int DEFAULT_VERTEX_ARENA_BYTES = Integer.getInteger("havoc.rhi.vertexArenaBytes", 32 * 1024 * 1024);
+    private static final int DEFAULT_INDEX_ARENA_BYTES = Integer.getInteger("havoc.rhi.indexArenaBytes", 8 * 1024 * 1024);
+    private static final int DEFAULT_PERSISTENT_ARENAS = Integer.getInteger("havoc.rhi.meshArenas", 3);
+
+    private final RhiStats stats;
+    private final List<Blaze3dMeshArena> persistentArenas = new ArrayList<>();
+    private final List<Blaze3dMeshArena> retiredArenas = new ArrayList<>();
+    private final List<Blaze3dMeshArena> activeArenas = new ArrayList<>();
+
+    private Blaze3dMeshArena currentArena;
+    private long frameId;
+    private int spillArenaSequence;
+    private boolean persistentArenasCreated;
+    private boolean persistentMappedWritesResolved;
+    private boolean persistentMappedWrites;
+    private int persistentArenaSequence;
+
+    public Blaze3dDynamicMeshBackend(RhiStats stats) {
+        this.stats = stats;
+    }
+
+    private static int align(int value, int alignment) {
+        return (value + alignment - 1) & -alignment;
+    }
+
+    private record ArenaSelection(Blaze3dMeshArena arena, boolean reused) {
+    }
+
+    @Override
+    public GpuMeshHandle upload(MeshBuilder mesh) {
+        try (RenderCostProfiler.Scope ignored = RenderCostProfiler.rhiDraw("dynamic_mesh_upload")) {
+            if (mesh == null || mesh.getIndicesCount() <= 0) {
+                throw new IllegalArgumentException("Cannot upload empty mesh");
+            }
+            if (mesh.isBuilding()) {
+                mesh.end();
+            }
+
+            mesh.validateComplete("dynamic mesh upload");
+            int vertexBytes = mesh.getVertexBytes();
+            int indexBytes = mesh.getIndexBytes();
+            int vertexStride = mesh.getVertexStride();
+            if (vertexBytes <= 0 || indexBytes <= 0 || vertexStride <= 0) {
+                throw new IllegalArgumentException("Cannot upload mesh with invalid vertex/index payload: vertexBytes="
+                        + vertexBytes + ", indexBytes=" + indexBytes + ", vertexStride=" + vertexStride);
+            }
+            if (vertexBytes % vertexStride != 0) {
+                throw new IllegalStateException("Cannot upload mesh whose vertex payload is not stride-aligned: vertexBytes="
+                        + vertexBytes + ", vertexStride=" + vertexStride);
+            }
+
+            ensurePersistentArenas();
+            Blaze3dMeshArena arena = selectArena(vertexBytes, indexBytes, vertexStride);
+            Blaze3dMeshAllocation allocation = arena.allocate(vertexBytes, indexBytes, vertexStride);
+            allocation.write(mesh);
+            stats.meshUpload(vertexBytes, indexBytes);
+            stats.dynamicArenaAllocation(vertexBytes, indexBytes, arena.persistent());
+            stats.dynamicArenaUploadPath(vertexBytes + (long) indexBytes, arena.persistentMappedWrites());
+            GpuMeshHandle handle = allocation.toHandle(mesh);
+            handle.validateForDraw("dynamic mesh upload");
+            return handle;
+        }
+    }
+
+    private void ensurePersistentArenas() {
+        if (persistentArenasCreated) return;
+        if (!persistentMappedWritesResolved) {
+            // RhiCapabilities delegates this decision to Mojang DeviceFeatures; do not re-probe GL.
+            persistentMappedWrites = RhiCapabilities.current().persistentMapping();
+            persistentMappedWritesResolved = true;
+        }
+
+        // Do not reserve the entire configured ring up-front. One 32/8 MiB arena is enough for
+        // light UI frames; additional persistent arenas are created only after real pressure from
+        // capacity/fence overlap proves they are needed. Capacity of each arena remains unchanged
+        // until telemetry justifies tuning it separately.
+        persistentArenas.add(createPersistentArena());
+        persistentArenasCreated = true;
+    }
+
+    private int maxPersistentArenas() {
+        return Math.max(2, DEFAULT_PERSISTENT_ARENAS);
+    }
+
+    private Blaze3dMeshArena createPersistentArena() {
+        Blaze3dMeshArena arena = new Blaze3dMeshArena(
+                "Havoc RHI Dynamic Mesh Arena #" + persistentArenaSequence++,
+                DEFAULT_VERTEX_ARENA_BYTES,
+                DEFAULT_INDEX_ARENA_BYTES,
+                true,
+                persistentMappedWrites
+        );
+        stats.dynamicArenaCreated(1, DEFAULT_VERTEX_ARENA_BYTES, DEFAULT_INDEX_ARENA_BYTES, false);
+        return arena;
+    }
+
+    private Blaze3dMeshArena selectArena(int vertexBytes, int indexBytes, int vertexStride) {
+        if (currentArena != null && currentArena.canAllocate(vertexBytes, indexBytes, vertexStride)) {
+            return currentArena;
+        }
+
+        ArenaSelection selection = findAvailablePersistentArena(vertexBytes, indexBytes, vertexStride);
+        if (selection != null) {
+            currentArena = selection.arena();
+            markActive(currentArena);
+            if (selection.reused()) stats.dynamicArenaReuse();
+            return currentArena;
+        }
+
+        stats.dynamicArenaBacklog();
+        currentArena = createSpillArena(vertexBytes, indexBytes);
+        markActive(currentArena);
+        return currentArena;
+    }
+
+    private ArenaSelection findAvailablePersistentArena(int vertexBytes, int indexBytes, int vertexStride) {
+        reclaimRetired(false);
+        for (Blaze3dMeshArena arena : persistentArenas) {
+            if (activeArenas.contains(arena)) continue;
+            if (arena.isRetired()) stats.dynamicFenceCheck();
+            if (!arena.canStartFrame()) continue;
+            if (!arena.canAllocate(vertexBytes, indexBytes, vertexStride)) continue;
+            return new ArenaSelection(arena, true);
+        }
+
+        // Grow the persistent ring on demand; oversized meshes use spill arenas.
+        if (persistentArenas.size() < maxPersistentArenas()
+                && vertexBytes <= DEFAULT_VERTEX_ARENA_BYTES
+                && indexBytes <= DEFAULT_INDEX_ARENA_BYTES) {
+            Blaze3dMeshArena created = createPersistentArena();
+            persistentArenas.add(created);
+            return new ArenaSelection(created, false);
+        }
+        return null;
+    }
+
+    private Blaze3dMeshArena createSpillArena(int vertexBytes, int indexBytes) {
+        int vertexCapacity = Math.max(DEFAULT_VERTEX_ARENA_BYTES, align(vertexBytes, 1024 * 1024));
+        int indexCapacity = Math.max(DEFAULT_INDEX_ARENA_BYTES, align(indexBytes, 256 * 1024));
+        Blaze3dMeshArena spill = new Blaze3dMeshArena(
+                "Havoc RHI Dynamic Mesh Spill #" + spillArenaSequence++,
+                vertexCapacity,
+                indexCapacity,
+                false,
+                persistentMappedWrites
+        );
+        stats.dynamicArenaCreated(1, vertexCapacity, indexCapacity, true);
+        return spill;
+    }
+
+    private void markActive(Blaze3dMeshArena arena) {
+        if (!activeArenas.contains(arena)) {
+            activeArenas.add(arena);
+        }
+    }
+
+    @Override
+    public void beginFrame(long frameId) {
+        DynamicMeshWrites.flushPending();
+        // Retire active arenas if framePresented() was skipped.
+        if (!activeArenas.isEmpty()) {
+            framePresented();
+        }
+        this.frameId = frameId;
+        this.currentArena = null;
+        this.activeArenas.clear();
+        reclaimRetired(false);
+    }
+
+    @Override
+    public void endSubmission() {
+        // Mappings stay open between uploads; make sure nothing is left unflushed at submission end.
+        DynamicMeshWrites.flushPending();
+    }
+
+    @Override
+    public void framePresented() {
+        DynamicMeshWrites.flushPending();
+        if (!activeArenas.isEmpty()) {
+            Blaze3dFrameFence frameFence = new Blaze3dFrameFence(RenderSystem.getDevice().createCommandEncoder().createFence());
+            for (Blaze3dMeshArena arena : activeArenas) {
+                stats.dynamicArenaFrameUsage(
+                        arena.vertexUsedBytes(), arena.vertexCapacity(),
+                        arena.indexUsedBytes(), arena.indexCapacity()
+                );
+                arena.retire(frameFence.retain());
+                retiredArenas.add(arena);
+                stats.dynamicArenaRetired();
+            }
+            frameFence.release();
+            activeArenas.clear();
+            currentArena = null;
+        }
+        reclaimRetired(true);
+    }
+
+    private void reclaimRetired(boolean countCompleted) {
+        Iterator<Blaze3dMeshArena> it = retiredArenas.iterator();
+        while (it.hasNext()) {
+            Blaze3dMeshArena arena = it.next();
+            stats.dynamicFenceCheck();
+            boolean complete = arena.reclaimIfComplete();
+            if (!complete) continue;
+            it.remove();
+            if (countCompleted) stats.dynamicFenceCompleted();
+            if (!arena.persistent()) {
+                arena.close();
+            }
+        }
+    }
+
+    public long frameId() {
+        return frameId;
+    }
+
+    @Override
+    public void close() {
+        DynamicMeshWrites.flushPending();
+        for (Blaze3dMeshArena arena : activeArenas) {
+            arena.close();
+        }
+        activeArenas.clear();
+        for (Blaze3dMeshArena arena : retiredArenas) {
+            arena.close();
+        }
+        retiredArenas.clear();
+        for (Blaze3dMeshArena arena : persistentArenas) {
+            arena.close();
+        }
+        persistentArenas.clear();
+        currentArena = null;
+        persistentArenasCreated = false;
+        persistentMappedWritesResolved = false;
+        persistentMappedWrites = false;
+        persistentArenaSequence = 0;
+    }
+}

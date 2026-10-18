@@ -1,0 +1,50 @@
+#version 330 core
+
+in vec4 v_Local;
+in vec2 v_TexCoord;
+in vec4 v_Color;
+in vec4 v_Rect;
+in vec4 v_Params; // radius, softness, mask mode, reserved
+
+out vec4 fragColor;
+
+uniform sampler2D u_Texture;
+
+layout (std140) uniform UIBatch {
+    vec4 uScreen;
+    vec4 uLayer;
+};
+
+#moj_import <havoc:ui_aa.glsl>
+#moj_import <havoc:ui_geometry.glsl>
+#ifdef HAVOC_ANALYTIC_CLIP
+#moj_import <havoc:ui_clip.glsl>
+#endif
+
+vec2 warpedLocal(vec4 local) {
+    float invW = abs(local.z) > 0.000001 ? local.z : 1.0;
+    return local.xy / invW;
+}
+
+
+void main() {
+    vec2 logicalScale = uScreen.zw / max(uScreen.xy, vec2(1.0));
+    vec2 frag = warpedLocal(v_Local);
+    vec2 halfSize = v_Rect.zw * 0.5;
+    float d = roundedBoxSdf(frag - (v_Rect.xy + halfSize), halfSize, v_Params.x);
+    float shapeAlpha = coverage(d, analyticAa(d, logicalScale, max(v_Params.y, 0.0)));
+    float invW = abs(v_Local.z) > 0.000001 ? v_Local.z : 1.0;
+    vec2 projectiveUv = v_TexCoord / invW;
+    vec4 texel = texture(u_Texture, projectiveUv);
+    if (v_Params.z > 0.5) {
+        fragColor = vec4(v_Color.rgb, v_Color.a * texel.r * shapeAlpha);
+    } else {
+        fragColor = vec4(texel.rgb * v_Color.rgb, texel.a * v_Color.a * shapeAlpha);
+    }
+#ifdef HAVOC_ANALYTIC_CLIP
+    fragColor.a *= havocClipCoverage(
+        havocClipDistance(havocLogicalFragCoord()), logicalScale
+    );
+    if (fragColor.a <= 0.001) discard;
+#endif
+}

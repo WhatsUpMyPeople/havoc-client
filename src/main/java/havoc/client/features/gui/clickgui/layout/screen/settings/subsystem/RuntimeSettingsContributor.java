@@ -1,0 +1,24 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.clickgui.layout.screen.settings.subsystem;
+
+import havoc.client.config.subsystem.RuntimeConfig;
+import havoc.client.config.SettingDef;
+import havoc.client.config.SettingOwner;
+
+import java.util.List;
+
+public final class RuntimeSettingsContributor implements MainSettingsContributor {
+    @Override public String id() { return "runtime"; }
+    @Override public String titleKey() { return "clickgui.settings.main.runtime"; }
+    @Override public String fallbackTitle() { return "Runtime"; }
+    @Override public String icon() { return "brain-cog"; }
+    @Override public int order() { return 400; }
+    @Override public SettingOwner owner() { return RuntimeConfig.get(); }
+    @Override public List<SettingDef> settingDefs() { return RuntimeConfig.get().getSettingDefs(); }
+}

@@ -1,0 +1,2921 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.chat;
+
+import havoc.client.features.module.modules.misc.NameProtect;
+import havoc.client.util.text.GuiTextCaret;
+import havoc.client.features.gui.clickgui.ClickGuiRenderer;
+
+import havoc.client.render.engine.text.BuiltinFontCatalog;
+import com.mojang.blaze3d.platform.InputConstants;
+import havoc.client.mixins.accessors.SuggestionWindowAccessor;
+import havoc.client.util.screen.ClientScreen;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.ChatScreen;
+import net.minecraft.client.gui.screens.ConfirmLinkScreen;
+import net.minecraft.client.gui.screens.inventory.tooltip.DefaultTooltipPositioner;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.HoverEvent;
+import net.minecraft.network.chat.Style;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.Mth;
+import net.minecraft.util.Util;
+import net.minecraft.world.item.ItemStack;
+import org.lwjgl.glfw.GLFW;
+import havoc.client.features.command.CommandManager;
+import havoc.client.features.command.CommandOutput;
+import havoc.client.features.gui.chat.actions.ChatMessageActions;
+import havoc.client.features.gui.chat.actions.MessageActionRegistry;
+import havoc.client.features.gui.chat.ChatHoverUtil.HoverTip;
+import havoc.client.features.gui.chat.rich.BetterChatMessage;
+import havoc.client.features.gui.chat.rich.ItemNode;
+import havoc.client.features.gui.chat.rich.TextNode;
+import havoc.client.features.gui.hud.HudRenderUtil;
+import havoc.client.features.gui.clickgui.layout.screen.settings.SettingsGuiPalette;
+import havoc.client.features.gui.hud.draggable.DraggableHudElementRegistry;
+import havoc.client.features.gui.hud.draggable.impl.BetterChat;
+import havoc.client.features.module.Notifier;
+import havoc.client.features.gui.hud.nondraggable.impl.BetterTooltips;
+import havoc.client.mixins.accessors.ChatScreenAccessor;
+import havoc.client.mixins.accessors.TextFieldWidgetAccessor;
+import havoc.client.render.engine.animation.AnimationUtility;
+import havoc.client.render.engine.color.RenderColor;
+import havoc.client.render.engine.renderer.Renderer2D;
+import havoc.client.render.engine.renderer.ui.UiBlurResources;
+import havoc.client.render.engine.renderer.ui.draw.UiRect;
+import havoc.client.render.engine.svg.SvgRenderOptions;
+import havoc.client.render.engine.text.TextGlyphFallback;
+import havoc.client.render.engine.text.TextRenderer;
+import havoc.client.render.helpers.ClipFunction;
+import havoc.client.render.helpers.ScissorFunction;
+import havoc.client.render.helpers.SystemCursor;
+import havoc.client.util.text.ChatNameUtil;
+import havoc.client.util.text.ClipboardUtil;
+import havoc.client.util.text.TextSelection;
+import havoc.client.util.chat.ChatPasswordHeuristics;
+import havoc.client.features.gui.chat.BetterChatMessageLayout.LayoutResult;
+import havoc.client.features.gui.chat.BetterChatMessageLayout.VisualLine;
+import havoc.client.features.gui.chat.BetterChatInputLayout.InputLine;
+import havoc.client.features.gui.chat.BetterChatFrameLayout.FrameLine;
+import havoc.client.features.gui.chat.BetterChatFrameLayout.GlyphBox;
+import havoc.client.features.gui.chat.BetterChatFrameLayout.MessageBubble;
+import havoc.client.features.gui.chat.BetterChatFrameLayout.MessageClipBounds;
+import havoc.client.features.gui.chat.BetterChatFrameLayout.PickResult;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+import static org.lwjgl.glfw.GLFW.GLFW_PRESS;
+import static org.lwjgl.glfw.GLFW.glfwGetKey;
+import static havoc.client.features.theme.Theme.theme;
+
+public enum BetterChatRenderer {
+    ;
+    private static final int MAX_MESSAGE_CHARS = 256; // vanilla chat input limit
+    private static final float PADDING = 8f;
+    private static final float LINE_SPACING = 3f;
+    private static final float RADIUS = 24f;
+    private static final float CLIP_AA_GUARD = 1.5f;
+    private static final float MESSAGE_PAD_X = 8f;
+    private static final float MESSAGE_PAD_Y = 5f;
+    private static final float MESSAGE_GAP = 4f;
+    private static final float MESSAGE_INPUT_GAP = 8f;
+    private static final float MESSAGE_RADIUS = 9f;
+    private static final float MESSAGE_TS_GAP = 8f;
+    private static final float INPUT_RADIUS = 12f;
+    private static final float SEARCH_ICON_WIDTH = 34f;
+    private static final float SEARCH_ICON_HEIGHT = 22f;
+    private static final float NEW_MESSAGE_REVEAL_SECONDS = 0.34f;
+    private static final float NEW_MESSAGE_SLIDE_PX = 18f;
+    private static final int MAX_HISTORY = 32000;
+    private static final float CHAT_TOOLTIP_OFFSET_X = 6f;
+    private static final float CHAT_TOOLTIP_OFFSET_Y = 12f;
+    private static final RenderColor TMP_COLOR = new RenderColor(0xFFFFFFFF);
+    private static final TextSelection selection = new TextSelection();
+    private static final double DRAG_SELECT_THRESHOLD = 4.0; // px
+    private static Renderer2D renderer;
+    private static float lastRenderWidth = 0f;
+    private static float lastRenderHeight = 0f;
+    private static int scrollOffsetLines = 0;
+    private static float smoothScrollOffsetLines = 0f;
+    private static int maxScrollLines = 0;
+    private static float lastFontSizeForUi = 16f;
+    private static List<ChatLine> lastMessages = Collections.emptyList();
+    private static boolean draggingScrollbar = false;
+    private static float sbTrackX, sbTrackY, sbTrackW, sbTrackH;
+    private static float sbThumbY, sbThumbH;
+    private static float sbDragOffset = 0f;
+    private static long lastScrollInteractionMs = 0L;
+    private static boolean sbEnabled = false;
+    private static int sbTotalLines = 0;
+    private static int sbVisibleLines = 0;
+    private static float inputBoxX = 0f, inputBoxY = 0f, inputBoxW = 0f, inputBoxH = 0f;
+    private static boolean hasInputBox = false;
+    private static float inputTextX = 0f, inputTextY = 0f, inputTextW = 0f;
+    private static float inputFontSize = 0f, inputLineHeight = 0f;
+    private static String inputTextSnapshot = "";
+    private static List<InputLine> inputLinesSnapshot = List.of();
+    private static boolean inputSearchSnapshot = false;
+    private static boolean inputCaretDragging = false;
+    // Suggest UI hitbox
+    private static boolean suggestActive = false;
+    private static float suggestX, suggestY, suggestW, suggestH, suggestItemH;
+    private static float suggestRowsX, suggestRowsY, suggestRowsW, suggestRowsH;
+    private static int suggestStart, suggestVisible, suggestTotal;
+    private static net.minecraft.client.gui.components.CommandSuggestions.SuggestionsList suggestWindow;
+    private static List<com.mojang.brigadier.suggestion.Suggestion> suggestEntries = Collections.emptyList();
+    private static boolean lastHoverWasOutsideSuggest = true;
+    private static boolean suggestHasScrollbar = false;
+    private static boolean suggestDraggingScrollbar = false;
+    private static float suggestTrackX, suggestTrackY, suggestTrackW, suggestTrackH, suggestThumbH;
+    private static int suggestCurrentStart = -1;
+    private static int suggestCurrentSelection = -1;
+    private static float suggestAppearProgress = 0f;
+    private static double lastMouseFx = 0.0;
+    private static double lastMouseFy = 0.0;
+    private static boolean lastMouseValid = false;
+    private static boolean tooltipCaptured = false;
+    private static String lastSuggestInput = "";
+    private static int lastSuggestCursor = -1;
+    private static int lastSuggestSelStart = -1;
+    private static int lastSuggestSelEnd = -1;
+    private static CommandSuggestorBridge.SuggestionSnapshot lastSnapshot = null;
+    private static long debugPerfWindowStartNs = 0L;
+    private static long debugPerfAccumLayoutNs = 0L;
+    private static long debugPerfAccumBuildNs = 0L;
+    private static int debugPerfAccumFrames = 0;
+    private static BetterChatFrameLayout frame = BetterChatFrameLayout.empty();
+    private static ContextMenu contextMenu = ContextMenu.closed();
+    private static float contextMenuAppearProgress = 0f;
+    private static boolean selecting = false;
+    private static boolean searchHit = false;
+    private static float searchRectX = 0f, searchRectY = 0f, searchRectW = 0f, searchRectH = 0f;
+    private static boolean searchHotkeyDown = false;
+    private static float chatHitX = 0f, chatHitY = 0f, chatHitW = 0f, chatHitH = 0f;
+    private static String hoverEntityUuid = null;
+    private static ChatScreen storedScreen;
+    private static BetterChatStore previewStore;
+    private static int lastSuggestionHash = 0;
+    private static boolean leftPending = false;
+    private static double leftDownFx = 0.0, leftDownFy = 0.0;
+    private static int leftDownMsgIndex = -1;
+    private static int leftDownCharIndex = -1;
+    private static Style leftDownStyle = null;
+    private static boolean passwordReveal = false;
+    private static float passwordRevealProgress = 0f;
+    private static String passwordInputSnapshot = "";
+
+    public static void markLayoutDirty() {
+        BetterChatMessageLayout.invalidateLayouts();
+    }
+
+    static void clearMessageCaches() {
+        BetterChatMessageLayout.clear();
+        BetterChatRuntimeMessages.clear();
+    }
+
+    public static void renderEngine(Renderer2D rendererIn,
+                                    TextRenderer fallback,
+                                    GuiGraphicsExtractor ctx,
+                                    int screenW,
+                                    float baseX,
+                                    float baseY) {
+        SystemCursor.beginFrame(ctx);
+        try {
+            renderEngineInternal(rendererIn, fallback, ctx, screenW, baseX, baseY);
+        } finally {
+            SystemCursor.endFrame();
+        }
+    }
+
+    private static void renderEngineInternal(Renderer2D rendererIn,
+                                             TextRenderer fallback,
+                                             GuiGraphicsExtractor ctx,
+                                             int screenW,
+                                             float baseX,
+                                             float baseY) {
+        renderer = rendererIn;
+        BetterChat settings = BetterChat.get();
+        boolean preview = DraggableHudElementRegistry.isForceVisible();
+        if (settings == null || (!settings.isEnabled() && !preview)) {
+            lastRenderWidth = 0f;
+            lastRenderHeight = 0f;
+            return;
+        }
+
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || (mc.player == null && !preview)) {
+            lastRenderWidth = 0f;
+            lastRenderHeight = 0f;
+            return;
+        }
+        if (!preview && mc.isPaused()) {
+            selection.clear();
+            contextMenu = ContextMenu.closed();
+            selecting = false;
+            lastRenderWidth = 0f;
+            lastRenderHeight = 0f;
+            return;
+        }
+
+        BetterChatStore store = (preview && mc.player == null)
+                ? buildPreviewStore()
+                : BetterChatStoreManager.getActiveStore(mc);
+        if (store == null) {
+            if (preview) {
+                store = buildPreviewStore();
+            } else {
+                lastRenderWidth = 0f;
+                lastRenderHeight = 0f;
+                return;
+            }
+        }
+
+        boolean chatOpen = ClientScreen.current() instanceof ChatScreen;
+        boolean activeChatSurface = chatOpen || preview;
+        if (!chatOpen && store.size() == 0) {
+            if (preview) {
+                store = buildPreviewStore();
+            } else {
+                selection.clear();
+                contextMenu = ContextMenu.closed();
+                lastRenderWidth = 0f;
+                lastRenderHeight = 0f;
+                return;
+            }
+        }
+        if (!chatOpen) {
+            selection.clear();
+            contextMenu = ContextMenu.closed();
+            selecting = false;
+            storedScreen = null;
+            draggingScrollbar = false;
+            sbEnabled = false;
+            scrollOffsetLines = 0;
+            BetterChatSearch.deactivate();
+            resetSuggestionTracking();
+            resetPasswordPrivacy();
+            inputCaretDragging = false;
+            inputTextSnapshot = "";
+            inputLinesSnapshot = List.of();
+        }
+        if (chatOpen && ctx != null) {
+            BetterTooltips.beginTooltipFrame();
+            BetterTooltips.setDrawContext(ctx);
+        }
+        tooltipCaptured = false;
+
+        int visibleLimit = Math.max(1, chatOpen ? settings.maxLines() : Math.min(settings.maxLines(), 12));
+        List<CommandOutput.MessageLine> commandOutputMessages = settings.hideVanilla()
+                ? CommandOutput.recentMessages()
+                : List.of();
+        int totalMessages = store.size() + commandOutputMessages.size();
+        boolean autoFollow = scrollOffsetLines == 0;
+        boolean tsEnabled = settings.timestampEnabled();
+        boolean tsSeconds = settings.timestampSeconds();
+        int tsColor = settings.timestampColor();
+        boolean tsActiveOnly = settings.timestampToggles().get("active_only");
+        boolean tsTipDate = settings.timestampToggles().get("hover_date");
+        boolean tsTipUnix = settings.timestampToggles().get("hover_unix");
+        boolean showTs = tsEnabled && (!tsActiveOnly || chatOpen);
+
+        List<ChatLine> messages;
+        if (BetterChatSearch.hasQuery() && BetterChatSearch.results() != null && chatOpen) {
+            List<ChatLine> res = BetterChatSearch.results();
+            totalMessages = res.size();
+            int maxScrollSearch = Math.max(0, totalMessages - visibleLimit);
+            scrollOffsetLines = Mth.clamp(scrollOffsetLines, 0, maxScrollSearch);
+            int tailBudget = Math.min(totalMessages, Math.max(visibleLimit + scrollOffsetLines + 20, visibleLimit + 10));
+            int endIdx = Math.min(totalMessages, Math.max(0, totalMessages - scrollOffsetLines));
+            int startIdx = Math.max(0, endIdx - tailBudget);
+            if (startIdx > endIdx) startIdx = endIdx;
+            messages = res.subList(startIdx, endIdx);
+        } else {
+            int tailBudget = chatOpen
+                    ? Math.max(visibleLimit + scrollOffsetLines + 80, visibleLimit)
+                    : Math.max(visibleLimit + 8, visibleLimit);
+            int needed = Math.min(MAX_HISTORY, Math.min(totalMessages, tailBudget));
+            messages = BetterChatRuntimeMessages.merge(
+                    store.tail(Math.min(store.size(), needed)), commandOutputMessages, needed);
+        }
+        lastMessages = messages;
+        int[] messageGroups = BetterChatMessageGrouping.groupIds(messages);
+
+        float fontSize = 16f * settings.fontScale();
+        float width = computeWidth(screenW, settings.widthRatio());
+        float tsWidth = 0f;
+        if (showTs) {
+            String sampleTs = tsSeconds ? "00:00:00" : "00:00";
+            tsWidth = BetterChatTextSupport.width(BetterChatTextSupport.interRegular(), sampleTs, Math.max(9f, fontSize * 0.72f)) + MESSAGE_TS_GAP;
+        }
+        float contentWidth = Math.max(32f, width - PADDING * 2f - MESSAGE_PAD_X * 2f - tsWidth);
+        lastFontSizeForUi = fontSize;
+
+        int lineTarget = visibleLimit + scrollOffsetLines + Math.max(10, visibleLimit / 2) + 2;
+        long perfT0 = System.nanoTime();
+        LayoutResult layoutResult = BetterChatMessageLayout.tail(
+                messages, messageGroups, fontSize, contentWidth, lineTarget);
+        long perfT1 = System.nanoTime();
+        List<VisualLine> allLines = layoutResult.lines();
+        float lineHeight = fontSize + LINE_SPACING;
+        float boxHeight;
+        List<VisualLine> visible;
+        int localStart;
+        hasInputBox = false; // reset per-frame before renderInput fills it
+        float lineYOffset = 0f;
+        int targetVisibleForBox = visibleLimit;
+        if (allLines.isEmpty()) {
+            maxScrollLines = 0;
+            sbTotalLines = 0;
+            sbVisibleLines = 0;
+            boxHeight = 0f;
+            visible = Collections.emptyList();
+            smoothScrollOffsetLines = 0f;
+        } else {
+            int lineCount = allLines.size();
+            int observedMessages = Math.max(1, layoutResult.messagesSeen());
+            float avgLinesPerMsg = Math.max(1f, (float) lineCount / (float) observedMessages);
+            int estimatedTotalLines = Math.max(lineCount, (int) Math.ceil(avgLinesPerMsg * totalMessages));
+            maxScrollLines = Math.max(0, estimatedTotalLines - visibleLimit);
+            scrollOffsetLines = Mth.clamp(scrollOffsetLines, 0, maxScrollLines);
+            if (autoFollow) {
+                smoothScrollOffsetLines = 0f;
+            } else {
+                smoothScrollOffsetLines = Mth.clamp(smoothScrollOffsetLines, 0f, maxScrollLines);
+                smoothScrollOffsetLines = AnimationUtility.approach(
+                        smoothScrollOffsetLines,
+                        scrollOffsetLines,
+                        draggingScrollbar ? 0.55f : 0.22f
+                );
+                smoothScrollOffsetLines = AnimationUtility.snap(
+                        smoothScrollOffsetLines,
+                        scrollOffsetLines,
+                        draggingScrollbar ? 0.01f : 0.035f
+                );
+            }
+
+            // The viewport is line-bounded even when one incoming message wraps heavily.
+            // A large server table/message must not grow the whole BetterChat column and evict
+            // unrelated history from the visible surface.
+            int targetVisible = visibleLimit;
+            targetVisibleForBox = Math.max(1, Math.min(targetVisible, lineCount));
+
+            float globalStartFloat = autoFollow
+                    ? Math.max(0f, lineCount - targetVisible)
+                    : Math.max(0f, lineCount - visibleLimit - smoothScrollOffsetLines);
+            int globalStart = Math.max(0, (int) Math.floor(globalStartFloat) - (autoFollow ? 0 : 1));
+            int viewportStart = autoFollow
+                    ? Math.max(0, lineCount - targetVisibleForBox)
+                    : Mth.clamp((int) Math.floor(globalStartFloat), 0, Math.max(0, lineCount - 1));
+            int viewportEnd = Math.min(lineCount, viewportStart + targetVisibleForBox);
+            int groupsForBox = countMessageGroups(allLines.subList(viewportStart, viewportEnd), targetVisibleForBox);
+
+            localStart = Math.max(0, Math.min(globalStart, Math.max(0, lineCount - 1)));
+            int endLine = Math.min(lineCount, localStart + targetVisibleForBox + (autoFollow ? 0 : 3));
+            // Do not expand to message-group boundaries here. A wrapped/box-drawing message may
+            // be taller than the viewport; clipping it is preferable to creating a giant column.
+            visible = allLines.subList(localStart, endLine);
+            sbTotalLines = lineCount;
+            sbVisibleLines = targetVisibleForBox;
+
+            boxHeight = messageStackHeight(targetVisibleForBox, groupsForBox, lineHeight);
+            if (autoFollow) {
+                int actualGroups = countMessageGroups(visible, visible.size());
+                float actualHeight = messageStackHeight(visible.size(), actualGroups, lineHeight);
+                // Keep the newest visible lines pinned to the viewport bottom.
+                lineYOffset = boxHeight - actualHeight;
+            } else {
+                lineYOffset = (localStart - globalStartFloat) * lineHeight;
+            }
+        }
+        float stableBoxHeight = messageStackHeight(visibleLimit, visibleLimit, lineHeight);
+        float fixedInputY = baseY + stableBoxHeight + MESSAGE_INPUT_GAP;
+        float frameY = baseY + stableBoxHeight - boxHeight;
+        float visualTop = Math.min(baseY, frameY);
+        float visualBottom = chatOpen ? fixedInputY + Math.max(36f, fontSize + 16f) : frameY + boxHeight;
+        float totalHeight = Math.max(0f, visualBottom - visualTop);
+        lastRenderWidth = width;
+        lastRenderHeight = totalHeight;
+
+        long perfT2Start = System.nanoTime();
+        frame = BetterChatFrameLayout.build(
+                visible, baseX, frameY, width, boxHeight, fontSize, lineHeight, lineYOffset,
+                showTs ? tsWidth : 0f,
+                PADDING, MESSAGE_PAD_X, MESSAGE_PAD_Y, MESSAGE_GAP, LINE_SPACING);
+        long perfT2 = System.nanoTime();
+        debugPerfAccumLayoutNs += (perfT1 - perfT0);
+        debugPerfAccumBuildNs += (perfT2 - perfT2Start);
+        debugPerfAccumFrames++;
+        if (debugPerfWindowStartNs == 0L) debugPerfWindowStartNs = perfT2;
+        long windowNs = perfT2 - debugPerfWindowStartNs;
+        if (windowNs >= 1_000_000_000L && debugPerfAccumFrames > 0 && chatOpen) {
+            double layoutMs = (debugPerfAccumLayoutNs / (double) debugPerfAccumFrames) / 1_000_000.0;
+            double buildMs = (debugPerfAccumBuildNs / (double) debugPerfAccumFrames) / 1_000_000.0;
+            debugPerfWindowStartNs = perfT2;
+            debugPerfAccumLayoutNs = 0L;
+            debugPerfAccumBuildNs = 0L;
+            debugPerfAccumFrames = 0;
+        }
+
+        searchHit = false;
+        if (!chatOpen) {
+            BetterChatSearch.deactivate();
+        }
+        updateSearchHotkey(mc, chatOpen);
+
+        MousePos mouse = resolveMouse(mc.mouseHandler.xpos(), mc.mouseHandler.ypos());
+        double mouseX = mouse.fx();
+        double mouseY = mouse.fy();
+        lastMouseFx = mouseX;
+        lastMouseFy = mouseY;
+        lastMouseValid = true;
+        HoverTip hoverTip = null;
+        hoverEntityUuid = null;
+
+        TextRenderer tsRenderer = showTs ? BetterChatTextSupport.interRegular() : null;
+        float tsFontSize = Math.max(9f, fontSize * 0.72f);
+        float tsTextHeight = 0f;
+        if (showTs && tsRenderer != null) {
+            float tsScale = BetterChatTextSupport.scale(tsFontSize);
+            tsRenderer.begin(tsScale, false, false);
+            tsTextHeight = (float) tsRenderer.getHeight(false);
+            tsRenderer.end();
+        }
+
+        boolean chatClip = false;
+        MessageClipBounds clipBounds = frame.messageClipBounds(PADDING);
+        if (clipBounds != null) {
+            if (!frame.bubbles().isEmpty()) {
+                UiBlurResources.requestBeforeNextShapeClip(new UiRect(
+                        clipBounds.x(), clipBounds.y(), clipBounds.w(), clipBounds.h()));
+            }
+            float clipRadius = Math.min(RADIUS, clipBounds.h() * 0.5f);
+            chatClip = ClipFunction.pushRoundedRectAnalyticRequired(
+                    clipBounds.x(), clipBounds.y(), clipBounds.w(), clipBounds.h(),
+                    clipRadius, clipRadius, 0.0f, 0.0f
+            );
+        }
+        drawMessageBubbles(frame.bubbles(), activeChatSurface);
+
+        // Keep the cheap rectangular reject for embedded items, then let shape/text/MSDF pipelines
+        // consume the same analytic rounded boundary. Clip selection is orthogonal to fast/warped text.
+        boolean contentScissor = clipBounds != null && ScissorFunction.pushRaw(
+                clipBounds.x() - CLIP_AA_GUARD,
+                clipBounds.y() - CLIP_AA_GUARD,
+                clipBounds.w() + CLIP_AA_GUARD * 2.0f,
+                clipBounds.h() + CLIP_AA_GUARD * 2.0f
+        );
+        for (FrameLine line : frame.lines()) {
+            float alpha = activeChatSurface ? 1f : fade(line.message().ageSeconds());
+            if (alpha <= 0.01f) continue;
+            drawSelection(line, alpha, lineHeight);
+        }
+
+        renderGlyphs(frame.lines(), fontSize, lineHeight, activeChatSurface);
+        if (showTs && tsRenderer != null) {
+            hoverTip = renderBubbleTimestamps(
+                    tsRenderer,
+                    frame.bubbles(),
+                    tsFontSize,
+                    tsTextHeight,
+                    tsSeconds,
+                    tsColor,
+                    tsTipDate,
+                    tsTipUnix,
+                    activeChatSurface,
+                    chatOpen,
+                    hoverTip
+            );
+        }
+        if (contentScissor) ScissorFunction.pop();
+        if (chatClip) ClipFunction.pop();
+        PickResult hover = frame.pick(mouseX, mouseY);
+        boolean overSuggestWindow = isInsideSuggestWindow(mouse.fx(), mouse.fy(), mouse.rawX(), mouse.rawY());
+        if (overSuggestWindow && lastHoverWasOutsideSuggest) {
+lastHoverWasOutsideSuggest = false;
+        } else if (!overSuggestWindow && !lastHoverWasOutsideSuggest) {
+            lastHoverWasOutsideSuggest = true;
+        }
+
+        if (hover != null && hover.glyph().item() != null && !hover.glyph().item().isEmpty() && !overSuggestWindow) {
+            hoverTip = ChatHoverUtil.buildItemTip(hover.glyph().item(), mc, false);
+        } else if (hover != null && hover.glyph().hover() != null && !overSuggestWindow) {
+            hoverTip = ChatHoverUtil.fromHover(hover.glyph().hover(), mc);
+            if (hoverTip != null) hoverEntityUuid = hoverTip.uuid();
+        }
+
+        // Fallback heuristic: if no hover info was provided (e.g., from persisted history), try to infer from cache or nickname.
+        if (selecting) {
+            hoverTip = null;
+            hoverEntityUuid = null;
+        }
+
+        if (!selecting && !overSuggestWindow && hoverTip == null && hover != null) {
+            String raw = hover.line().message().text().getString();
+            String word = wordAt(raw, hover.glyph().charIndex());
+            if (!word.isEmpty()) {
+                boolean looksLikeItem = (word.startsWith("[") && word.contains("]"));
+                HoverTip cached = ChatHoverUtil.inferFromDisplay(word, looksLikeItem, mc);
+                if (cached != null) {
+                    hoverTip = cached;
+                    hoverEntityUuid = cached.uuid();
+                }
+            }
+            if (hoverTip == null) {
+                List<String> nickCandidates = ChatNameUtil.extractNicks(raw);
+                String normalized = ChatNameUtil.normalizeNickCandidate(word);
+                String targetNick = null;
+                if (!normalized.isEmpty()
+                        && ChatNameUtil.isNickLike(normalized)
+                        && nickCandidates.stream().anyMatch(n -> n.equalsIgnoreCase(normalized))) {
+                    targetNick = normalized;
+                } else if (nickCandidates.size() == 1) {
+                    targetNick = nickCandidates.getFirst();
+                }
+                if (targetNick != null) {
+                    hoverTip = ChatHoverUtil.inferFromNick(targetNick, mc);
+                    if (hoverTip != null) hoverEntityUuid = hoverTip.uuid();
+                }
+            }
+        }
+
+        if (overSuggestWindow || contextMenu.open) {
+            hoverTip = null;
+            hoverEntityUuid = null;
+        }
+
+        if (chatOpen) {
+            renderInput(mc, fontSize, width, baseX, fixedInputY);
+            float hitBottom = hasInputBox ? inputBoxY + inputBoxH : fixedInputY;
+            chatHitX = baseX;
+            chatHitY = frame.y();
+            chatHitW = width;
+            chatHitH = Math.max(boxHeight, hitBottom - chatHitY);
+            renderSuggestions();
+        } else {
+            chatHitX = chatHitY = chatHitW = chatHitH = 0f;
+            lastMouseValid = false;
+        }
+
+        if (chatOpen && maxScrollLines > 0) {
+            int scrollbarStart = autoFollow
+                    ? Math.max(0, sbTotalLines - visibleLimit)
+                    : Math.max(0, sbTotalLines - visibleLimit - scrollOffsetLines);
+            renderScrollbar(frame.x(), frame.y(), frame.w(), frame.h(), scrollbarStart, visibleLimit, sbTotalLines, mouseX, mouseY);
+        }
+
+        if (chatOpen && hoverTip != null) {
+            captureTooltip(hoverTip, (float) mouseX + CHAT_TOOLTIP_OFFSET_X, (float) mouseY + CHAT_TOOLTIP_OFFSET_Y, ctx);
+        }
+
+        if (contextMenu.open) {
+            contextMenu.render((float) mouseX, (float) mouseY, fontSize);
+        }
+    }
+
+    private static int countMessageGroups(List<VisualLine> lines, int maxLines) {
+        if (lines == null || lines.isEmpty() || maxLines <= 0) return 0;
+        int groups = 0;
+        int lastMessage = Integer.MIN_VALUE;
+        int limit = Math.min(lines.size(), maxLines);
+        for (int i = 0; i < limit; i++) {
+            int messageGroup = lines.get(i).messageGroup();
+            if (messageGroup != lastMessage) {
+                groups++;
+                lastMessage = messageGroup;
+            }
+        }
+        return groups;
+    }
+
+    private static float messageStackHeight(int lineCount, int groupCount, float lineHeight) {
+        if (lineCount <= 0) return 0f;
+        return lineCount * lineHeight
+                - LINE_SPACING
+                + Math.max(0, groupCount - 1) * MESSAGE_GAP
+                + MESSAGE_PAD_Y * 2f;
+    }
+
+    private static void drawMessageBubbles(List<MessageBubble> bubbles, boolean activeChatSurface) {
+        if (bubbles == null || bubbles.isEmpty()) return;
+        for (MessageBubble bubble : bubbles) {
+            float alpha = activeChatSurface ? 1f : fade(bubble.message().ageSeconds());
+            if (alpha <= 0.01f) continue;
+            float reveal = newMessageReveal(bubble.message());
+            float x = bubble.x() - (1f - reveal) * NEW_MESSAGE_SLIDE_PX;
+            float y = bubble.y();
+            float w = bubble.w();
+            float h = bubble.h();
+            drawMessageBubbleGlass(x, y, w, h, Math.min(MESSAGE_RADIUS, h * 0.5f), alpha);
+        }
+    }
+
+    private static void drawMessageBubbleGlass(float x, float y, float w, float h, float radius, float alpha) {
+        if (renderer == null || w <= 0f || h <= 0f) return;
+        float drawAlpha = Mth.clamp(alpha, 0.0f, 1.0f);
+        if (drawAlpha <= 0.001f) return;
+        BetterChat settings = BetterChat.get();
+        float configuredAlpha = settings != null ? settings.liquidGlassAlphaFactor() : (230f / 255f);
+        float blurStrength = configuredAlpha * drawAlpha;
+        float glassScale = MESSAGE_RADIUS <= 0.0f ? 1.0f : radius / MESSAGE_RADIUS;
+        HudRenderUtil.drawLiquidGlassCorners(
+                x, y, w, h,
+                radius, radius, radius, radius,
+                glassScale, false,
+                blurStrength, drawAlpha * 0.94f,
+                theme().accent()
+        );
+        drawRoundedRect(x, y, w, h, radius,
+                withAlpha(theme().windowBg(), Math.round(0x08 * drawAlpha)));
+    }
+
+    private static HoverTip renderBubbleTimestamps(TextRenderer tsRenderer,
+                                                   List<MessageBubble> bubbles,
+                                                   float tsFontSize,
+                                                   float tsTextHeight,
+                                                   boolean withSeconds,
+                                                   int tsColor,
+                                                   boolean tsTipDate,
+                                                   boolean tsTipUnix,
+                                                   boolean activeChatSurface,
+                                                   boolean chatOpen,
+                                                   HoverTip currentHover) {
+        if (bubbles == null || bubbles.isEmpty()) return currentHover;
+        HoverTip hover = currentHover;
+        float tsScale = BetterChatTextSupport.scale(tsFontSize);
+        float shadowOffset = Math.max(0.75f, tsFontSize * 0.07f);
+        float timestampShadowAlpha = 0.46f;
+        tsRenderer.begin(tsScale, false, false);
+        try {
+            for (MessageBubble bubble : bubbles) {
+                float alpha = activeChatSurface ? 1f : fade(bubble.message().ageSeconds());
+                if (alpha <= 0.01f) continue;
+
+                String ts = formatTimestamp(bubble.message().timestampMs(), withSeconds);
+                float textW = (float) tsRenderer.getWidth(ts, false);
+                float reveal = newMessageReveal(bubble.message());
+                float tx = bubble.x() + bubble.w() - MESSAGE_PAD_X - textW - (1f - reveal) * NEW_MESSAGE_SLIDE_PX;
+                float ty = bubble.lastLine().y0() + (bubble.lastLine().y1() - bubble.lastLine().y0() - tsTextHeight) * 0.5f;
+                int shadowColor = mulAlpha(0xFF000000, alpha * timestampShadowAlpha);
+                applyColor(shadowColor);
+                tsRenderer.render(ts, tx + shadowOffset, ty, TMP_COLOR, false);
+                tsRenderer.render(ts, tx, ty + shadowOffset, TMP_COLOR, false);
+                applyColor(mulAlpha(tsColor, alpha * 0.82f));
+                tsRenderer.render(ts, tx, ty, TMP_COLOR, false);
+
+                if (hover == null && chatOpen && lastMouseValid) {
+                    float hitPad = 2f;
+                    if (lastMouseFx >= tx - hitPad && lastMouseFx <= tx + textW + hitPad
+                            && lastMouseFy >= ty - hitPad && lastMouseFy <= ty + tsTextHeight + hitPad) {
+                        hover = buildTimestampTooltip(bubble.message().timestampMs(), tsTipDate, tsTipUnix);
+                    }
+                }
+            }
+        } finally {
+            tsRenderer.end();
+        }
+        return hover;
+    }
+
+    private static float fade(float ageSeconds) {
+        BetterChat cfg = BetterChat.get();
+        float life = cfg != null ? cfg.fadeSeconds() : 12f;
+        if (life <= 0f) return 0f;
+
+        // Держим сообщение полностью видимым, затем быстро гасим в конце.
+        float fadeDur = Math.min(2.0f, Math.max(0.35f, life * 0.18f)); // быстрое затухание (0.35..2.0с)
+        float holdDur = Math.max(0f, life - fadeDur);
+
+        if (ageSeconds <= holdDur) return 1f;
+
+        float t = (ageSeconds - holdDur) / fadeDur; // 0..1
+        t = Mth.clamp(t, 0f, 1f);
+
+        // Быстрое “падение” в конце (кубическая кривая)
+        float inv = 1f - t;
+        return inv * inv * inv;
+    }
+
+    private static void drawSelection(FrameLine line, float alpha, float lineHeight) {
+        if (!selection.appliesToLine(line.messageIndex())) return;
+
+        int selStart = selection.startForLine(line.messageIndex());
+        int selEnd = selection.endForLine(line.messageIndex());
+        if (selStart < 0 && selEnd < 0) return;
+
+        float y0 = line.y0() - 1.5f;
+        float h = lineHeight + 3f;
+        float startX = Float.NaN;
+        float endX = Float.NaN;
+        for (GlyphBox g : line.glyphs()) {
+            if (g.charEndExclusive() <= selStart || g.charIndex() > selEnd) continue;
+            if (Float.isNaN(startX)) startX = g.x0();
+            endX = g.x1();
+        }
+        if (Float.isNaN(startX) || Float.isNaN(endX)) return;
+        float w = Math.max(1f, endX - startX);
+        drawRoundedRect(startX, y0, w, h, 1.8f, mulAlpha(theme().accent(), alpha * 0.55f));
+    }
+
+    private static void renderGlyphs(List<FrameLine> lines, float fontSize, float lineHeight, boolean activeChatSurface) {
+        if (lines == null || lines.isEmpty()) return;
+        float scale = BetterChatTextSupport.scale(fontSize);
+        TextRenderer current = null;
+        float currentHeight = 0f;
+        float shadowOffset = Math.max(1f, fontSize * 0.08f);
+        float shadowAlpha = 0.68f;
+        for (FrameLine line : lines) {
+            float alpha = activeChatSurface ? 1f : fade(line.message().ageSeconds());
+            if (alpha <= 0.01f) continue;
+            float baseY = line.y0();
+            float reveal = newMessageReveal(line.message());
+            float xOffset = -(1f - reveal) * NEW_MESSAGE_SLIDE_PX;
+            boolean commandLine = CommandOutput.isHavocMessage(line.message().text());
+            // Translation-only reveal avoids per-message scissor state and batch flushes.
+            List<GlyphBox> glyphs = line.glyphs();
+            for (int gi = 0; gi < glyphs.size(); gi++) {
+                GlyphBox g = glyphs.get(gi);
+                if (g.item() != null && !g.item().isEmpty()) {
+                    if (current != null) {
+                        current.end();
+                        current = null;
+                    }
+                    float iconSize = Math.max(1.0f, g.x1() - g.x0());
+                    float gx = g.x0() + xOffset;
+                    float itemY = baseY + (lineHeight - iconSize) * 0.5f;
+                    double previousRendererAlpha = renderer.getAlpha();
+                    try {
+                        renderer.setAlpha(previousRendererAlpha * alpha);
+                        renderer.item(
+                                g.item(),
+                                gx,
+                                itemY,
+                                iconSize / 16.0f,
+                                31 * line.messageIndex() + gi,
+                                Renderer2D.ITEM_OVERLAY_NONE,
+                                null
+                        );
+                    } finally {
+                        renderer.setAlpha(previousRendererAlpha);
+                    }
+                    continue;
+                }
+                if (commandLine && g.charIndex() < CommandOutput.PREFIX.length() && !TextGlyphFallback.isSvgFontKey(g.font())) {
+                    if (current != null) {
+                        current.end();
+                        current = null;
+                    }
+                    int runEnd = gi + 1;
+                    while (runEnd < glyphs.size()) {
+                        GlyphBox next = glyphs.get(runEnd);
+                        if (next.charIndex() >= CommandOutput.PREFIX.length()) break;
+                        if (TextGlyphFallback.isSvgFontKey(next.font())) break;
+                        if (!java.util.Objects.equals(next.font(), g.font())) break;
+                        runEnd++;
+                    }
+                    renderCommandPrefixRun(glyphs, gi, runEnd, baseY, lineHeight, xOffset, scale, alpha, shadowOffset, shadowAlpha, line.message().text());
+                    gi = runEnd - 1;
+                    continue;
+                }
+                if (TextGlyphFallback.isSvgFontKey(g.font())) {
+                    if (current != null) {
+                        current.end();
+                        current = null;
+                    }
+                    String svgName = TextGlyphFallback.svgNameFromFontKey(g.font());
+                    float gx = g.x0() + xOffset;
+                    float iconSize = Math.max(1.0f, g.x1() - g.x0());
+                    float iconY = baseY + (lineHeight - iconSize) * 0.5f;
+                    if (svgName != null) {
+                        renderer.svg(svgName, gx, iconY, iconSize, iconSize, SvgRenderOptions.fromFile().withAlpha(alpha));
+                    }
+                    continue;
+                }
+                TextRenderer tr = BetterChatTextSupport.renderer(g.font());
+                if (tr != current) {
+                    if (current != null) {
+                        current.end();
+                    }
+                    current = tr;
+                    current.begin(scale, false, false);
+                    currentHeight = (float) current.getHeight(false);
+                }
+                float textY = baseY + (lineHeight - currentHeight) * 0.5f;
+                float gx = g.x0() + xOffset;
+                int shadowColor = mulAlpha(0xFF000000, alpha * shadowAlpha);
+                applyColor(shadowColor);
+                current.render(g.text(), gx + shadowOffset, textY, TMP_COLOR, false);
+                current.render(g.text(), gx - shadowOffset, textY, TMP_COLOR, false);
+                current.render(g.text(), gx, textY + shadowOffset, TMP_COLOR, false);
+                current.render(g.text(), gx, textY - shadowOffset, TMP_COLOR, false);
+                applyColor(mulAlpha(g.color(), alpha));
+                current.render(g.text(), gx, textY, TMP_COLOR, false);
+            }
+        }
+        if (current != null) {
+            current.end();
+        }
+    }
+
+    private static void renderCommandPrefixRun(List<GlyphBox> glyphs,
+                                               int from,
+                                               int to,
+                                               float baseY,
+                                               float lineHeight,
+                                               float xOffset,
+                                               float scale,
+                                               float alpha,
+                                               float shadowOffset,
+                                               float shadowAlpha,
+                                               Component source) {
+        if (from < 0 || to <= from || to > glyphs.size()) return;
+        GlyphBox first = glyphs.get(from);
+        GlyphBox last = glyphs.get(to - 1);
+        TextRenderer tr = BetterChatTextSupport.renderer(first.font());
+        if (tr == null) return;
+
+        StringBuilder text = new StringBuilder();
+        for (int i = from; i < to; i++) {
+            text.append(glyphs.get(i).text());
+        }
+        if (text.isEmpty()) return;
+
+        float runX = first.x0() + xOffset;
+        float runW = Math.max(1.0f, last.x1() - first.x0());
+        CommandOutput.Tone tone = CommandOutput.toneOf(source);
+        int start = CommandOutput.prefixStartColor(tone);
+        int end = CommandOutput.prefixEndColor(tone);
+        int bottomMix = CommandOutput.mixRgb(end, 0xFFFFFFFF, 0.10f);
+
+        tr.begin(scale, false, false);
+        try {
+            float textY = baseY + (lineHeight - (float) tr.getHeight(false)) * 0.5f;
+            int shadowColor = mulAlpha(0xFF000000, alpha * shadowAlpha);
+            applyColor(shadowColor);
+            tr.render(text.toString(), runX + shadowOffset, textY, TMP_COLOR, false);
+            tr.render(text.toString(), runX - shadowOffset, textY, TMP_COLOR, false);
+            tr.render(text.toString(), runX, textY + shadowOffset, TMP_COLOR, false);
+            tr.render(text.toString(), runX, textY - shadowOffset, TMP_COLOR, false);
+
+            tr.renderQuadGradient(text.toString(), runX, textY, (idx, cp, x0, y0, x1, y1, out) -> {
+                float t0 = (float) ((x0 - runX) / runW);
+                float t1 = (float) ((x1 - runX) / runW);
+                int leftTop = mulAlpha(CommandOutput.mixRgb(start, end, t0), alpha);
+                int rightTop = mulAlpha(CommandOutput.mixRgb(start, end, t1), alpha);
+                int leftBottom = mulAlpha(CommandOutput.mixRgb(start, bottomMix, t0), alpha);
+                int rightBottom = mulAlpha(CommandOutput.mixRgb(start, bottomMix, t1), alpha);
+                out[0] = leftTop;
+                out[1] = leftBottom;
+                out[2] = rightBottom;
+                out[3] = rightTop;
+            }, false);
+        } finally {
+            tr.end();
+        }
+    }
+
+     private static float newMessageReveal(ChatLine message) {
+        if (message == null) return 1f;
+        float age = message.ageSeconds();
+        if (age <= 0f) return 0f;
+        if (age >= NEW_MESSAGE_REVEAL_SECONDS) return 1f;
+        float t = Mth.clamp(age / NEW_MESSAGE_REVEAL_SECONDS, 0f, 1f);
+        float inv = 1f - t;
+        return 1f - inv * inv * inv;
+    }
+
+    private static void captureTooltip(HoverTip tip, float x, float y, GuiGraphicsExtractor ctx) {
+        if (tip == null || ctx == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.getWindow() == null) return;
+        float scale = (float) mc.getWindow().getGuiScale();
+        int mx = Math.round(x / scale);
+        int my = Math.round(y / scale);
+        List<FormattedCharSequence> lines = buildOrderedTooltipLines(tip);
+        if (lines.isEmpty()) return;
+
+        BetterTooltips.setTooltipScaleOverride(0.8f);
+        if (tip.item() != null && !tip.item().isEmpty()) {
+            BetterTooltips.captureItemTooltipOrdered(lines, DefaultTooltipPositioner.INSTANCE, mx, my, tip.item(), ctx);
+        } else {
+            BetterTooltips.captureTooltipOrdered(lines, DefaultTooltipPositioner.INSTANCE, mx, my);
+        }
+        tooltipCaptured = true;
+    }
+
+    public static void renderCapturedTooltip(GuiGraphicsExtractor ctx) {
+        if (!tooltipCaptured) return;
+        BetterTooltips.renderTooltipWithContext(ctx);
+        BetterTooltips.resetTooltipScaleOverride();
+        tooltipCaptured = false;
+    }
+
+    private static List<FormattedCharSequence> buildOrderedTooltipLines(HoverTip tip) {
+        if (tip == null || tip.lines() == null || tip.lines().isEmpty()) return Collections.emptyList();
+        List<FormattedCharSequence> out = new ArrayList<>(tip.lines().size());
+        for (ChatHoverUtil.ColoredLine line : tip.lines()) {
+            int argb = line.color() != 0 ? line.color() : theme().textPrimary();
+            int rgb = argb & 0x00FFFFFF;
+            Component text = Component.literal(line.text()).setStyle(Style.EMPTY.withColor(net.minecraft.network.chat.TextColor.fromRgb(rgb)));
+            out.add(text.getVisualOrderText());
+        }
+        return out;
+    }
+
+     static ItemStack resolveItemFromStyle(Style style) {
+        if (style == null) return ItemStack.EMPTY;
+        HoverEvent hover = style.getHoverEvent();
+        if (!(hover instanceof HoverEvent.ShowItem(net.minecraft.world.item.ItemStackTemplate template))) {
+            return ItemStack.EMPTY;
+        }
+        return resolveCachedItem(template.create());
+    }
+
+    private static ItemStack resolveCachedItem(ItemStack source) {
+        if (source == null || source.isEmpty()) return ItemStack.EMPTY;
+        BetterChatHoverCache cache = BetterChatStoreManager.getActiveCache();
+        if (cache == null) return source.copy();
+        String key = BetterChatStoreManager.hoverItemKey(source);
+        ItemStack cached = cache.getItem(key);
+        return cached.isEmpty() ? source.copy() : cached;
+    }
+
+    private static ItemStack resolvePreviewItem(PickResult pick, boolean exactGlyphHit) {
+        if (pick == null) return ItemStack.EMPTY;
+        GlyphBox glyph = pick.glyph();
+        if (exactGlyphHit && glyph != null) {
+            if (glyph.item() != null && !glyph.item().isEmpty()) return glyph.item().copy();
+            ItemStack styled = resolveItemFromStyle(glyph.style());
+            if (!styled.isEmpty()) return styled;
+        }
+
+        if (exactGlyphHit && pick.line() != null && pick.line().message() != null) {
+            String raw = pick.line().message().text().getString();
+            HoverTip inferred = ChatHoverUtil.inferFromDisplay(
+                    wordAt(raw, glyph == null ? 0 : glyph.charIndex()),
+                    true,
+                    Minecraft.getInstance()
+            );
+            if (inferred != null && inferred.item() != null && !inferred.item().isEmpty()) {
+                return inferred.item().copy();
+            }
+        }
+
+        BetterChatMessage message = pick.line() != null && pick.line().message() != null
+                ? pick.line().message().message()
+                : null;
+        if (message == null) return ItemStack.EMPTY;
+
+        ItemStack found = ItemStack.EMPTY;
+        for (var node : message.nodes()) {
+            ItemStack candidate = ItemStack.EMPTY;
+            if (node instanceof ItemNode item) {
+                candidate = resolveCachedItem(item.stack());
+            } else if (node instanceof TextNode text) {
+                final ItemStack[] fromText = {ItemStack.EMPTY};
+                text.component().visit((style, value) -> {
+                    if (fromText[0].isEmpty()) fromText[0] = resolveItemFromStyle(style);
+                    return Optional.empty();
+                }, Style.EMPTY);
+                candidate = fromText[0];
+            }
+            if (candidate.isEmpty()) continue;
+            if (!found.isEmpty() && !sameItemIdentity(found, candidate)) {
+                return ItemStack.EMPTY;
+            }
+            found = candidate.copy();
+        }
+        return found;
+    }
+
+    private static boolean sameItemIdentity(ItemStack left, ItemStack right) {
+        return left.getItem() == right.getItem()
+                && left.getCount() == right.getCount()
+                && java.util.Objects.equals(left.getComponents(), right.getComponents());
+    }
+
+    private static void updateSearchHotkey(Minecraft mc, boolean chatOpen) {
+        if (!chatOpen || mc == null || mc.getWindow() == null) {
+            searchHotkeyDown = false;
+            return;
+        }
+
+        long handle = mc.getWindow().handle();
+
+        boolean ctrl =
+                glfwGetKey(handle, GLFW.GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                        glfwGetKey(handle, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+
+        boolean f =
+                glfwGetKey(handle, GLFW.GLFW_KEY_F) == GLFW_PRESS;
+
+        boolean down = ctrl && f;
+
+        if (down && !searchHotkeyDown) {
+            toggleSearchMode();
+        }
+
+        searchHotkeyDown = down;
+    }
+
+    private static void toggleSearchMode() {
+        if (BetterChatSearch.isActive() || BetterChatSearch.hasQuery()) {
+            BetterChatSearch.deactivate();
+        } else {
+            BetterChatSearch.setActive(true);
+        }
+    }
+
+    private static void renderInput(Minecraft mc, float fontSize, float boxW, float x, float inputY) {
+        if (!(ClientScreen.current() instanceof ChatScreen chatScreen)) return;
+        EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+        if (field == null) return;
+
+        String fieldText = field.getValue();
+        boolean searchMode = BetterChatSearch.isActive();
+        String text = searchMode ? BetterChatSearch.getText() : fieldText;
+        int cursor = searchMode ? text.length() : field.getCursorPosition();
+        int selStart = searchMode ? cursor : selectionStart(field, cursor);
+        int selEnd = searchMode ? cursor : selectionEnd(field, cursor);
+
+        BetterChat cfg = BetterChat.get();
+        ChatPasswordHeuristics.SensitiveRange sensitiveRange = !searchMode && cfg != null && cfg.passwordPrivacy()
+                ? ChatPasswordHeuristics.sensitiveRange(fieldText)
+                : null;
+        updatePasswordPrivacyState(fieldText, sensitiveRange);
+
+        float padX = 12f;
+        float padY = 7f;
+        float lineHeight = fontSize + 2f;
+        float iconGap = 8f;
+        float searchBoxW = SEARCH_ICON_WIDTH;
+        float searchBoxH = SEARCH_ICON_HEIGHT;
+        float counterReserve = (!searchMode && text.length() >= MAX_MESSAGE_CHARS - 20) ? 34f : 0f;
+        float modeReserve = (searchMode || BetterChatSearch.hasQuery()) ? 74f : 0f;
+        float rightReserve = counterReserve + modeReserve;
+
+        if (!searchMode && text.length() > MAX_MESSAGE_CHARS) {
+            text = text.substring(0, MAX_MESSAGE_CHARS);
+            field.setValue(text);
+            setCursorSafe(field, text.length());
+        }
+        int remaining = searchMode ? Integer.MAX_VALUE : MAX_MESSAGE_CHARS - text.length();
+
+        float maxLineWidth = Math.max(32f, boxW - padX * 2f - searchBoxW - iconGap - rightReserve);
+        List<InputLine> lines = BetterChatInputLayout.wrap(text, fontSize, maxLineWidth);
+        if (lines.isEmpty()) {
+            lines = List.of(new InputLine(0, 0, 0f));
+        }
+        float contentHeight = lines.size() * lineHeight;
+        float h = Math.max(36f, contentHeight + padY * 2f);
+        inputBoxX = x;
+        inputBoxY = inputY;
+        inputBoxW = boxW;
+        inputBoxH = h;
+        hasInputBox = true;
+
+        drawGlassPill(x, inputY, boxW, h, Math.min(INPUT_RADIUS, h * 0.5f), 0.92f, false);
+
+        float searchX = x + padX;
+        float searchY = inputY + (h - searchBoxH) * 0.5f;
+        renderSearchIcon(searchX, searchY, searchBoxW, searchBoxH, BetterChatSearch.isActive(), BetterChatSearch.hasQuery());
+        searchRectX = searchX;
+        searchRectY = searchY;
+        searchRectW = searchBoxW;
+        searchRectH = searchBoxH;
+        searchHit = true;
+
+        float textX = searchX + searchBoxW + iconGap;
+        float textClipW = Math.max(20f, x + boxW - padX - textX - rightReserve);
+
+        // Capture the exact rendered input geometry for mouse -> caret hit testing.
+        inputTextX = textX;
+        inputTextY = inputY + padY;
+        inputTextW = textClipW;
+        inputFontSize = fontSize;
+        inputLineHeight = lineHeight;
+        inputTextSnapshot = text;
+        inputLinesSnapshot = List.copyOf(lines);
+        inputSearchSnapshot = searchMode;
+
+        TextRenderer tr = BetterChatTextSupport.iosevkaRegular();
+        float textScale = BetterChatTextSupport.scale(fontSize);
+        boolean clipped = ScissorFunction.pushRaw(textX, inputY, textClipW, h);
+        if (tr != null) {
+            tr.begin(textScale, false, false);
+            float textH = (float) tr.getHeight(false);
+            tr.end();
+            float textYOffset = (lineHeight - textH) * 0.5f;
+            float lineY = inputY + padY + textYOffset;
+            if (text.isEmpty()) {
+                drawText(tr, searchMode ? "Search chat..." : "Message...", textX, lineY, fontSize, theme().textMuted(), false);
+            } else {
+                for (InputLine line : lines) {
+                    renderInputLine(tr, text, line, sensitiveRange, textX, lineY, fontSize, lineHeight);
+                    lineY += lineHeight;
+                }
+            }
+        }
+
+        int min = Math.min(selStart, selEnd);
+        int max = Math.max(selStart, selEnd);
+        if (max > min) {
+            for (int i = 0; i < lines.size(); i++) {
+                InputLine line = lines.get(i);
+                int lineStart = line.start();
+                int lineEnd = line.end();
+                int selA = Math.max(min, lineStart);
+                int selB = Math.min(max, lineEnd);
+                if (selB > selA) {
+                    float selX = textX + BetterChatTextSupport.width(BetterChatTextSupport.iosevkaRegular(), safeSub(text, lineStart, selA), fontSize);
+                    float selW = BetterChatTextSupport.width(BetterChatTextSupport.iosevkaRegular(), safeSub(text, selA, selB), fontSize);
+                    float sy = inputY + padY + i * lineHeight;
+                    drawRoundedRect(selX, sy, selW, lineHeight, 3.5f, withAlpha(theme().accent(), 0x4A));
+                }
+            }
+        }
+
+        int caretLine = BetterChatInputLayout.visualLineForCursor(lines, cursor);
+        float caretX = textX + BetterChatInputLayout.widthTo(text, lines, cursor, fontSize);
+        float caretY = inputY + padY + caretLine * lineHeight;
+        boolean blink = (System.currentTimeMillis() / 500L) % 2 == 0;
+        if (blink) {
+            float glyphHeight = tr != null ? ClickGuiRenderer.textHeight(tr, fontSize) : fontSize;
+            float caretHeight = GuiTextCaret.height(fontSize, glyphHeight);
+            drawRect(caretX, caretY + (lineHeight - caretHeight) * 0.5f,
+                    GuiTextCaret.width(fontSize), caretHeight,
+                    withAlpha(theme().textPrimary(), 0xD8));
+        }
+        if (clipped) ScissorFunction.pop();
+
+        if (BetterChatSearch.isActive() || BetterChatSearch.hasQuery()) {
+            String q = BetterChatSearch.isActive() ? "Search" : BetterChatSearch.getText();
+            float chipFont = Math.max(10f, fontSize * 0.72f);
+            String chipText = fitText(BetterChatTextSupport.interRegular(), q, chipFont, Math.max(36f, boxW * 0.28f));
+            float chipW = BetterChatTextSupport.width(BetterChatTextSupport.interRegular(), chipText, chipFont) + 14f;
+            float chipH = Math.min(22f, h - 8f);
+            float chipX = x + boxW - padX - chipW - counterReserve;
+            float chipY = inputY + (h - chipH) * 0.5f;
+            drawRoundedRect(chipX, chipY, chipW, chipH, chipH * 0.5f, withAlpha(theme().accentSoft(), BetterChatSearch.isActive() ? 0x66 : 0x40));
+            drawText(BetterChatTextSupport.interRegular(), chipText, chipX + 7f, chipY + (chipH - BetterChatTextSupport.height(BetterChatTextSupport.interRegular(), chipFont)) * 0.5f, chipFont,
+                    BetterChatSearch.hasQuery() ? theme().textPrimary() : theme().textMuted(), false);
+        }
+
+        if (!searchMode && remaining <= 20) {
+            String remStr = String.valueOf(Math.max(0, remaining));
+            float remSize = fontSize * 0.74f;
+            int remColor = remaining <= 5 ? withAlpha(theme().accent(), 0xFF) : withAlpha(theme().textMuted(), 0xCC);
+            drawText(BetterChatTextSupport.iosevkaRegular(), remStr, searchX + 2.0f,
+                    inputY + h + 3.0f,
+                    remSize, remColor, false);
+        }
+    }
+
+    private static void updatePasswordPrivacyState(String fieldText, ChatPasswordHeuristics.SensitiveRange range) {
+        if (range == null) {
+            passwordReveal = false;
+            passwordRevealProgress = 0f;
+            passwordInputSnapshot = "";
+            return;
+        }
+
+        String current = fieldText == null ? "" : fieldText;
+        if (!current.equals(passwordInputSnapshot)) {
+            // Editing a credential re-masks it immediately to prevent character disclosure.
+            passwordReveal = false;
+            passwordRevealProgress = 0f;
+            passwordInputSnapshot = current;
+        }
+        passwordRevealProgress = AnimationUtility.approach(
+                passwordRevealProgress,
+                passwordReveal ? 1f : 0f,
+                AnimationUtility.deltaTime(),
+                12.0f
+        );
+        passwordRevealProgress = AnimationUtility.snap(passwordRevealProgress, passwordReveal ? 1f : 0f, 0.015f);
+    }
+
+    private static void resetPasswordPrivacy() {
+        passwordReveal = false;
+        passwordRevealProgress = 0f;
+        passwordInputSnapshot = "";
+    }
+
+    private static void renderInputLine(TextRenderer tr,
+                                        String text,
+                                        InputLine line,
+                                        ChatPasswordHeuristics.SensitiveRange sensitiveRange,
+                                        float textX,
+                                        float lineY,
+                                        float fontSize,
+                                        float lineHeight) {
+        if (sensitiveRange == null || !sensitiveRange.intersects(line.start(), line.end())) {
+            drawText(tr, safeSub(text, line.start(), line.end()), textX, lineY, fontSize, theme().textPrimary(), true);
+            return;
+        }
+
+        int secretStart = Math.max(line.start(), sensitiveRange.start());
+        int secretEnd = Math.min(line.end(), sensitiveRange.end());
+        String before = safeSub(text, line.start(), secretStart);
+        String secret = safeSub(text, secretStart, secretEnd);
+        String after = safeSub(text, secretEnd, line.end());
+
+        float cursorX = textX;
+        if (!before.isEmpty()) {
+            drawText(tr, before, cursorX, lineY, fontSize, theme().textPrimary(), true);
+            cursorX += BetterChatTextSupport.width(tr, before, fontSize);
+        }
+
+        float secretW = Math.max(1f, BetterChatTextSupport.width(tr, secret, fontSize));
+        float easedReveal = AnimationUtility.smoothstep(passwordRevealProgress);
+        if (easedReveal > 0.01f && !secret.isEmpty()) {
+            int textAlpha = Math.round(255f * easedReveal);
+            drawText(tr, secret, cursorX, lineY, fontSize, withAlpha(theme().textPrimary(), textAlpha), true);
+        }
+
+        float maskAlpha = 1f - easedReveal;
+        if (maskAlpha > 0.01f) {
+            float maskPadX = 3.5f;
+            float maskH = Math.max(12f, fontSize * 0.88f);
+            float maskY = lineY + (lineHeight - maskH) * 0.5f;
+            float maskX = cursorX - maskPadX;
+            float maskW = Math.max(22f, secretW + maskPadX * 2f);
+            drawPasswordPrivacyMask(maskX, maskY, maskW, maskH, maskAlpha);
+        }
+
+        cursorX += secretW;
+        if (!after.isEmpty()) {
+            drawText(tr, after, cursorX, lineY, fontSize, theme().textPrimary(), true);
+        }
+    }
+
+    private static void drawPasswordPrivacyMask(float x, float y, float w, float h, float alpha) {
+        if (renderer == null || w <= 0f || h <= 0f) return;
+        float a = Mth.clamp(alpha, 0f, 1f);
+        int surfaceAlpha = Math.round(190f * a);
+        int gradientAlpha = Math.round(178f * a);
+        int strokeAlpha = Math.round(150f * a);
+        float radius = Math.min(5.5f, h * 0.5f);
+
+        renderer.roundedRect(x, y, w, h, radius, 1.0f, withAlpha(theme().windowBg(), surfaceAlpha));
+        HudRenderUtil.ThemeGradient fill = HudRenderUtil.themeAccentGradient(gradientAlpha);
+        renderer.roundedRectGradient(x, y, w, h, radius, 1.0f, fill.start(), fill.end(), fill.angleDeg());
+        HudRenderUtil.ThemeGradient stroke = HudRenderUtil.themeAccentGradient(strokeAlpha);
+        renderer.roundedRectStrokeGradient(x, y, w, h, radius, 1.0f, 0.7f, stroke.start(), stroke.end(), stroke.angleDeg());
+
+        // A small moving highlight keeps the privacy surface readable as an intentional control
+        // rather than a flat censor bar, while remaining fully theme-driven.
+        float shimmer = (AnimationUtility.time(0.00022f) % 1f);
+        float highlightW = Math.max(8f, w * 0.18f);
+        float highlightX = x + (w + highlightW) * shimmer - highlightW;
+        boolean clipped = ScissorFunction.pushRaw(x, y, w, h);
+        renderer.roundedRectGradient(
+                highlightX, y + 1f, highlightW, Math.max(1f, h - 2f),
+                Math.max(1f, radius - 1f), 1.0f,
+                withAlpha(0xFFFFFFFF, Math.round(30f * a)),
+                withAlpha(0xFFFFFFFF, 0),
+                0f
+        );
+        if (clipped) ScissorFunction.pop();
+    }
+
+     public static boolean onScroll(double delta) {
+        Minecraft mc = Minecraft.getInstance();
+        if (!BetterChat.isActive()) return false;
+        if (!(ClientScreen.current() instanceof ChatScreen)) return false;
+        MousePos mouse = resolveMouse(mc.mouseHandler.xpos(), mc.mouseHandler.ypos());
+        double mx = mouse.fx();
+        double my = mouse.fy();
+        double rawX = mouse.rawX();
+        double rawY = mouse.rawY();
+        boolean insideSuggest = isInsideSuggestWindow(mx, my, rawX, rawY);
+        if (insideSuggest) {
+            int step = delta > 0 ? -1 : 1;
+            int scrollable = Math.max(0, suggestTotal - suggestVisible);
+            suggestCurrentStart = Mth.clamp(suggestCurrentStart + step, 0, scrollable);
+            applySuggestionWindowState(suggestCurrentStart, suggestCurrentSelection);
+            return true;
+        }
+        int step = delta > 0 ? 3 : -3;
+        scrollOffsetLines = Mth.clamp(scrollOffsetLines + step, 0, maxScrollLines);
+        lastScrollInteractionMs = System.currentTimeMillis();
+        return false;
+    }
+
+    public static boolean onMouseButton(double mx, double my, int button, boolean pressed) {
+        Minecraft mc = Minecraft.getInstance();
+        if (!BetterChat.isActive()) return false;
+        if (!(ClientScreen.current() instanceof ChatScreen)) return false;
+
+        MousePos mouse = resolveMouse(mx, my);
+        double fx = mouse.fx();
+        double fy = mouse.fy();
+        boolean leftUp = button == GLFW.GLFW_MOUSE_BUTTON_LEFT && !pressed;
+
+        boolean overSuggestWindow = isInsideSuggestWindow(fx, fy, mouse.rawX(), mouse.rawY());
+
+        if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT && sbEnabled && isScrollbarHovered(fx, fy)) {
+            if (pressed) {
+                draggingScrollbar = true;
+                sbDragOffset = (fy >= sbThumbY && fy <= sbThumbY + sbThumbH)
+                        ? (float) fy - sbThumbY
+                        : sbThumbH * 0.5f;
+                scrollToPosition(fy);
+            } else {
+                draggingScrollbar = false;
+            }
+            return true;
+        }
+        if (draggingScrollbar) {
+            if (leftUp) draggingScrollbar = false;
+            return true;
+        }
+
+        float sTop = suggestRowsY;
+        boolean overSuggestRows = isInsideSuggestRows(fx, fy, mouse.rawX(), mouse.rawY());
+
+        if (suggestDraggingScrollbar) {
+            if (leftUp) suggestDraggingScrollbar = false;
+            return true;
+        }
+
+        if (suggestHasScrollbar && isInsideSuggestScrollbar(fx, fy)) {
+            if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+                if (pressed) {
+                    suggestDraggingScrollbar = true;
+                    scrollSuggestToPosition(fy);
+                }
+            }
+            return true;
+        }
+
+        if (overSuggestRows) {
+            if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT && pressed) {
+                int row = (int) ((fy - sTop) / suggestItemH);
+                row = Mth.clamp(row, 0, Math.max(0, suggestVisible - 1));
+                int idx = Mth.clamp(suggestStart + row, 0, Math.max(0, suggestTotal - 1));
+                applySuggestion(idx);
+                return true;
+            }
+            // block other clicks while over suggest box
+            return true;
+        }
+
+        if (overSuggestWindow) {
+            return true;
+        }
+
+        if (searchHit) {
+            boolean inside = fx >= searchRectX && fx <= searchRectX + searchRectW && fy >= searchRectY && fy <= searchRectY + searchRectH;
+            if (inside && button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+                if (pressed) {
+                    toggleSearchMode();
+                }
+                return true;
+            }
+            if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT && pressed) {
+                BetterChatSearch.setActive(false);
+            }
+        }
+
+        if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT && hasInputBox && !inputSearchSnapshot) {
+            boolean insideInputText = isInsideInputText(fx, fy);
+            if (pressed && insideInputText) {
+                if (ClientScreen.current() instanceof ChatScreen chatScreen) {
+                    EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+                    if (field != null) {
+                        int caret = inputCaretIndexAt(fx, fy);
+                        boolean extendSelection =
+                                InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_LEFT_SHIFT)
+                                        || InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_RIGHT_SHIFT);
+                        field.moveCursorTo(caret, extendSelection);
+                        inputCaretDragging = true;
+                        contextMenu = ContextMenu.closed();
+                        selection.clear();
+                        selecting = false;
+                        leftPending = false;
+                        return true;
+                    }
+                }
+            }
+            if (!pressed && inputCaretDragging) {
+                inputCaretDragging = false;
+                return true;
+            }
+        }
+
+        if (contextMenu.open) {
+            if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+                if (pressed && contextMenu.contains(fx, fy)) {
+                    ContextMenu.MenuEntry entry = contextMenu.pick(fy);
+                    if (entry != null) entry.action().run();
+                }
+                contextMenu = ContextMenu.closed();
+                return true;
+            }
+        }
+
+        boolean contextPress = button == GLFW.GLFW_MOUSE_BUTTON_RIGHT && pressed;
+        PickResult pick = contextPress ? frame.pickContext(fx, fy) : frame.pick(fx, fy);
+        if (pick == null) {
+            if (pressed && button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+                selection.clear();
+                selecting = false;
+                leftPending = false;
+            }
+            if (!pressed && button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+                selecting = false;
+            }
+            contextMenu = ContextMenu.closed();
+            return false;
+        }
+
+        boolean ctrlDown = InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_LEFT_CONTROL)
+                || InputConstants.isKeyDown(mc.getWindow(), GLFW.GLFW_KEY_RIGHT_CONTROL);
+
+        if (button == GLFW.GLFW_MOUSE_BUTTON_LEFT) {
+            if (pressed) {
+                // Кандидат на клик/выделение. Выделение начнём только при drag.
+                leftPending = true;
+                leftDownFx = fx;
+                leftDownFy = fy;
+                leftDownMsgIndex = pick.line().messageIndex();
+                leftDownCharIndex = pick.glyph().charIndex();
+                leftDownStyle = pick.glyph().style();
+                selecting = false;              // не выделяем сразу
+                contextMenu = ContextMenu.closed();
+                return true;                    // важно: блокируем ванильный suggest по клику
+            } else {
+                // отпускание ЛКМ
+                if (leftPending) {
+                    leftPending = false;
+
+                    if (selecting) {
+                        // закончили drag-выделение
+                        selecting = false;
+                        return true;
+                    }
+
+                    // одиночный клик (без drag)
+                    boolean handled = handleClickEvent(leftDownStyle, ctrlDown);
+                    if (!handled && ctrlDown) {
+                        handled = tryPrefillTellFromClick(leftDownMsgIndex, leftDownCharIndex);
+                    }
+                    if (!handled) selection.clear();
+                    return true; // блокируем ванильную обработку кликов по чату
+                }
+            }
+        } else if (button == GLFW.GLFW_MOUSE_BUTTON_RIGHT) {
+            if (pressed) {
+                openContextMenu(pick, mx, my, isExactGlyphHit(pick, fx, fy));
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static void onMouseMove(double mx, double my) {
+        if (!BetterChat.isActive()) return;
+        MousePos mouse = resolveMouse(mx, my);
+        double fx = mouse.fx();
+        double fy = mouse.fy();
+        if (draggingScrollbar) {
+            scrollToPosition(fy);
+            return;
+        }
+        if (suggestDraggingScrollbar) {
+            scrollSuggestToPosition(fy);
+            return;
+        }
+        if (isInsideSuggestWindow(fx, fy, mouse.rawX(), mouse.rawY())) return;
+
+        if (inputCaretDragging && !inputSearchSnapshot) {
+            if (ClientScreen.current() instanceof ChatScreen chatScreen) {
+                EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+                if (field != null) {
+                    field.moveCursorTo(inputCaretIndexAt(fx, fy), true);
+                }
+            }
+            return;
+        }
+
+        if (leftPending && !selecting) {
+            double dx = fx - leftDownFx;
+            double dy = fy - leftDownFy;
+            if (dx * dx + dy * dy >= DRAG_SELECT_THRESHOLD * DRAG_SELECT_THRESHOLD) {
+                selection.update(leftDownMsgIndex, leftDownCharIndex);
+                selecting = true;
+            } else {
+                // пока не потащили — не начинаем выделение
+                return;
+            }
+        }
+
+        if (!selecting) return;
+        PickResult pick = frame.pick(mouse.fx(), mouse.fy());
+        if (pick == null) {
+            pick = nearestFramePick(mouse.fx(), mouse.fy());
+        }
+        if (pick == null) return;
+        selection.updateCaret(pick.line().messageIndex(), selectionCaretIndex(pick.glyph()));
+    }
+
+    private static int selectionCaretIndex(GlyphBox glyph) {
+        if (glyph == null) return 0;
+        return Math.max(glyph.charIndex(), glyph.charEndExclusive() - 1);
+    }
+
+    private static PickResult nearestFramePick(double mx, double my) {
+        if (frame == null || frame.lines() == null || frame.lines().isEmpty()) return null;
+
+        FrameLine bestLine = null;
+        float bestDist = Float.MAX_VALUE;
+        for (FrameLine line : frame.lines()) {
+            float dy;
+            if (my < line.y0()) {
+                dy = (float) (line.y0() - my);
+            } else if (my > line.y1() + LINE_SPACING) {
+                dy = (float) (my - (line.y1() + LINE_SPACING));
+            } else {
+                dy = 0.0f;
+            }
+
+            if (dy < bestDist) {
+                bestDist = dy;
+                bestLine = line;
+            }
+        }
+
+        if (bestLine == null || bestLine.glyphs().isEmpty()) return null;
+        GlyphBox first = bestLine.glyphs().getFirst();
+        GlyphBox last = bestLine.glyphs().getLast();
+        GlyphBox glyph = mx <= first.x0() ? first : last;
+        return new PickResult(bestLine, glyph);
+    }
+
+    private static void openContextMenu(PickResult pick, double mx, double my, boolean exactGlyphHit) {
+        List<ContextMenu.MenuEntry> entries = new ArrayList<>();
+        ChatLine msg = pick.line().message();
+        String full = msg.text().getString();
+        BetterChat settings = BetterChat.get();
+        long ts = msg.timestampMs();
+        boolean tsEnabled = settings != null && settings.timestampEnabled();
+        boolean tsUnix = settings != null && settings.timestampToggles().get("hover_unix");
+
+        if (selection.appliesTo(pick.line().messageIndex()) && selection.hasRange()) {
+            String selected = selectedText();
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_selection"), () -> ClipboardUtil.copy(selected)));
+        } else {
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_message"), () -> ClipboardUtil.copy(full)));
+        }
+
+        ItemStack previewItem = resolvePreviewItem(pick, exactGlyphHit);
+        if (!previewItem.isEmpty()) {
+            ItemStack stack = previewItem.copy();
+            entries.add(new ContextMenu.MenuEntry(
+                    I18n.get("better_chat.context.preview_item"),
+                    () -> BetterChatItemInteraction.tryOpenPreview(stack)
+            ));
+        }
+
+        ContextActionResolution resolved = resolveMessageContextActions(pick, exactGlyphHit);
+        if (resolved.targetNick() != null && isOnlinePlayer(resolved.targetNick())) {
+            String nickToTell = resolved.targetNick();
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.reply"), () -> prefillTell(nickToTell)));
+        }
+
+        if (resolved.entityUuid() != null && !resolved.entityUuid().isEmpty()) {
+            String uuidToCopy = resolved.entityUuid();
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_uuid"), () -> ClipboardUtil.copy(uuidToCopy)));
+        }
+
+        appendResolvedClickActions(entries, resolved.clickEvents());
+        String actionToken = msg.rawMessage().actionToken();
+        if (actionToken != null) {
+            for (MessageActionRegistry.OfferedAction offered : ChatMessageActions.actions(actionToken)) {
+                String actionId = offered.qualifiedId();
+                MessageActionRegistry.Action action = offered.action();
+                if (action.enabled()) {
+                    entries.add(new ContextMenu.MenuEntry(action.label(), () -> ChatMessageActions.invoke(actionToken, actionId)));
+                }
+            }
+        }
+
+        if (tsEnabled) {
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_time"), () -> ClipboardUtil.copy(formatTimestamp(ts, settings.timestampSeconds()))));
+            entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_date"), () -> ClipboardUtil.copy(formatDate(ts))));
+            if (tsUnix) {
+                entries.add(new ContextMenu.MenuEntry(I18n.get("better_chat.context.copy_unix"), () -> ClipboardUtil.copy(String.valueOf(ts / 1000L))));
+            }
+        }
+
+        contextMenuAppearProgress = 0f;
+        contextMenu = ContextMenu.open((float) mx, (float) my, entries);
+    }
+
+    private static ContextActionResolution resolveMessageContextActions(PickResult pick, boolean exactGlyphHit) {
+        if (pick == null || pick.line() == null || pick.line().message() == null) {
+            return ContextActionResolution.empty();
+        }
+
+        ChatLine line = pick.line().message();
+        BetterChatMessage message = line.message();
+        String full = line.text().getString();
+        GlyphBox glyph = pick.glyph();
+
+        String targetNick = null;
+        List<String> nickCandidates = ChatNameUtil.extractNicks(full);
+        if (exactGlyphHit && glyph != null) {
+            String hovered = ChatNameUtil.normalizeNickCandidate(wordAt(full, glyph.charIndex()));
+            if (!hovered.isEmpty()
+                    && ChatNameUtil.isNickLike(hovered)
+                    && nickCandidates.stream().anyMatch(n -> n.equalsIgnoreCase(hovered))) {
+                targetNick = hovered;
+            }
+        }
+        if (targetNick == null && nickCandidates.size() == 1) {
+            targetNick = nickCandidates.getFirst();
+        }
+
+        String exactUuid = exactGlyphHit && glyph != null ? entityUuidFromStyle(glyph.style()) : null;
+        String entityUuid = exactUuid != null ? exactUuid : uniqueEntityUuid(message);
+        if (entityUuid == null && targetNick != null) {
+            entityUuid = onlinePlayerUuid(targetNick);
+        }
+
+        LinkedHashMap<String, ClickEvent> clickEvents = new LinkedHashMap<>();
+        if (exactGlyphHit && glyph != null) {
+            addContextClickEvent(clickEvents, glyph.style() == null ? null : glyph.style().getClickEvent());
+        }
+        collectMessageClickEvents(message, clickEvents);
+
+        return new ContextActionResolution(targetNick, entityUuid, List.copyOf(clickEvents.values()));
+    }
+
+    private static void appendResolvedClickActions(List<ContextMenu.MenuEntry> entries, List<ClickEvent> events) {
+        if (events == null || events.isEmpty()) return;
+        for (ClickEvent evt : events) {
+            if (evt instanceof ClickEvent.RunCommand run && ChatMessageActions.isLocalActionCommand(run.command())) continue;
+            switch (evt) {
+                case ClickEvent.OpenUrl openUrl -> {
+                    String value = openUrl.uri().toString();
+                    String summary = contextValueSummary(value);
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.open_link", summary),
+                            () -> handleClickEvent(evt, true)
+                    ));
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.copy_link", summary),
+                            () -> ClipboardUtil.copy(value)
+                    ));
+                }
+                case ClickEvent.OpenFile openFile -> {
+                    String value = openFile.path();
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.open_file", contextValueSummary(value)),
+                            () -> handleClickEvent(evt, true)
+                    ));
+                }
+                case ClickEvent.RunCommand run -> {
+                    String value = run.command();
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.insert_command", contextValueSummary(value)),
+                            () -> prefillChat(value)
+                    ));
+                }
+                case ClickEvent.SuggestCommand suggest -> {
+                    String value = suggest.command();
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.insert_command", contextValueSummary(value)),
+                            () -> prefillChat(value)
+                    ));
+                }
+                case ClickEvent.CopyToClipboard copy -> {
+                    String value = copy.value();
+                    entries.add(new ContextMenu.MenuEntry(
+                            I18n.get("better_chat.context.copy_value", contextValueSummary(value)),
+                            () -> ClipboardUtil.copy(value)
+                    ));
+                }
+                default -> {
+                    // Dialog/page/custom events are intentionally left to vanilla click handling.
+                }
+            }
+        }
+    }
+
+    private static void collectMessageClickEvents(BetterChatMessage message, Map<String, ClickEvent> out) {
+        if (message == null || out == null) return;
+        for (var node : message.nodes()) {
+            if (!(node instanceof TextNode text)) continue;
+            text.component().visit((style, value) -> {
+                addContextClickEvent(out, style == null ? null : style.getClickEvent());
+                return Optional.empty();
+            }, Style.EMPTY);
+        }
+    }
+
+    private static void addContextClickEvent(Map<String, ClickEvent> out, ClickEvent evt) {
+        if (out == null || evt == null) return;
+        String value = clickEventValue(evt);
+        if (value == null || value.isEmpty()) return;
+        String family = switch (evt) {
+            case ClickEvent.OpenUrl ignored -> "open_url";
+            case ClickEvent.OpenFile ignored -> "open_file";
+            case ClickEvent.RunCommand ignored -> "insert_command";
+            case ClickEvent.SuggestCommand ignored -> "insert_command";
+            case ClickEvent.CopyToClipboard ignored -> "copy_value";
+            default -> null;
+        };
+        if (family == null) return;
+        out.putIfAbsent(family + '\u0000' + value, evt);
+    }
+
+    private static String uniqueEntityUuid(BetterChatMessage message) {
+        if (message == null) return null;
+        String[] found = {null};
+        boolean[] ambiguous = {false};
+        for (var node : message.nodes()) {
+            if (!(node instanceof TextNode text)) continue;
+            text.component().visit((style, value) -> {
+                String uuid = entityUuidFromStyle(style);
+                if (uuid != null) {
+                    if (found[0] == null) {
+                        found[0] = uuid;
+                    } else if (!found[0].equals(uuid)) {
+                        ambiguous[0] = true;
+                    }
+                }
+                return Optional.empty();
+            }, Style.EMPTY);
+            if (ambiguous[0]) return null;
+        }
+        return found[0];
+    }
+
+    private static String entityUuidFromStyle(Style style) {
+        if (style == null) return null;
+        HoverEvent hover = style.getHoverEvent();
+        if (hover instanceof HoverEvent.ShowEntity(HoverEvent.EntityTooltipInfo entity)) {
+            return entity.uuid.toString();
+        }
+        return null;
+    }
+
+    private static String contextValueSummary(String value) {
+        if (value == null) return "";
+        String normalized = value.replace('\n', ' ').replace('\r', ' ').trim();
+        final int max = 34;
+        if (normalized.length() <= max) return normalized;
+        return normalized.substring(0, max - 1) + "…";
+    }
+
+    private static boolean isExactGlyphHit(PickResult pick, double mx, double my) {
+        if (pick == null || pick.glyph() == null) return false;
+        GlyphBox glyph = pick.glyph();
+        return mx >= glyph.x0() && mx <= glyph.x1() && my >= glyph.y0() && my <= glyph.y1();
+    }
+
+    public static void copySelectionToClipboard() {
+        String selected = selectedText();
+        if (selected.isEmpty()) return;
+        ClipboardUtil.copy(selected);
+    }
+
+    private static String selectedText() {
+        if (!selection.hasRange()) return "";
+        if (lastMessages == null || lastMessages.isEmpty()) return "";
+
+        int startMsg = Mth.clamp(selection.startContext(), 0, lastMessages.size() - 1);
+        int endMsg = Mth.clamp(selection.endContext(), 0, lastMessages.size() - 1);
+        if (endMsg < startMsg) return "";
+
+        StringBuilder out = new StringBuilder();
+        for (int msgIdx = startMsg; msgIdx <= endMsg; msgIdx++) {
+            ChatLine line = lastMessages.get(msgIdx);
+            if (line == null || line.text() == null) continue;
+
+            String full = line.text().getString();
+            int len = full.length();
+            int start = selection.startForLine(msgIdx);
+            int end = selection.endForLine(msgIdx);
+
+            int from = start == Integer.MIN_VALUE ? 0 : Mth.clamp(start, 0, len);
+            int toInclusive = end == Integer.MAX_VALUE ? Math.max(0, len - 1) : Mth.clamp(end, 0, Math.max(0, len - 1));
+            int to = Mth.clamp(toInclusive + 1, 0, len);
+
+            if (to > from) {
+                if (!out.isEmpty()) out.append(' ');
+                out.append(safeSub(full, from, to));
+            }
+        }
+        return out.toString();
+    }
+
+    private static boolean handleClickEvent(Style style, boolean ctrlDown) {
+        if (style == null) return false;
+        return handleClickEvent(style.getClickEvent(), ctrlDown);
+    }
+
+    private static boolean handleClickEvent(ClickEvent evt, boolean ctrlDown) {
+        if (evt == null) return false;
+        String val = clickEventValue(evt);
+        if (val == null || val.isEmpty()) return false;
+        try {
+            if (evt instanceof ClickEvent.OpenUrl || evt instanceof ClickEvent.OpenFile) {
+                Minecraft mc = Minecraft.getInstance();
+                if (ClientScreen.current() instanceof ChatScreen chat) {
+                    ClientScreen.show(mc, new ConfirmLinkScreen(confirm -> {
+                        if (confirm) Util.getPlatform().openUri(val);
+                        ClientScreen.show(mc, chat);
+                    }, val, false));
+                } else {
+                    Util.getPlatform().openUri(val);
+                }
+                return true;
+            } else if (evt instanceof ClickEvent.CopyToClipboard) {
+                ClipboardUtil.copy(val);
+                return true;
+            } else if (evt instanceof ClickEvent.RunCommand && ChatMessageActions.isLocalActionCommand(val)) {
+                return CommandManager.handle(val);
+            } else if (evt instanceof ClickEvent.RunCommand && val.startsWith("@")) {
+                return CommandManager.handle(val);
+            } else if (evt instanceof ClickEvent.SuggestCommand || evt instanceof ClickEvent.RunCommand) {
+                // Убираем нежелательный автокомплит: без Ctrl не подставляем команды в поле ввода.
+                if (!ctrlDown) return false;
+                prefillChat(val);
+                return true;
+            } else {
+                return false;
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+
+    private static String clickEventValue(ClickEvent evt) {
+        return switch (evt) {
+            case ClickEvent.OpenUrl openUrl -> openUrl.uri().toString();
+            case ClickEvent.OpenFile openFile -> openFile.path();
+            case ClickEvent.RunCommand run -> run.command();
+            case ClickEvent.SuggestCommand sug -> sug.command();
+            case ClickEvent.CopyToClipboard copy -> copy.value();
+            case ClickEvent.ShowDialog showDialog -> showDialog.dialog().value().toString();
+            case ClickEvent.ChangePage changePage -> String.valueOf(changePage.page());
+            case ClickEvent.Custom custom -> custom.id().toString();
+            default -> null;
+        };
+    }
+
+    private static boolean tryPrefillTellFromClick(int msgIndex, int charIndex) {
+        if (msgIndex < 0 || msgIndex >= lastMessages.size()) return false;
+        String full = lastMessages.get(msgIndex).text().getString();
+        List<String> nickCandidates = ChatNameUtil.extractNicks(full);
+        if (nickCandidates.isEmpty()) return false;
+
+        String hovered = ChatNameUtil.normalizeNickCandidate(wordAt(full, charIndex));
+        String targetNick = null;
+        if (!hovered.isEmpty()
+                && ChatNameUtil.isNickLike(hovered)
+                && nickCandidates.stream().anyMatch(n -> n.equalsIgnoreCase(hovered))) {
+            targetNick = hovered;
+        } else if (nickCandidates.size() == 1) {
+            targetNick = nickCandidates.getFirst();
+        }
+        if (!isOnlinePlayer(targetNick)) return false;
+        prefillTell(targetNick);
+        return true;
+    }
+
+    private static void prefillChat(String value) {
+        if (value == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (!(ClientScreen.current() instanceof ChatScreen chatScreen)) return;
+        EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+        if (field == null) return;
+        field.setValue(value);
+        setCursorSafe(field, value.length());
+    }
+
+    private static void prefillTell(String nick) {
+        Minecraft mc = Minecraft.getInstance();
+        if (!(ClientScreen.current() instanceof ChatScreen chatScreen)) return;
+        if (!isOnlinePlayer(nick)) return;
+        EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+        if (field == null) return;
+        String value = "/tell " + nick + " ";
+        field.setValue(value);
+    }
+
+    public static void applyAutoPrefixIfNeeded(EditBox field) {
+        // Compact BetterChat no longer owns chat-prefix chips; hook kept for compatibility.
+    }
+
+    private static boolean isOnlinePlayer(String nick) {
+        return onlinePlayerUuid(nick) != null;
+    }
+
+    private static String onlinePlayerUuid(String nick) {
+        if (nick == null || nick.isEmpty()) return null;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.player == null || mc.player.connection == null) return null;
+        return mc.player.connection.getOnlinePlayers().stream()
+                .filter(e -> e.getProfile() != null && nick.equalsIgnoreCase(e.getProfile().name()))
+                .map(e -> e.getProfile().id().toString())
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static int withAlpha(int argb, int alpha) {
+        return (argb & 0x00FFFFFF) | ((alpha & 0xFF) << 24);
+    }
+
+    private static int mulAlpha(int argb, float a) {
+        int alpha = (int) (((argb >>> 24) & 0xFF) * a);
+        return (argb & 0x00FFFFFF) | (Mth.clamp(alpha, 0, 255) << 24);
+    }
+
+    private static void renderSearchIcon(float x, float y, float w, float h, boolean active, boolean hasQuery) {
+        boolean hover = lastMouseValid && lastMouseFx >= x && lastMouseFx <= x + w && lastMouseFy >= y && lastMouseFy <= y + h;
+        float radius = h * 0.5f;
+        int bg = active
+                ? withAlpha(theme().accent(), 0x8E)
+                : (hasQuery ? withAlpha(theme().accentSoft(), 0x8A) : withAlpha(theme().surface(), hover ? 0xC0 : 0xA2));
+        int tint = withAlpha(theme().accent(), active ? 0x30 : (hasQuery ? 0x24 : 0x18));
+        int strokeA = active ? withAlpha(theme().accent(), 0xC8) : withAlpha(theme().textPrimary(), hover ? 0x38 : 0x24);
+        int strokeB = withAlpha(theme().accentSoft(), active ? 0x86 : (hasQuery ? 0x66 : 0x40));
+
+        drawRoundedRect(x, y, w, h, radius, bg);
+        drawRoundedRect(x + 1f, y + 1f, w - 2f, h - 2f, Math.max(0f, radius - 1f), tint);
+        drawRoundedRectStrokeGradient(x, y, w, h, radius, 0.7f, strokeA, strokeB);
+
+        TextRenderer icons = BuiltinFontCatalog.ICONS.renderer(BetterChatTextSupport.interRegular());
+        String icon = "s";
+        float iconSize = h * 0.50f;
+        float iconW = BetterChatTextSupport.width(icons, icon, iconSize);
+        float iconH = BetterChatTextSupport.height(icons, iconSize);
+        int iconColor = active || hasQuery ? theme().textPrimary() : withAlpha(theme().textPrimary(), hover ? 0xD8 : 0xB8);
+        drawText(icons, icon, x + (w - iconW) * 0.5f, y + (h - iconH) * 0.5f - h * 0.015f, iconSize, iconColor, false);
+    }
+
+    private static void drawLiquidHoverPill(float x, float y, float w, float h, float radius, float alpha) {
+        if (renderer == null || w <= 0f || h <= 0f || alpha <= 0.001f) return;
+        flushRenderer();
+        renderer.liquidGlassRect(
+                x, y, w, h,
+                Math.max(1.0f, radius),
+                withAlpha(theme().accentSoft(), 0x24),
+                Mth.clamp(alpha, 0.0f, 1.0f),
+                1.0f,
+                Renderer2D.LiquidGlassPreset.HUD_SMALL,
+                1.2f
+        );
+        drawRoundedRect(x, y, w, h, radius, withAlpha(theme().surfaceHover(), 0x32));
+        drawRoundedRectStrokeGradient(x, y, w, h, radius, 0.55f,
+                withAlpha(theme().accentSoft(), 0x50),
+                withAlpha(theme().accent(), 0x34));
+    }
+
+    private static void drawScrollbarGlass(float trackX,
+                                           float trackY,
+                                           float trackW,
+                                           float trackH,
+                                           float thumbY,
+                                           float thumbH,
+                                           boolean hot,
+                                           int trackAlpha,
+                                           int thumbAlpha) {
+        if (renderer == null || trackW <= 0f || trackH <= 0f || thumbH <= 0f) return;
+
+        SettingsGuiPalette palette = SettingsGuiPalette.current();
+        int trackA = withAlpha(palette.moduleScrollTrackA(), trackAlpha);
+        int trackB = withAlpha(palette.moduleScrollTrackB(), Math.min(255, trackAlpha + 0x18));
+        int handleA = withAlpha(palette.moduleScrollHandleA(), thumbAlpha);
+        int handleB = withAlpha(palette.moduleScrollHandleB(), Math.min(255, thumbAlpha + 0x0C));
+        float radius = trackW * 0.5f;
+
+        // Identical structure to ClickGui Modules/Settings: one vertical gradient for the track
+        // and one for the handle. No rail, highlight, stroke or hover-width decoration.
+        renderer.roundedRectGradientQuad(
+                trackX, trackY, trackW, trackH, radius, 1.0f,
+                trackA, trackB, trackB, trackA
+        );
+        renderer.roundedRectGradientQuad(
+                trackX, thumbY, trackW, thumbH, radius, 1.0f,
+                handleA, handleB, handleB, handleA
+        );
+    }
+
+    private static void drawGlassPill(float x, float y, float w, float h, float radius, float alpha, boolean softPanel) {
+        if (renderer == null || w <= 0f || h <= 0f) return;
+
+        BetterChat settings = BetterChat.get();
+        float drawAlpha = Mth.clamp(alpha, 0.0f, 1.0f);
+        if (drawAlpha <= 0.001f) return;
+        float configuredAlpha = settings != null ? settings.liquidGlassAlphaFactor() : (230f / 255f);
+        float materialAlpha = drawAlpha;
+        float glassRadius = Math.max(2f, radius);
+        Renderer2D.LiquidGlassPreset preset = softPanel
+                ? Renderer2D.LiquidGlassPreset.HUD_LARGE
+                : Renderer2D.LiquidGlassPreset.HUD_SMALL;
+
+        flushRenderer();
+        renderer.liquidGlassRect(
+                x, y, w, h,
+                glassRadius,
+                withAlpha(theme().accent(), Math.round(configuredAlpha * (softPanel ? 32f : 22f))),
+                materialAlpha,
+                1.0f,
+                preset,
+                softPanel ? 2.65f : 2.25f
+        );
+
+        int veilAlpha = Math.round((softPanel ? 0x16 : 0x0C) * drawAlpha);
+        if (veilAlpha > 0) {
+            drawRoundedRect(x, y, w, h, glassRadius, withAlpha(theme().windowBg(), veilAlpha));
+        }
+    }
+
+    private static String fitText(TextRenderer font, String text, float size, float maxWidth) {
+        text = NameProtect.applyDisplay(text);
+        if (text == null) return "";
+        if (BetterChatTextSupport.width(font, text, size) <= maxWidth) return text;
+        String suffix = "...";
+        float suffixW = BetterChatTextSupport.width(font, suffix, size);
+        int end = text.length();
+        while (end > 0 && BetterChatTextSupport.width(font, text.substring(0, end), size) + suffixW > maxWidth) {
+            end--;
+        }
+        return end <= 0 ? suffix : text.substring(0, end) + suffix;
+    }
+
+     private static void drawText(TextRenderer tr, String text, float x, float y, float size, int argb, boolean shadow) {
+        text = NameProtect.applyDisplay(text);
+        if (tr == null || text == null || text.isEmpty()) return;
+        if (((argb >>> 24) & 0xFF) <= 0) return;
+        float scale = BetterChatTextSupport.scale(size);
+        float svgSize = BetterChatTextSupport.svgGlyphSize(tr, size, shadow);
+        float svgY = y + (BetterChatTextSupport.height(tr, size) - svgSize) * 0.5f;
+        applyColor(argb);
+        TextRenderer current = null;
+        float cursorX = x;
+        try {
+            for (int i = 0; i < text.length(); ) {
+                int cp = text.codePointAt(i);
+                if (TextGlyphFallback.shouldUseVanillaSvg(tr, cp)) {
+                    if (current != null) {
+                        current.end();
+                        current = null;
+                    }
+                    String svgName = TextGlyphFallback.vanillaSvgName(cp);
+                    if (renderer != null && svgName != null) {
+                        renderer.svg(svgName, cursorX, svgY, svgSize, svgSize,
+                                SvgRenderOptions.fromFile().withAlpha(((argb >>> 24) & 0xFF) / 255.0f));
+                    }
+                    cursorX += svgSize;
+                    i += Character.charCount(cp);
+                    continue;
+                }
+                String glyph = new String(Character.toChars(cp));
+                TextRenderer next = BetterChatTextSupport.rendererForGlyph(tr, cp);
+                if (next != current) {
+                    if (current != null) current.end();
+                    current = next;
+                    current.begin(scale, false, false);
+                }
+                cursorX = (float) current.render(glyph, cursorX, y, TMP_COLOR, shadow);
+                i += Character.charCount(cp);
+            }
+        } finally {
+            if (current != null) current.end();
+        }
+    }
+
+    private static void drawRoundedRect(float x, float y, float w, float h, float radius, int argb) {
+        if (renderer == null) return;
+        if (((argb >>> 24) & 0xFF) <= 0) return;
+        BetterChat cfg = BetterChat.get();
+        boolean useGradient = cfg != null && cfg.gradientEnabled();
+        HudRenderUtil.drawHudBackground(renderer, x, y, w, h, radius, 1.1f, argb, useGradient);
+    }
+
+    private static void drawRoundedRectStrokeGradient(float x, float y, float w, float h, float radius, float thickness,
+                                                      int startArgb, int endArgb) {
+        if (renderer == null) return;
+        if (((startArgb >>> 24) & 0xFF) <= 0 && ((endArgb >>> 24) & 0xFF) <= 0) return;
+        renderer.roundedRectStrokeGradient(x, y, w, h, radius, 1.1f, thickness, startArgb, endArgb, (float) 0.0);
+    }
+
+    private static void drawRect(float x, float y, float w, float h, int argb) {
+        if (renderer == null) return;
+        if (((argb >>> 24) & 0xFF) <= 0) return;
+        renderer.quad(x, y, w, h, argb);
+    }
+
+    private static void flushRenderer() {
+        if (renderer == null) return;
+        if (Renderer2D.isBatching()) {
+            Renderer2D.flushBatch();
+        } else {
+            renderer.begin();
+        }
+    }
+
+    private static void applyColor(int argb) {
+        BetterChatRenderer.TMP_COLOR.a = (argb >>> 24) & 0xFF;
+        BetterChatRenderer.TMP_COLOR.r = (argb >>> 16) & 0xFF;
+        BetterChatRenderer.TMP_COLOR.g = (argb >>> 8) & 0xFF;
+        BetterChatRenderer.TMP_COLOR.b = argb & 0xFF;
+    }
+
+    private static String safeSub(String s, int start, int end) {
+        if (s == null) return "";
+        int len = s.length();
+        start = Math.max(0, Math.min(len, start));
+        end = Math.max(0, Math.min(len, end));
+        if (end < start) {
+            int t = start;
+            start = end;
+            end = t;
+        }
+        return s.substring(start, end);
+    }
+
+    private static boolean isInsideInputText(double x, double y) {
+        return hasInputBox
+                && x >= inputTextX
+                && x <= inputTextX + inputTextW
+                && y >= inputBoxY
+                && y <= inputBoxY + inputBoxH;
+    }
+
+    private static int inputCaretIndexAt(double mouseX, double mouseY) {
+        String text = inputTextSnapshot == null ? "" : inputTextSnapshot;
+        List<InputLine> lines = inputLinesSnapshot;
+        if (lines == null || lines.isEmpty()) return 0;
+
+        float lineHeight = Math.max(1f, inputLineHeight);
+        int lineIndex = Mth.clamp((int) Math.floor((mouseY - inputTextY) / lineHeight), 0, lines.size() - 1);
+        InputLine line = lines.get(lineIndex);
+
+        double localX = mouseX - inputTextX;
+        if (localX <= 0.0) return line.start();
+        if (localX >= line.width()) return line.end();
+
+        float advance = 0f;
+        int index = Mth.clamp(line.start(), 0, text.length());
+        int lineEnd = Mth.clamp(line.end(), index, text.length());
+        TextRenderer tr = BetterChatTextSupport.iosevkaRegular();
+
+        while (index < lineEnd) {
+            int cp = text.codePointAt(index);
+            int cpLen = Character.charCount(cp);
+            if (index + cpLen > lineEnd) break;
+
+            String glyph = new String(Character.toChars(cp));
+            float glyphW = BetterChatTextSupport.width(tr, glyph, inputFontSize);
+            if (localX < advance + glyphW * 0.5f) {
+                return index;
+            }
+            advance += glyphW;
+            index += cpLen;
+        }
+        return lineEnd;
+    }
+
+    /**
+     * Toggles visibility only for the currently detected credential range.
+     * Editing the credential still re-masks immediately.
+     */
+    public static void togglePasswordRevealFromBind() {
+        BetterChat cfg = BetterChat.get();
+        if (cfg == null || !cfg.passwordPrivacy()) {
+            Notifier.warning(I18n.get("better_chat.password.privacy_disabled"));
+            return;
+        }
+        if (!(ClientScreen.current() instanceof ChatScreen chatScreen)) return;
+
+        EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+        if (field == null) return;
+
+        String current = field.getValue();
+        ChatPasswordHeuristics.SensitiveRange range = ChatPasswordHeuristics.sensitiveRange(current);
+        if (range == null) {
+            passwordReveal = false;
+            passwordRevealProgress = 0f;
+            passwordInputSnapshot = current == null ? "" : current;
+            Notifier.info(I18n.get("better_chat.password.nothing_hidden"));
+            return;
+        }
+
+        passwordReveal = !passwordReveal;
+        passwordInputSnapshot = current == null ? "" : current;
+        Notifier.info(I18n.get(passwordReveal
+                ? "better_chat.password.revealed"
+                : "better_chat.password.hidden"));
+    }
+
+    private static int selectionStart(EditBox field, int fallback) {
+        if (field == null) return fallback;
+        return Mth.clamp(field.getCursorPosition(), 0, field.getValue().length());
+    }
+
+    private static int selectionEnd(EditBox field, int fallback) {
+        if (field == null) return fallback;
+        try {
+            return Mth.clamp(((TextFieldWidgetAccessor) field).havoc$getSelectionEnd(), 0, field.getValue().length());
+        } catch (Throwable ignored) {
+            String selected = field.getHighlighted();
+            int cursor = selectionStart(field, fallback);
+            if (selected == null || selected.isEmpty()) return cursor;
+            return Mth.clamp(cursor + selected.length(), 0, field.getValue().length());
+        }
+    }
+
+    private static void setCursorSafe(EditBox field, int pos) {
+        if (field == null) return;
+        field.moveCursorTo(Mth.clamp(pos, 0, field.getValue().length()), false);
+    }
+
+    private static String wordAt(String text, int charIndex) {
+        if (text == null || text.isEmpty()) return "";
+        int idx = Mth.clamp(charIndex, 0, Math.max(0, text.length() - 1));
+        int start = idx;
+        while (start > 0 && !Character.isWhitespace(text.charAt(start - 1))) start--;
+        int end = idx;
+        while (end < text.length() && !Character.isWhitespace(text.charAt(end))) end++;
+        if (end <= start) return "";
+        return text.substring(start, end).replaceAll("[<>:\\[\\]]", "");
+    }
+
+    private static MousePos resolveMouse(double rawX, double rawY) {
+        // No scaling; keep raw and framebuffer identical.
+        return new MousePos(rawX, rawY, rawX, rawY);
+    }
+
+    public static void resetScroll() {
+        scrollOffsetLines = 0;
+        smoothScrollOffsetLines = 0f;
+        draggingScrollbar = false;
+        sbEnabled = false;
+        sbDragOffset = 0f;
+    }
+
+    public static float getLastWidth() {
+        return lastRenderWidth;
+    }
+
+    public static float getLastHeight() {
+        return lastRenderHeight;
+    }
+
+    public static boolean contains(float mx, float my) {
+        return isInteractive(mx, my);
+    }
+
+    public static boolean isInteractive(float mx, float my) {
+        boolean inChat = chatHitW > 0f && mx >= chatHitX && mx <= chatHitX + chatHitW && my >= chatHitY && my <= chatHitY + chatHitH;
+        boolean inSearch = searchHit && mx >= searchRectX && mx <= searchRectX + searchRectW && my >= searchRectY && my <= searchRectY + searchRectH;
+        boolean inInput = hasInputBox && mx >= inputBoxX && mx <= inputBoxX + inputBoxW && my >= inputBoxY && my <= inputBoxY + inputBoxH;
+        boolean inSuggest = isInsideSuggestWindow(mx, my);
+        boolean inContext = contextMenu.open && contextMenu.contains(mx, my);
+        boolean inScrollbar = sbEnabled && isScrollbarHovered(mx, my);
+        return inChat || inSearch || inInput || inSuggest || inContext || inScrollbar;
+    }
+
+    public static void onNewMessage() {
+        if (scrollOffsetLines > 0 && scrollOffsetLines <= 2) {
+            scrollOffsetLines = 0;
+            smoothScrollOffsetLines = 0f;
+        }
+    }
+
+    private static boolean isInsideSuggestRows(double mx, double my) {
+        if (!suggestActive) return false;
+        return mx >= suggestRowsX && mx <= suggestRowsX + suggestRowsW
+                && my >= suggestRowsY && my <= suggestRowsY + suggestRowsH;
+    }
+
+    private static boolean isInsideSuggestRows(double mx, double my, double rawX, double rawY) {
+        return isInsideSuggestRows(mx, my) || isInsideSuggestRows(rawX, rawY);
+    }
+
+    private static boolean isInsideSuggestWindow(double mx, double my) {
+        if (!suggestActive) return false;
+        return mx >= suggestX && mx <= suggestX + suggestW && my >= suggestY && my <= suggestY + suggestH;
+    }
+
+    private static boolean isInsideSuggestWindow(double mx, double my, double rawX, double rawY) {
+        return isInsideSuggestWindow(mx, my) || isInsideSuggestWindow(rawX, rawY);
+    }
+
+    private static boolean isInsideSuggestScrollbar(double mx, double my) {
+        if (!suggestActive || !suggestHasScrollbar) return false;
+        float hitPad = 4f;
+        return mx >= suggestTrackX - hitPad &&
+                mx <= suggestTrackX + suggestTrackW + hitPad &&
+                my >= suggestTrackY - hitPad &&
+                my <= suggestTrackY + suggestTrackH + hitPad;
+    }
+
+    private static float computeWidth(int screenW, float ratio) {
+        float clamped = Mth.clamp(ratio, 0.2f, 0.8f);
+        float w = screenW * clamped;
+        return Mth.clamp(w, 320f, 560f);
+    }
+
+    private static BetterChatStore buildPreviewStore() {
+        if (previewStore == null) {
+            BetterChatStore store = new BetterChatStore();
+            store.add(Component.literal("Better Chat"));
+            store.add(Component.literal("Drag to position"));
+            store.add(Component.literal("Messages appear here"));
+            previewStore = store;
+        }
+        return previewStore;
+    }
+
+    private static void renderScrollbar(
+            float boxX,
+            float boxY,
+            float boxW,
+            float boxH,
+            int startLine,
+            int visibleLines,
+            int totalLines,
+            double mouseX,
+            double mouseY) {
+        if (visibleLines <= 0 || totalLines <= visibleLines) {
+            sbEnabled = false;
+            draggingScrollbar = false;
+            return;
+        }
+
+        int scrollable = Math.max(1, totalLines - visibleLines);
+        boolean hot = draggingScrollbar || isScrollbarHovered(mouseX, mouseY);
+        boolean recently = System.currentTimeMillis() - lastScrollInteractionMs < 850L;
+        float trackW = 5.0f;
+        float trackX = boxX - trackW - 7f;
+        float trackY = boxY + 10f;
+        float trackH = Math.max(16f, boxH - 20f);
+        float thumbH = Math.max(18f, trackH * ((float) visibleLines / (float) totalLines));
+        float ratio = (float) startLine / (float) scrollable;
+        float thumbY = trackY + (trackH - thumbH) * Mth.clamp(ratio, 0f, 1f);
+
+        sbTrackX = trackX;
+        sbTrackY = trackY;
+        sbTrackW = trackW;
+        sbTrackH = trackH;
+        sbThumbY = thumbY;
+        sbThumbH = thumbH;
+        sbEnabled = true;
+
+        if (hot || draggingScrollbar) {
+            SystemCursor.set(SystemCursor.CursorType.SCROLL);
+        }
+
+        int trackAlpha = hot ? 0xB8 : (recently ? 0x9C : 0x84);
+        int thumbAlpha = hot ? 0xFF : (recently ? 0xEC : 0xD4);
+        drawScrollbarGlass(trackX, trackY, trackW, trackH, thumbY, thumbH, hot, trackAlpha, thumbAlpha);
+    }
+
+    private static boolean isScrollbarHovered(double mx, double my) {
+        float hitPad = 5f;
+        return sbEnabled &&
+                mx >= sbTrackX - hitPad &&
+                mx <= sbTrackX + sbTrackW + hitPad &&
+                my >= sbTrackY - hitPad &&
+                my <= sbTrackY + sbTrackH + hitPad;
+    }
+
+    private static void scrollToPosition(double my) {
+        if (!sbEnabled || sbVisibleLines <= 0 || sbTotalLines <= sbVisibleLines) return;
+        float trackSpan = sbTrackH - sbThumbH;
+        if (trackSpan <= 0f) return;
+        float rel = (float) (my - sbTrackY - sbDragOffset);
+        float t = Mth.clamp(rel / trackSpan, 0f, 1f);
+        int scrollable = Math.max(0, sbTotalLines - sbVisibleLines);
+        int targetStart = Math.round(t * scrollable);
+        scrollOffsetLines = Mth.clamp(sbTotalLines - sbVisibleLines - targetStart, 0, scrollable);
+        lastScrollInteractionMs = System.currentTimeMillis();
+    }
+
+    private static void scrollSuggestToPosition(double my) {
+        if (!suggestHasScrollbar || suggestVisible <= 0 || suggestTotal <= suggestVisible) return;
+        float trackSpan = suggestTrackH - suggestThumbH;
+        if (trackSpan <= 0f) return;
+        float rel = (float) (my - suggestTrackY - suggestThumbH * 0.5f);
+        float t = Mth.clamp(rel / trackSpan, 0f, 1f);
+        int scrollable = Math.max(0, suggestTotal - suggestVisible);
+        int targetStart = Math.round(t * scrollable);
+        suggestCurrentStart = Mth.clamp(targetStart, 0, scrollable);
+        applySuggestionWindowState(suggestCurrentStart, suggestCurrentSelection);
+    }
+
+    private static void applySuggestionWindowState(int start, int selection) {
+        if (suggestWindow == null) return;
+        SuggestionWindowAccessor acc = (SuggestionWindowAccessor) suggestWindow;
+        acc.setHavoc$inWindowIndex(Math.max(0, start));
+        if (selection >= 0) {
+            acc.setHavoc$selection(selection);
+        }
+    }
+
+    private static void applySuggestion(int idx) {
+        Minecraft mc = Minecraft.getInstance();
+        if (!(ClientScreen.current() instanceof ChatScreen chatScreen)) return;
+        EditBox field = ((ChatScreenAccessor) chatScreen).getChatField();
+        if (field == null) return;
+
+        // Update vanilla selection state for completeness
+        if (suggestWindow != null) {
+            SuggestionWindowAccessor acc = (SuggestionWindowAccessor) suggestWindow;
+            acc.setHavoc$selection(idx);
+        }
+
+        if (idx < 0 || idx >= suggestEntries.size()) return;
+        com.mojang.brigadier.suggestion.Suggestion suggestion = suggestEntries.get(idx);
+        String current = field.getValue();
+        try {
+            String applied = suggestion.apply(current);
+            field.setValue(applied);
+            setCursorSafe(field, applied.length());
+            suggestCurrentSelection = idx;
+            applySuggestionWindowState(suggestCurrentStart, suggestCurrentSelection);
+        } catch (Exception e) {
+        }
+    }
+
+    private static CommandSuggestorBridge.SuggestionSnapshot buildCustomSnapshot(String text, int cursor) {
+        List<com.mojang.brigadier.suggestion.Suggestion> suggestions = CommandManager.suggest(text, cursor);
+        if (suggestions == null || suggestions.isEmpty()) return null;
+        List<String> texts = new ArrayList<>(suggestions.size());
+        for (com.mojang.brigadier.suggestion.Suggestion s : suggestions) {
+            texts.add(s.getText());
+        }
+        int selection = 0;
+        int start = 0;
+        int visible = Math.min(5, Math.max(1, suggestions.size()));
+        return new CommandSuggestorBridge.SuggestionSnapshot(0, 0, 0, 0, texts, suggestions, selection, start, visible);
+    }
+
+    @SuppressWarnings("unused")
+    public static void setSuggestionContext(ChatScreen screen, GuiGraphicsExtractor context, int mouseX, int mouseY) {
+        storedScreen = screen;
+    }
+
+    private static char commandPrefix(String text) {
+        if (text == null) return 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            if (c == '/' || c == '@') return c;
+            return 0;
+        }
+        return 0;
+    }
+
+    private static boolean refreshSuggestionsIfNeeded(String text, int cursor, int selStart, int selEnd) {
+        if (text.equals(lastSuggestInput)
+                && cursor == lastSuggestCursor
+                && selStart == lastSuggestSelStart
+                && selEnd == lastSuggestSelEnd) {
+            return false;
+        }
+        lastSuggestInput = text;
+        lastSuggestCursor = cursor;
+        lastSuggestSelStart = selStart;
+        lastSuggestSelEnd = selEnd;
+        return true;
+    }
+
+    private static void resetSuggestionTracking() {
+        lastSuggestInput = "";
+        lastSuggestCursor = -1;
+        lastSuggestSelStart = -1;
+        lastSuggestSelEnd = -1;
+        lastSnapshot = null;
+        lastSuggestionHash = 0;
+        suggestWindow = null;
+        suggestEntries = Collections.emptyList();
+        suggestRowsX = suggestRowsY = suggestRowsW = suggestRowsH = 0f;
+        suggestCurrentStart = -1;
+        suggestCurrentSelection = -1;
+        suggestAppearProgress = 0f;
+    }
+
+    private static void renderSuggestions() {
+        boolean wasSuggestActive = suggestActive;
+        suggestActive = false;
+        suggestHasScrollbar = false;
+        if (storedScreen == null) return;
+        EditBox field = ((ChatScreenAccessor) storedScreen).getChatField();
+        String text = field != null ? field.getValue() : null;
+        if (field == null || text == null || text.isEmpty()) {
+            storedScreen = null;
+            resetSuggestionTracking();
+            return;
+        }
+
+        int cursor = field.getCursorPosition();
+        int selStart = selectionStart(field, cursor);
+        int selEnd = selectionEnd(field, cursor);
+
+        char prefix = commandPrefix(text);
+        if (prefix == 0) {
+            storedScreen = null;
+            resetSuggestionTracking();
+            return;
+        }
+
+        boolean inputChanged = refreshSuggestionsIfNeeded(text, cursor, selStart, selEnd);
+        boolean windowChanged = false;
+        if (prefix == '/') {
+            windowChanged = CommandSuggestorBridge.peekWindow(storedScreen) != CommandSuggestorBridge.lastWindow();
+        }
+        if (inputChanged || windowChanged || lastSnapshot == null) {
+            if (prefix == '@') {
+                lastSnapshot = buildCustomSnapshot(text, cursor);
+            } else {
+                lastSnapshot = CommandSuggestorBridge.snapshot(storedScreen);
+            }
+        }
+        CommandSuggestorBridge.SuggestionSnapshot snap = lastSnapshot;
+        if (snap == null) {
+            storedScreen = null;
+            resetSuggestionTracking();
+            return;
+        }
+        if (prefix == '@') {
+            suggestWindow = null;
+        }
+
+        // Debug logging once per snapshot content to confirm suggestions arrive
+        int hash = snap.texts().hashCode() ^ snap.selection() ^ snap.startIndex();
+        boolean snapshotChanged = hash != lastSuggestionHash;
+        if (snapshotChanged) {
+            lastSuggestionHash = hash;
+}
+        suggestEntries = snap.suggestions();
+
+        int total = snap.texts().size();
+        int visible = Math.min(5, Math.max(1, total - snap.startIndex()));
+        int scrollable = Math.max(0, total - visible);
+
+        if (snapshotChanged) {
+            suggestCurrentStart = Mth.clamp(snap.startIndex(), 0, scrollable);
+            suggestCurrentSelection = Mth.clamp(snap.selection(), 0, Math.max(0, total - 1));
+        }
+        if (suggestCurrentStart < 0) {
+            suggestCurrentStart = Mth.clamp(snap.startIndex(), 0, scrollable);
+        } else {
+            suggestCurrentStart = Mth.clamp(suggestCurrentStart, 0, scrollable);
+        }
+        if (suggestCurrentSelection < 0) {
+            suggestCurrentSelection = Mth.clamp(snap.selection(), 0, Math.max(0, total - 1));
+        } else {
+            suggestCurrentSelection = Mth.clamp(suggestCurrentSelection, 0, Math.max(0, total - 1));
+        }
+        applySuggestionWindowState(suggestCurrentStart, suggestCurrentSelection);
+
+        float baseFont = Math.max(10f, lastFontSizeForUi * 0.95f);
+        float itemH = baseFont + 6f;
+
+        float screenW = Minecraft.getInstance().getWindow().getWidth();
+        float h = itemH * visible + 6f;
+        float x;
+        float w;
+        float y;
+
+        if (hasInputBox && inputBoxW > 0f) {
+            x = inputBoxX;
+            float needed = textWidthRange(snap.texts(), snap.startIndex(), visible, baseFont) + 18f;
+            w = Math.max(140f, Math.min(inputBoxW, Math.max(needed, 0f)));
+            y = inputBoxY - h - 4f;
+        } else {
+            double scale = Minecraft.getInstance().getWindow().getGuiScale();
+            x = Math.max(4f, (float) (snap.x() * scale));
+            float snapW = snap.w() > 0 ? (float) (snap.w() * scale) : 200f;
+            float needed = textWidthRange(snap.texts(), snap.startIndex(), visible, baseFont) + 18f;
+            w = Math.max(140f, Math.max(needed, snapW));
+            y = (float) (snap.y() * scale) - h - 2f;
+        }
+        if (y < 4f) y = 4f;
+        if (x + w > screenW - 4f) x = screenW - w - 4f;
+
+        // avoid zero-size windows
+        if (w <= 2f || h <= 2f || snap.texts().isEmpty()) {
+            storedScreen = null;
+            return;
+        }
+
+        boolean hasScrollbar = total > visible;
+        float scrollbarReserve = hasScrollbar ? 13f : 0f;
+        float maxTextWidth = textWidthRange(snap.texts(), snap.startIndex(), visible, baseFont);
+        w = Math.max(w, maxTextWidth + 18f + scrollbarReserve);
+
+        if (!wasSuggestActive) {
+            suggestAppearProgress = 0f;
+        }
+        suggestAppearProgress = AnimationUtility.approach(
+                suggestAppearProgress,
+                1f,
+                AnimationUtility.deltaTime(),
+                12.0f
+        );
+        suggestAppearProgress = AnimationUtility.snap(suggestAppearProgress, 1f, 0.015f);
+        float suggestEase = AnimationUtility.easeInOutCubic(suggestAppearProgress);
+        float suggestOffsetY = (1f - suggestEase) * 7f;
+        float visualY = y + suggestOffsetY;
+
+        drawGlassPill(x, visualY, w, h, 7f, 0.82f * suggestEase, true);
+
+        float trackW = hasScrollbar ? 4.8f : 0f;
+        float trackX = x + w - trackW - 5f;
+        float trackY = y + 3.5f;
+        float trackH = h - 7f;
+        float thumbH = hasScrollbar ? Math.max(12f, trackH * ((float) visible / (float) total)) : 0f;
+        float thumbY = hasScrollbar ? trackY + (trackH - thumbH) * ((float) suggestCurrentStart / (float) (Math.max(1, total - visible))) : trackY;
+        float rowX = x + 3f;
+        float rowY = y + 3f;
+        float rowW = Math.max(0f, (hasScrollbar ? trackX - 3f : x + w - 3f) - rowX);
+        float rowH = visible * itemH;
+
+        boolean suggestClip = ScissorFunction.pushRaw(x, visualY, w, h);
+        for (int i = 0; i < visible; i++) {
+            int idx = suggestCurrentStart + i;
+            if (idx < 0 || idx >= snap.texts().size()) break;
+            float rowEase = staggeredAppear(suggestAppearProgress, i, visible);
+            float top = rowY + i * itemH + suggestOffsetY + (1f - rowEase) * 3.5f;
+            boolean hoverRow = rowEase > 0.90f && lastMouseValid &&
+                    lastMouseFx >= rowX && lastMouseFx <= rowX + rowW &&
+                    lastMouseFy >= top && lastMouseFy <= top + itemH;
+            if (hoverRow) {
+                drawLiquidHoverPill(rowX, top + 0.6f, rowW, itemH - 1.2f, 4.5f, 0.46f * rowEase);
+            }
+            float textH = BetterChatTextSupport.height(BetterChatTextSupport.iosevkaRegular(), baseFont);
+            float textY = top + (itemH - textH) * 0.5f;
+            drawText(
+                    BetterChatTextSupport.iosevkaRegular(),
+                    snap.texts().get(idx),
+                    rowX + 4f + (1f - rowEase) * 5f,
+                    textY,
+                    baseFont,
+                    mulAlpha(theme().textPrimary(), rowEase * suggestEase),
+                    true
+            );
+        }
+        if (suggestClip) ScissorFunction.pop();
+
+        if (hasScrollbar) {
+            boolean hotScroll = suggestDraggingScrollbar || (lastMouseValid
+                    && lastMouseFx >= trackX - 4f && lastMouseFx <= trackX + trackW + 4f
+                    && lastMouseFy >= trackY - 4f && lastMouseFy <= trackY + trackH + 4f);
+            if (hotScroll) {
+                SystemCursor.set(SystemCursor.CursorType.SCROLL);
+            }
+            drawScrollbarGlass(
+                    trackX, trackY + suggestOffsetY, trackW, trackH, thumbY + suggestOffsetY, thumbH, hotScroll,
+                    Math.round((hotScroll ? 0xB0 : 0x88) * suggestEase),
+                    Math.round((hotScroll ? 0xFF : 0xD8) * suggestEase)
+            );
+        }
+
+        suggestActive = true;
+        suggestX = x;
+        suggestY = visualY;
+        suggestW = w;
+        suggestH = h;
+        suggestItemH = itemH;
+        suggestRowsX = rowX;
+        suggestRowsY = rowY + suggestOffsetY;
+        suggestRowsW = rowW;
+        suggestRowsH = rowH;
+        suggestStart = suggestCurrentStart;
+        suggestVisible = visible;
+        suggestTotal = total;
+        suggestWindow = CommandSuggestorBridge.lastWindow();
+        suggestHasScrollbar = hasScrollbar;
+        suggestTrackX = trackX;
+        suggestTrackY = trackY + suggestOffsetY;
+        suggestTrackW = trackW;
+        suggestTrackH = trackH;
+        suggestThumbH = thumbH;
+        if (!hasScrollbar) suggestDraggingScrollbar = false;
+        storedScreen = null;
+    }
+
+    private static float textWidthRange(List<String> list, int start, int count, float fontSize) {
+        float max = 0f;
+        for (int i = 0; i < count; i++) {
+            int idx = start + i;
+            if (idx < 0 || idx >= list.size()) break;
+            max = Math.max(max, BetterChatTextSupport.width(BetterChatTextSupport.iosevkaRegular(), list.get(idx), fontSize));
+        }
+        return max;
+    }
+
+    private static String formatTimestamp(long ms, boolean withSeconds) {
+        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault());
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern(withSeconds ? "HH:mm:ss" : "HH:mm");
+        return dt.format(fmt);
+    }
+
+    private static String formatDate(long ms) {
+        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault());
+        return dt.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"));
+    }
+
+    private static HoverTip buildTimestampTooltip(long ms, boolean showDate, boolean showUnix) {
+        List<ChatHoverUtil.ColoredLine> lines = new ArrayList<>();
+        LocalDateTime dt = LocalDateTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault());
+        if (showDate) {
+            lines.add(new ChatHoverUtil.ColoredLine(I18n.get(
+                    "better_chat.hover.date",
+                    dt.format(DateTimeFormatter.ofPattern("dd.MM.yyyy"))
+            ), 0));
+        }
+        if (showUnix) {
+            lines.add(new ChatHoverUtil.ColoredLine("Unix: " + (ms / 1000L), 0xFF888888));
+        }
+        if (lines.isEmpty()) return null;
+        return new HoverTip(lines, null, false, net.minecraft.world.item.ItemStack.EMPTY);
+    }
+
+    private record MousePos(double rawX, double rawY, double fx, double fy) {
+    }
+
+      private record ContextActionResolution(String targetNick, String entityUuid, List<ClickEvent> clickEvents) {
+        static ContextActionResolution empty() {
+            return new ContextActionResolution(null, null, List.of());
+        }
+    }
+
+    private static float staggeredAppear(float progress, int index, int count) {
+        if (count <= 1) return AnimationUtility.easeInOutCubic(progress);
+        float maxDelay = 0.34f;
+        float delay = maxDelay * ((float) index / (float) Math.max(1, count - 1));
+        float local = AnimationUtility.clamp01((progress - delay) / Math.max(0.001f, 1f - delay));
+        return AnimationUtility.easeInOutCubic(local);
+    }
+
+    private record ContextMenu(boolean open, float x, float y, List<MenuEntry> entries) {
+        private static final float MENU_PAD_X = 8f;
+        private static final float MENU_PAD_Y = 7f;
+        private static final float MENU_RADIUS = 9f;
+
+        static ContextMenu closed() {
+            return new ContextMenu(false, 0, 0, Collections.emptyList());
+        }
+
+        static ContextMenu open(float x, float y, List<MenuEntry> entries) {
+            return new ContextMenu(true, x, y, entries);
+        }
+
+        private static float itemHeight(float fontSize) {
+            return Math.max(20f, fontSize + 7f);
+        }
+
+        boolean contains(double mx, double my) {
+            if (!open) return false;
+            float fontSize = lastFontSizeForUi * 0.92f;
+            float menuEase = AnimationUtility.easeInOutCubic(contextMenuAppearProgress);
+            float panelY = y + (1f - menuEase) * 6f;
+            return mx >= x && mx <= x + width(fontSize)
+                    && my >= panelY && my <= panelY + height(fontSize);
+        }
+
+        MenuEntry pick(double my) {
+            if (!open) return null;
+            float fontSize = lastFontSizeForUi * 0.92f;
+            float itemH = itemHeight(fontSize);
+            float menuEase = AnimationUtility.easeInOutCubic(contextMenuAppearProgress);
+            float panelOffsetY = (1f - menuEase) * 6f;
+            float cy = y + MENU_PAD_Y;
+            for (int i = 0; i < entries.size(); i++) {
+                float rowEase = staggeredAppear(contextMenuAppearProgress, i, entries.size());
+                float top = cy + i * itemH + panelOffsetY + (1f - rowEase) * 3.5f;
+                float bottom = top + itemH;
+                if (rowEase > 0.90f && my >= top && my <= bottom) {
+                    return entries.get(i);
+                }
+            }
+            return null;
+        }
+
+        void render(float mouseX, float mouseY, float fontSize) {
+            if (!open || entries.isEmpty()) return;
+
+            contextMenuAppearProgress = AnimationUtility.approach(
+                    contextMenuAppearProgress,
+                    1f,
+                    AnimationUtility.deltaTime(),
+                    12.0f
+            );
+            contextMenuAppearProgress = AnimationUtility.snap(contextMenuAppearProgress, 1f, 0.015f);
+            float menuEase = AnimationUtility.easeInOutCubic(contextMenuAppearProgress);
+
+            float fs = Math.max(12f, fontSize * 0.92f);
+            float itemH = itemHeight(fs);
+            float w = width(fs);
+            float h = height(fs);
+            float panelOffsetY = (1f - menuEase) * 6f;
+            float panelY = y + panelOffsetY;
+
+            drawGlassPill(x, panelY, w, h, MENU_RADIUS, 0.94f * menuEase, true);
+
+            boolean menuClip = ScissorFunction.pushRaw(x, panelY, w, h);
+            float accentX = x + 5f;
+            drawRoundedRect(
+                    accentX,
+                    panelY + MENU_PAD_Y + 2f,
+                    2f,
+                    h - MENU_PAD_Y * 2f - 4f,
+                    1f,
+                    mulAlpha(withAlpha(theme().accent(), 0x72), menuEase)
+            );
+
+            float cy = y + MENU_PAD_Y;
+            for (int i = 0; i < entries.size(); i++) {
+                MenuEntry entry = entries.get(i);
+                float rowEase = staggeredAppear(contextMenuAppearProgress, i, entries.size());
+                float finalTop = cy + i * itemH;
+                float top = finalTop + panelOffsetY + (1f - rowEase) * 3.5f;
+                boolean hover = rowEase > 0.90f
+                        && mouseX >= x && mouseX <= x + w
+                        && mouseY >= top && mouseY <= top + itemH;
+                if (hover) {
+                    drawRoundedRect(
+                            x + 8f, top + 1f, w - 16f, itemH - 2f, itemH * 0.5f,
+                            mulAlpha(withAlpha(theme().surfaceHover(), 0xAA), rowEase)
+                    );
+                    drawRoundedRectStrokeGradient(
+                            x + 8f, top + 1f, w - 16f, itemH - 2f, itemH * 0.5f,
+                            0.55f,
+                            mulAlpha(withAlpha(theme().accent(), 0x66), rowEase),
+                            mulAlpha(withAlpha(theme().accentSoft(), 0x38), rowEase)
+                    );
+                }
+
+                float dot = 3.2f;
+                int dotColor = hover ? withAlpha(theme().accent(), 0xE0) : withAlpha(theme().textMuted(), 0x70);
+                drawRoundedRect(
+                        x + 14f + (1f - rowEase) * 4f,
+                        top + (itemH - dot) * 0.5f,
+                        dot, dot, dot * 0.5f,
+                        mulAlpha(dotColor, rowEase * menuEase)
+                );
+
+                float textY = top + (itemH - BetterChatTextSupport.height(BetterChatTextSupport.iosevkaRegular(), fs)) * 0.5f;
+                int textColor = hover ? theme().textPrimary() : withAlpha(theme().textPrimary(), 0xE4);
+                drawText(
+                        BetterChatTextSupport.iosevkaRegular(),
+                        entry.label(),
+                        x + 24f + (1f - rowEase) * 5f,
+                        textY,
+                        fs,
+                        mulAlpha(textColor, rowEase * menuEase),
+                        true
+                );
+            }
+            if (menuClip) ScissorFunction.pop();
+        }
+
+        private float width(float fontSize) {
+            float maxText = 0f;
+            for (MenuEntry e : entries) {
+                maxText = Math.max(maxText, BetterChatTextSupport.width(BetterChatTextSupport.iosevkaRegular(), e.label(), fontSize));
+            }
+            return Math.max(168f, maxText + MENU_PAD_X * 2f + 34f);
+        }
+
+        private float height(float fontSize) {
+            return MENU_PAD_Y * 2f + entries.size() * itemHeight(fontSize);
+        }
+
+        record MenuEntry(String label, Runnable action) {
+        }
+    }
+
+    public record Layout(float x, float y) {
+    }
+
+}

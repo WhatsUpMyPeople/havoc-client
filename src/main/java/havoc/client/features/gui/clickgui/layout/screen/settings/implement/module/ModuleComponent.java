@@ -1,0 +1,655 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.clickgui.layout.screen.settings.implement.module;
+
+import havoc.client.render.engine.text.BuiltinFontCatalog;
+import havoc.client.render.engine.renderer.RenderWarpStack;
+import havoc.client.features.gui.clickgui.ClickGuiRenderer;
+import havoc.client.features.gui.clickgui.sound.GuiSound;
+import havoc.client.features.gui.clickgui.settings.SettingErrorView;
+import havoc.client.features.module.Module;
+import havoc.client.features.module.ModuleManager;
+import havoc.client.runtime.error.ErrorHandler;
+import havoc.client.features.gui.clickgui.layout.screen.settings.SettingsGuiPalette;
+import havoc.client.features.gui.clickgui.layout.screen.settings.implement.other.StatusRender;
+import havoc.client.features.gui.clickgui.layout.screen.settings.render.LayoutRender2D;
+import havoc.client.features.gui.clickgui.layout.screen.settings.render.SettingsCardTransition;
+import havoc.client.features.gui.clickgui.util.ClickGuiI18n;
+import havoc.client.features.gui.clickgui.util.ClickGuiMath;
+import havoc.client.render.engine.animation.AnimationUtility;
+import havoc.client.render.engine.renderer.Renderer2D;
+import havoc.client.render.engine.text.TextRenderer;
+import havoc.client.render.helpers.ScissorFunction;
+import havoc.client.render.helpers.SystemCursor;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public final class ModuleComponent {
+    private static final float PARALLAX_MAX_ANGLE = 4.6f;
+    private static final float DESCRIPTION_TEXT_SIZE = 9.0f;
+    private static final int MAX_DESCRIPTION_LINES = 2;
+    private static final float DESCRIPTION_TEXT_LEFT = 15.0f;
+    private static final float DESCRIPTION_TEXT_RIGHT = 10.0f;
+    private static final float DESCRIPTION_ICON_X = 6.5f;
+    private static final float DESCRIPTION_ICON_SIZE = 9.0f;
+    private static final float PARALLAX_DEPTH = 4.8f;
+    private static final float PARALLAX_PERSPECTIVE = 0.92f;
+    private static final float PARALLAX_SCALE_BOOST = 0.012f;
+    private static final float PARALLAX_CONTENT_SHIFT = 0.0f;
+    private final List<CardHit> hits = new ArrayList<>();
+    private final Map<String, Float> stateAnimById = new HashMap<>();
+    private final Map<String, Float> hoverAnimById = new HashMap<>();
+    private final Map<String, StatusRender> statusRenderById = new HashMap<>();
+    private String lastHoverSoundCardId;
+    private String hoverSoundCardIdThisFrame;
+    private float scroll;
+    private float smoothedScroll;
+    private boolean scrollbarVisible;
+    private boolean draggingScrollbar;
+    private float scrollbarX;
+    private float scrollbarY;
+    private float scrollbarW;
+    private float scrollbarH;
+    private float scrollbarThumbY;
+    private float scrollbarThumbH;
+    private float scrollbarMaxScroll;
+    private float scrollbarDragOffset;
+
+    private static String normalizeDescription(String description) {
+        if (description == null || description.isBlank()) {
+            return ClickGuiI18n.tr("clickgui.settings.module.description_missing", "Module description is missing.");
+        }
+        return description;
+    }
+
+    private static int brightenRgb(int color, int delta) {
+        int a = (color >>> 24) & 0xFF;
+        int r = Math.min(255, ((color >>> 16) & 0xFF) + delta);
+        int g = Math.min(255, ((color >>> 8) & 0xFF) + delta);
+        int b = Math.min(255, (color & 0xFF) + delta);
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    private static Parallax computeParallax(float mx, float my, float x, float y, float w, float h, float hover) {
+        float ease = smooth(Math.max(0f, Math.min(1f, hover)));
+        if (ease <= 0.001f || w <= 0f || h <= 0f) return Parallax.NONE;
+        float nx = clamp((mx - x) / w * 2f - 1f, -1f, 1f);
+        float ny = clamp((my - y) / h * 2f - 1f, -1f, 1f);
+        return new Parallax(
+                -nx * PARALLAX_MAX_ANGLE * ease,
+                ny * PARALLAX_MAX_ANGLE * ease,
+                1f + PARALLAX_SCALE_BOOST * ease,
+                nx * PARALLAX_CONTENT_SHIFT * ease,
+                ny * PARALLAX_CONTENT_SHIFT * ease,
+                true
+        );
+    }
+
+    private static RenderWarpStack.Scope pushParallax(Parallax p, float x, float y, float w, float h) {
+        if (p == null || !p.active()) return Renderer2D.pushWarp(null);
+        return Renderer2D.pushPerspectiveWarp(x, y, w, h, p.yawDeg(), p.pitchDeg(), 0f, PARALLAX_DEPTH, PARALLAX_PERSPECTIVE, p.scale());
+    }
+
+    private static float smooth(float t) {
+        return t * t * (3f - 2f * t);
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    public void resetScroll() {
+        scroll = 0f;
+        smoothedScroll = 0f;
+        draggingScrollbar = false;
+    }
+
+    public void scroll(float mx, float my, float menuX, float menuY, float menuW, float menuH, double amount, float scale) {
+        float hitX = menuX + 35f * scale;
+        float hitY = menuY + 13f * scale;
+        float hitW = menuW - 35f * scale + 7f * scale;
+        float hitH = menuH - 13f * scale + 15f * scale;
+        if (!ClickGuiMath.insideRect(mx, my, hitX, hitY, hitW, hitH)) return;
+        scroll += (float) (amount * 20f);
+    }
+
+    public void render(float menuX,
+                       float menuY,
+                       float menuW,
+                       float menuH,
+                       List<CardEntry> entries,
+                       float scale) {
+        hits.clear();
+        hoverSoundCardIdThisFrame = null;
+        if (entries.isEmpty()) {
+            lastHoverSoundCardId = null;
+            return;
+        }
+
+        int[] offsets = calculateOffsets(entries, scale);
+        int column = 0;
+        int maxScroll = 0;
+        float columnWidth = 142f * scale;
+        SettingsGuiPalette palette = SettingsGuiPalette.current();
+
+        float scissorX = menuX + 35f * scale - 75f * scale;
+        float scissorY = menuY + 35.5f * scale;
+        float scissorW = menuW - 35f * scale + 150f * scale;
+        float scissorBottom = menuY + menuH - 3.5f * scale;
+        float scissorH = Math.max(1f, scissorBottom - scissorY);
+        boolean clipped = ScissorFunction.pushRaw(scissorX, scissorY, scissorW, scissorH);
+
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            CardEntry entry = entries.get(i);
+            int componentHeight = Math.round(getComponentHeight(entry, columnWidth + 40f * scale, scale) + 9f * scale);
+
+            float x = menuX + 32f * scale + (column * (columnWidth + 48f * scale));
+            float y = menuY + 35f * scale + offsets[column] - componentHeight + smoothedScroll;
+            float w = columnWidth + 40f * scale;
+            float h = componentHeight - 9f * scale;
+
+            if (y + h > scissorY + 1.0f * scale && scissorBottom - 1.0f * scale > y) {
+                CardHit hit = drawCard(entry, x, y, w, h, scale, palette);
+                hits.add(hit);
+            }
+
+            offsets[column] -= componentHeight;
+            maxScroll = Math.max(maxScroll, offsets[column]);
+            column = (column + 1) % 2;
+        }
+
+        int clamped = ClickGuiMath.clamp(Math.round(maxScroll - (menuH * 0.5f + 35f * scale)), 0, maxScroll);
+        updateScrollbarMetrics(menuX, menuY, menuH, clamped, scale);
+        if (draggingScrollbar) {
+            scrollToMouse(ClickGuiRenderer.getMouseY());
+        }
+        scroll = ClickGuiMath.clamp(scroll, -clamped, 0f);
+        smoothedScroll = AnimationUtility.approach(smoothedScroll, scroll, draggingScrollbar ? 0.55f : 0.2f);
+        smoothedScroll = AnimationUtility.snap(smoothedScroll, scroll, draggingScrollbar ? 0.01f : 0.05f);
+        if (clipped) ScissorFunction.pop();
+
+        renderScrollbar(menuX, menuY, menuH, clamped, scale, palette);
+        lastHoverSoundCardId = hoverSoundCardIdThisFrame;
+    }
+
+    public boolean mousePressedScrollbar(float mx, float my, int button) {
+        if (button != 0) return false;
+        if (!isScrollbarHovered(mx, my)) return false;
+        draggingScrollbar = true;
+        scrollbarDragOffset = ClickGuiMath.insideRect(mx, my, scrollbarX, scrollbarThumbY, scrollbarW, scrollbarThumbH)
+                ? my - scrollbarThumbY
+                : scrollbarThumbH * 0.5f;
+        scrollToMouse(my);
+        return true;
+    }
+
+    public void mouseReleased(int button) {
+        if (button == 0) {
+            draggingScrollbar = false;
+        }
+    }
+
+    public CardAction click(float mx, float my, int button) {
+        if (isScrollbarHovered(mx, my)) return null;
+        for (CardHit hit : hits) {
+            if (!ClickGuiMath.insideRect(mx, my, hit.x(), hit.y(), hit.w(), hit.h())) continue;
+            if (button == 1 && !hit.hasSettings()) continue;
+            return new CardAction(
+                    hit.getId(),
+                    button == 0,
+                    button == 1,
+                    hit.statusHit(mx, my),
+                    hit.bindHit(mx, my),
+                    hit.toggleable()
+            );
+        }
+        return null;
+    }
+
+    private CardHit drawCard(CardEntry entry, float x, float y, float w, float h, float scale, SettingsGuiPalette palette) {
+        Module faultModule = ModuleManager.get(entry.getId());
+        boolean failed = entry.failed() || SettingErrorView.hasFailure(faultModule);
+        boolean quarantined = ErrorHandler.blocked(faultModule);
+        float enabledAnim = stateAnimById.compute(entry.getId(), (k, v) -> AnimationUtility.approach(v == null ? 0f : v, entry.enabled() ? 1f : 0f, 0.16f));
+        boolean hovered = ClickGuiMath.insideRect(ClickGuiRenderer.getMouseX(), ClickGuiRenderer.getMouseY(), x, y, w, h);
+        if (hovered) {
+            hoverSoundCardIdThisFrame = entry.getId();
+            if (!entry.getId().equals(lastHoverSoundCardId)) GuiSound.MODULE_HOVER.feedback(0.60);
+        }
+        float hoverAnim = hoverAnimById.compute(entry.getId(), (k, v) -> AnimationUtility.approach(v == null ? 0f : v, hovered ? 1f : 0f, 0.18f));
+        Parallax parallax = computeParallax(ClickGuiRenderer.getMouseX(), ClickGuiRenderer.getMouseY(), x, y, w, h, hoverAnim);
+        int brightnessOffset = Math.round(9f * enabledAnim);
+        int alphaOffset = 150 + Math.round(105f * enabledAnim);
+        String description = normalizeDescription(entry.description());
+        float descHeight = descriptionHeight(description, w, scale);
+        int cardTopStrong = brightenRgb(palette.moduleCardTopStrong(), brightnessOffset);
+        int cardBottomStrong = brightenRgb(palette.moduleCardBottomStrong(), brightnessOffset);
+        BindRect bindRect;
+        float statusX = x + w - 24f * scale;
+        float statusY = y + descHeight + 31f * scale;
+
+        try (var ignored = pushParallax(parallax, x, y, w, h);
+             var transition = SettingsCardTransition.beginCard(x, y, w, h, 5f * scale, scale, palette)) {
+            // Use the soft-shadow SDF here. roundedRectShadow is a bottom-edge shadow primitive
+            // and visually collapses into a moving 1px strip on these tilted cards.
+            LayoutRender2D.roundedSoftShadow(
+                    x,
+                    y + 1.6f * scale,
+                    w,
+                    h,
+                    5.4f * scale,
+                    5.2f * scale,
+                    0.0f,
+                    LayoutRender2D.alpha(0xFF000000, 0.18f + 0.08f * hoverAnim)
+            );
+            ClickGuiRenderer.drawBlur(x, y, w, h, 5f * scale, 0xFF000000, 200f / 255f);
+            LayoutRender2D.roundedQuad(
+                    x, y, w, h,
+                    5f * scale,
+                    palette.moduleCardTop(),
+                    cardTopStrong,
+                    palette.moduleCardBottom(),
+                    cardBottomStrong
+            );
+            LayoutRender2D.rectQuad(
+                    x, y + descHeight + 25f * scale, w, 0.5f * scale,
+                    palette.moduleDividerStart(),
+                    palette.moduleDividerEnd(),
+                    palette.moduleDividerEnd(),
+                    palette.moduleDividerStart()
+            );
+            Renderer2D.COLOR.radialGlowMasked(
+                    x,
+                    y,
+                    w,
+                    h,
+                    5f * scale,
+                    0f,
+                    48f * scale,
+                    x + w * 0.18f,
+                    y + h * 0.08f,
+                    LayoutRender2D.alpha(palette.moduleCardTopStrong(), 0.12f + 0.10f * hoverAnim)
+            );
+
+            if (failed) {
+                SettingErrorView.warning(x+w-18f*scale,y+6f*scale,10f*scale,1f);
+            }
+            ClickGuiRenderer.drawText(
+                    ClickGuiRenderer.getInterRegular(),
+                    "• " + entry.title(),
+                    x + 8.8f * scale,
+                    y + 5.4f * scale,
+                    13f * scale,
+                    SettingsGuiPalette.withAlpha(failed ? 0xFFFF7777 : palette.moduleTitleText(), alphaOffset),
+                    false
+            );
+
+            drawDescription(description, x, y, w, scale, palette);
+            if (!entry.hasSettings()) {
+                drawNoSettingsHint(x, y, descHeight, scale, palette);
+            }
+            bindRect = drawBind(entry, x, y, w, descHeight, scale, palette);
+            if (entry.toggleable() && !quarantined) {
+                StatusRender status = statusRenderById.computeIfAbsent(entry.getId(), k -> new StatusRender());
+                status.render(statusX, statusY, enabledAnim, scale);
+            }
+        }
+
+        return new CardHit(
+                entry.getId(),
+                x,
+                y,
+                w,
+                h,
+                bindRect.hitX(),
+                bindRect.hitY(),
+                bindRect.hitW(),
+                bindRect.hitH(),
+                statusX,
+                statusY,
+                16f * scale,
+                8f * scale,
+                entry.hasSettings(),
+                entry.toggleable()
+        );
+    }
+
+    private void drawDescription(String description, float x, float y, float w, float scale, SettingsGuiPalette palette) {
+        DescriptionLayout layout = layoutDescription(description, w, scale);
+        if (layout.lines().isEmpty()) return;
+
+        float textSize = DESCRIPTION_TEXT_SIZE * scale;
+        float textY = y + 19f * scale;
+        float textX = x + DESCRIPTION_TEXT_LEFT * scale;
+        float lineStep = descriptionLineStep(scale);
+        TextRenderer icons = BuiltinFontCatalog.ICONS.renderer(ClickGuiRenderer.getInterRegular());
+
+        ClickGuiRenderer.drawText(
+                icons,
+                "J",
+                x + DESCRIPTION_ICON_X * scale,
+                textY + 0.55f * scale,
+                DESCRIPTION_ICON_SIZE * scale,
+                palette.moduleDescriptionIcon(),
+                false
+        );
+
+        for (int i = 0; i < layout.lines().size(); i++) {
+            ClickGuiRenderer.drawText(
+                    ClickGuiRenderer.getInterRegular(),
+                    layout.lines().get(i),
+                    textX,
+                    textY + i * lineStep,
+                    textSize,
+                    palette.moduleDescriptionText(),
+                    false
+            );
+        }
+    }
+
+    private BindRect drawBind(CardEntry entry, float x, float y, float w, float descHeight, float scale, SettingsGuiPalette palette) {
+        String label = entry.bindLabel();
+        if (label == null || label.isBlank()) {
+            return new BindRect(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+        }
+        float labelW = ClickGuiRenderer.textWidth(ClickGuiRenderer.getInterRegular(), label, 12f * scale);
+        float bindX = x + w - 37.5f * scale - labelW;
+        float bindY = y + descHeight + 29.75f * scale;
+        float bindW = labelW + 6f * scale;
+        float bindH = 10f * scale;
+        float hitY = y + descHeight + 32.5f * scale;
+        float hitH = 9f * scale;
+
+        LayoutRender2D.roundedQuad(
+                bindX + 0.25f * scale, bindY, bindW, bindH, 3f * scale,
+                palette.moduleBindBg0(),
+                palette.moduleBindBg1(),
+                palette.moduleBindBg2(),
+                palette.moduleBindBg3()
+        );
+        LayoutRender2D.roundedStroke(
+                bindX + 0.25f * scale, bindY, bindW, bindH, 3f * scale, 0.5f * scale,
+                palette.moduleBindStroke()
+        );
+        ClickGuiRenderer.drawText(
+                ClickGuiRenderer.getInterRegular(),
+                label,
+                x + w - 34.5f * scale - labelW,
+                y + descHeight + 34f * scale,
+                12f * scale,
+                palette.moduleBindText(),
+                false
+        );
+        return new BindRect(bindX, bindY, bindW, bindH, bindX, hitY, bindW, hitH);
+    }
+
+    private void drawNoSettingsHint(float x, float y, float descHeight, float scale, SettingsGuiPalette palette) {
+        ClickGuiRenderer.drawText(
+                ClickGuiRenderer.getInterRegular(),
+                ClickGuiI18n.tr("clickgui.settings.module.no_settings", "No settings"),
+                x + 10f * scale,
+                y + descHeight + 33.5f * scale,
+                9f * scale,
+                palette.moduleNoSettingsText(),
+                false
+        );
+    }
+
+    private void renderScrollbar(float menuX, float menuY, float menuH, int clamped, float scale, SettingsGuiPalette palette) {
+        updateScrollbarMetrics(menuX, menuY, menuH, clamped, scale);
+        if (!scrollbarVisible) return;
+
+        float mx = ClickGuiRenderer.getMouseX();
+        float my = ClickGuiRenderer.getMouseY();
+        boolean hover = isScrollbarHovered(mx, my);
+        if (hover || draggingScrollbar) {
+            SystemCursor.set(SystemCursor.CursorType.SCROLL);
+        }
+
+        LayoutRender2D.roundedQuad(
+                scrollbarX, scrollbarY, scrollbarW, scrollbarH, 2f * scale,
+                palette.moduleScrollTrackA(),
+                palette.moduleScrollTrackB(),
+                palette.moduleScrollTrackB(),
+                palette.moduleScrollTrackA()
+        );
+
+        LayoutRender2D.roundedQuad(
+                scrollbarX, scrollbarThumbY, scrollbarW, scrollbarThumbH, 2f * scale,
+                palette.moduleScrollHandleA(),
+                palette.moduleScrollHandleB(),
+                palette.moduleScrollHandleB(),
+                palette.moduleScrollHandleA()
+        );
+    }
+
+    private void updateScrollbarMetrics(float menuX, float menuY, float menuH, int clamped, float scale) {
+        scrollbarVisible = clamped > 0;
+        scrollbarMaxScroll = Math.max(0f, clamped);
+        if (!scrollbarVisible) {
+            draggingScrollbar = false;
+            scrollbarX = scrollbarY = scrollbarW = scrollbarH = scrollbarThumbY = scrollbarThumbH = 0f;
+            return;
+        }
+
+        float offsetY = 14f * scale;
+        scrollbarW = 4f * scale;
+        scrollbarX = menuX + 400f * scale - 35f * scale - scrollbarW + 50f * scale;
+        scrollbarY = menuY + offsetY + 22f * scale;
+        scrollbarH = menuH - offsetY * 2f - 14f * scale;
+
+        float contentHeight = scrollbarMaxScroll;
+        float viewHeight = menuH - offsetY * 2f;
+        scrollbarThumbH = Math.max(20f * scale, viewHeight * (viewHeight / (contentHeight + viewHeight)));
+        float scrollRatio = contentHeight <= 0f ? 0f : (-smoothedScroll / contentHeight);
+        scrollbarThumbY = scrollbarY + (scrollbarH - scrollbarThumbH) * AnimationUtility.clamp(scrollRatio, 0f, 1f);
+    }
+
+    private boolean isScrollbarHovered(float mx, float my) {
+        if (!scrollbarVisible) return false;
+        float pad = 4f;
+        return ClickGuiMath.insideRect(mx, my, scrollbarX - pad, scrollbarY - pad, scrollbarW + pad * 2f, scrollbarH + pad * 2f);
+    }
+
+    private void scrollToMouse(float my) {
+        if (!scrollbarVisible || scrollbarMaxScroll <= 0f) return;
+        float span = scrollbarH - scrollbarThumbH;
+        if (span <= 0.5f) return;
+        float thumbTop = AnimationUtility.clamp(my - scrollbarDragOffset, scrollbarY, scrollbarY + span);
+        float ratio = (thumbTop - scrollbarY) / span;
+        scroll = -scrollbarMaxScroll * AnimationUtility.clamp(ratio, 0f, 1f);
+    }
+
+    private float descriptionHeight(String description, float w, float scale) {
+        return layoutDescription(description, w, scale).height();
+    }
+
+    private DescriptionLayout layoutDescription(String description, float w, float scale) {
+        String normalized = normalizeDescription(description).trim();
+        if (normalized.isEmpty()) return new DescriptionLayout(List.of(), 0f);
+
+        float textSize = DESCRIPTION_TEXT_SIZE * scale;
+        float maxWidth = Math.max(24f * scale,
+                w - (DESCRIPTION_TEXT_LEFT + DESCRIPTION_TEXT_RIGHT) * scale);
+        List<String> lines = new ArrayList<>(MAX_DESCRIPTION_LINES);
+        String[] words = normalized.split("\\s+");
+        StringBuilder current = new StringBuilder();
+        boolean truncated = false;
+
+        for (int i = 0; i < words.length; i++) {
+            String word = words[i];
+            if (word.isBlank()) continue;
+            String candidate = current.isEmpty() ? word : current + " " + word;
+            if (ClickGuiRenderer.textWidth(ClickGuiRenderer.getInterRegular(), candidate, textSize) <= maxWidth) {
+                current.setLength(0);
+                current.append(candidate);
+                continue;
+            }
+
+            if (!current.isEmpty()) {
+                lines.add(current.toString());
+                current.setLength(0);
+                if (lines.size() >= MAX_DESCRIPTION_LINES) {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            if (ClickGuiRenderer.textWidth(ClickGuiRenderer.getInterRegular(), word, textSize) > maxWidth) {
+                current.append(ClickGuiRenderer.fitText(
+                        ClickGuiRenderer.getInterRegular(), word, textSize, maxWidth));
+            } else {
+                current.append(word);
+            }
+        }
+
+        if (!current.isEmpty() && lines.size() < MAX_DESCRIPTION_LINES) {
+            lines.add(current.toString());
+        } else if (!current.isEmpty()) {
+            truncated = true;
+        }
+
+        if (lines.isEmpty()) {
+            lines.add(ClickGuiRenderer.fitText(
+                    ClickGuiRenderer.getInterRegular(), normalized, textSize, maxWidth));
+        }
+
+        if (truncated || lines.size() == MAX_DESCRIPTION_LINES && joinedLength(lines) < normalized.length()) {
+            int last = lines.size() - 1;
+            String withEllipsis = lines.get(last).replaceAll("[.\u2026]+$", "") + "…";
+            lines.set(last, ClickGuiRenderer.fitText(
+                    ClickGuiRenderer.getInterRegular(), withEllipsis, textSize, maxWidth));
+        }
+
+        float lineHeight = ClickGuiRenderer.textHeight(ClickGuiRenderer.getInterRegular(), textSize);
+        float height = Math.max(0f,
+                lineHeight - 3.0f * scale + (lines.size() - 1) * descriptionLineStep(scale));
+        return new DescriptionLayout(List.copyOf(lines), height);
+    }
+
+    private static int joinedLength(List<String> lines) {
+        int length = Math.max(0, lines.size() - 1);
+        for (String line : lines) length += line.length();
+        return length;
+    }
+
+    private float descriptionLineStep(float scale) {
+        float lineHeight = ClickGuiRenderer.textHeight(
+                ClickGuiRenderer.getInterRegular(), DESCRIPTION_TEXT_SIZE * scale);
+        return Math.max(6.0f * scale, lineHeight - 2.5f * scale);
+    }
+
+    private int getComponentHeight(CardEntry entry, float w, float scale) {
+        return Math.round(45f * scale + descriptionHeight(normalizeDescription(entry.description()), w, scale));
+    }
+
+    private int[] calculateOffsets(List<CardEntry> entries, float scale) {
+        int[] offsets = new int[2];
+        int column = 0;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            int componentHeight = Math.round(getComponentHeight(entries.get(i), 182f * scale, scale) + 9f * scale);
+            offsets[column] += componentHeight;
+            column = (column + 1) % 2;
+        }
+        return offsets;
+    }
+
+    private record DescriptionLayout(List<String> lines, float height) {
+    }
+
+    public record CardEntry(String id,
+                            String title,
+                            String description,
+                            String bindLabel,
+                            boolean hasSettings,
+                            boolean enabled,
+                            boolean toggleable,
+                            boolean failed,
+                            boolean shownInModuleList,
+                            List<String> searchAliases) {
+        public CardEntry {
+            searchAliases = searchAliases == null ? List.of() : List.copyOf(searchAliases);
+        }
+
+        public CardEntry(String id,
+                         String title,
+                         String description,
+                         String bindLabel,
+                         boolean hasSettings,
+                         boolean enabled,
+                         boolean toggleable,
+                         boolean failed,
+                         boolean shownInModuleList) {
+            this(id, title, description, bindLabel, hasSettings, enabled, toggleable, failed, shownInModuleList, List.of());
+        }
+
+        public CardEntry(String id,
+                         String title,
+                         String description,
+                         String bindLabel,
+                         boolean hasSettings,
+                         boolean enabled,
+                         boolean toggleable) {
+            this(id, title, description, bindLabel, hasSettings, enabled, toggleable, false, true, List.of());
+        }
+
+        public String getId() {
+            return id;
+        }
+    }
+
+    public record CardAction(String id,
+                             boolean leftClick,
+                             boolean rightClick,
+                             boolean statusClick,
+                             boolean bindClick,
+                             boolean toggleable) {
+        public String getId() {
+            return id;
+        }
+    }
+
+    private record Parallax(float yawDeg, float pitchDeg, float scale, float shiftX, float shiftY, boolean active) {
+        private static final Parallax NONE = new Parallax(0f, 0f, 1f, 0f, 0f, false);
+    }
+
+    private record BindRect(float x, float y, float w, float h, float hitX, float hitY, float hitW, float hitH) {
+    }
+
+    private record CardHit(String id,
+                           float x,
+                           float y,
+                           float w,
+                           float h,
+                           float bindX,
+                           float bindY,
+                           float bindW,
+                           float bindH,
+                           float statusX,
+                           float statusY,
+                           float statusW,
+                           float statusH,
+                           boolean hasSettings,
+                           boolean toggleable) {
+        public String getId() {
+            return id;
+        }
+
+        boolean statusHit(float mx, float my) {
+            if (!toggleable) return false;
+            return ClickGuiMath.insideRect(mx, my, statusX, statusY, statusW, statusH);
+        }
+
+        boolean bindHit(float mx, float my) {
+            return ClickGuiMath.insideRect(mx, my, bindX, bindY, bindW, bindH);
+        }
+    }
+}

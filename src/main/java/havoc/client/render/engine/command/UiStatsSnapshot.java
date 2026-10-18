@@ -1,0 +1,22 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.command;
+
+public record UiStatsSnapshot(long frameId,
+                              int recordedCommands,
+                              int shapeCommands,
+                              int pathCommands,
+                              int textureCommands,
+                              int itemCommands,
+                              int effectCommands,
+                              int compiledPasses,
+                              int compiledOrderedBatches,
+                              int compiledCaptureAwarePasses,
+                              int rhiDrawCommands,
+                              int backendDrawCalls) {
+}

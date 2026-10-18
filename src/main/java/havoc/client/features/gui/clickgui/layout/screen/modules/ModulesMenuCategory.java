@@ -1,0 +1,72 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.clickgui.layout.screen.modules;
+
+import havoc.client.features.module.ModuleCategory;
+import havoc.client.features.module.ModuleSubcategoryDefinition;
+import havoc.client.features.module.ModuleSubcategoryRegistry;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+
+public enum ModulesMenuCategory {
+    COMBAT(ModuleCategory.COMBAT, "Combat", "swords", "combat"),
+    MOVEMENT(ModuleCategory.MOVEMENT, "Movement", "accessibility", "movement"),
+    PLAYER(ModuleCategory.PLAYER, "Player", "user", "player"),
+    VISUALS(ModuleCategory.VISUALS, "Visuals", "tree-pine", "visual", "render", "visuals"),
+    OTHER(ModuleCategory.MISC, "Other", "ellipsis", "other", "misc", "miscellaneous", "exploit", "world");
+
+    private final ModuleCategory moduleCategory;
+    private final String title;
+    private final String icon;
+    private final List<String> aliases;
+
+    ModulesMenuCategory(ModuleCategory moduleCategory, String title, String icon, String... aliases) {
+        this.moduleCategory = moduleCategory;
+        this.title = title;
+        this.icon = icon;
+        this.aliases = Arrays.asList(aliases);
+    }
+
+    public ModuleCategory moduleCategory() {
+        return moduleCategory;
+    }
+
+    public String title() {
+        return title;
+    }
+
+    public String icon() {
+        return icon;
+    }
+
+    public List<ModuleSubcategoryDefinition> subcategories() {
+        return ModuleSubcategoryRegistry.forCategory(moduleCategory);
+    }
+
+    boolean matches(ModuleCategory category) {
+        if (category == moduleCategory) return true;
+        if (category == null) return this == OTHER;
+
+        String name = category.name().toLowerCase(Locale.ROOT);
+        for (String alias : aliases) {
+            if (name.equals(alias) || name.contains(alias)) return true;
+        }
+
+        if (this == OTHER) {
+            for (ModulesMenuCategory c : values()) {
+                if (c == OTHER) continue;
+                if (c.matches(category)) return false;
+            }
+            return true;
+        }
+
+        return false;
+    }
+}

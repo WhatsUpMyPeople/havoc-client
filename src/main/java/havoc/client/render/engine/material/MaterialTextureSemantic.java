@@ -1,0 +1,25 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.material;
+
+/** Canonical texture semantics understood by the Havoc material system. */
+public enum MaterialTextureSemantic {
+    ALBEDO,
+    NORMAL,
+    AMBIENT_OCCLUSION,
+    ROUGHNESS,
+    METALLIC,
+    /** glTF metallic-roughness packing: G=roughness, B=metallic. */
+    METALLIC_ROUGHNESS,
+    SPECULAR,
+    EMISSIVE,
+    HEIGHT,
+    ORM,
+    LABPBR_NORMAL,
+    LABPBR_SPECULAR
+}

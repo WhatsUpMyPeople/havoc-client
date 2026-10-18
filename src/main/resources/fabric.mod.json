@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "${mod_id}",
+  "version": "${version}",
+  "name": "${mod_name}",
+  "description": "Havoc Client 26.2 — utility and PvP client for Minecraft 26.2 on Fabric.",
+  "authors": [
+    "Havoc"
+  ],
+  "contact": {},
+  "license": "${mod_license}",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "havoc.client.Havoc"
+    ]
+  },
+  "mixins": [
+    "havoc.mixins.json"
+  ],
+  "depends": {
+    "sodium": "0.9.2+mc26.2",
+    "fabricloader": "*",
+    "minecraft": "${minecraft_version}"
+  },
+  "suggests": {
+    "iris": "1.11.4+26.2-fabric",
+    "immediatelyfast": "*",
+    "viafabricplus": "*",
+    "sodium-extra": "*"
+  }
+}

@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Read mod properties
+        id: props
+        run: |
+          VERSION=$(grep '^mod_version=' gradle.properties | cut -d'=' -f2)
+          BASE=$(grep '^archives_base_name=' gradle.properties | cut -d'=' -f2)
+          NAME=$(grep '^mod_name=' gradle.properties | cut -d'=' -f2-)
+          echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"             >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"             >> "$GITHUB_OUTPUT"
+
+      - name: Build release jar
+        run: ./gradlew --no-daemon build
+
+      - name: Verify artifact exists
+        run: |
+          ARTIFACT="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}.jar"
+          if [ ! -f "$ARTIFACT" ]; then
+            echo "Release artifact not found: $ARTIFACT"
+            ls -la build/libs/ || true
+            exit 1
+          fi
+          echo "artifact=$ARTIFACT" >> "$GITHUB_ENV"
+
+      - name: Create / update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$artifact" --clobber
+          else
+            gh release create "$TAG" "$artifact" \
+              --verify-tag \
+              --title "${{ steps.props.outputs.name }} ${{ steps.props.outputs.version }}" \
+              --notes "${{ steps.props.outputs.name }} ${{ steps.props.outputs.version }} release build."
+          fi

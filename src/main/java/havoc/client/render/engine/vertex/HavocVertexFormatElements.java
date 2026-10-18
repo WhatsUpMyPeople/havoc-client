@@ -1,0 +1,45 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.render.engine.vertex;
+
+import com.mojang.blaze3d.GpuFormat;
+
+public enum HavocVertexFormatElements {
+    ;
+    public static final GpuFormat POS3 = GpuFormat.RGB32_FLOAT;
+    public static final GpuFormat POS2 = GpuFormat.RG32_FLOAT;
+    public static final GpuFormat TEXTURE = GpuFormat.RG32_FLOAT;
+    public static final GpuFormat COLOR = GpuFormat.RGBA8_UNORM;
+    public static final GpuFormat RECT = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS2 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS3 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS4 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS5 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS6 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS7 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS8 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS9 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS10 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat PARAMS11 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat LOCAL = GpuFormat.RGBA32_FLOAT;
+
+    // Rigged 3D geometry. The resulting player-oriented layout stays exactly 64 bytes/vertex.
+    public static final GpuFormat NORMAL = GpuFormat.RGB32_FLOAT;
+    public static final GpuFormat TANGENT = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat BONE_INDICES32 = GpuFormat.RGBA32_UINT;
+    public static final GpuFormat BONE_WEIGHTS32 = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat BONE_INDICES = GpuFormat.RGBA8_UINT;
+    public static final GpuFormat BONE_WEIGHTS = GpuFormat.RGBA8_UNORM;
+    public static final GpuFormat DEFORM_COORD = GpuFormat.RGBA32_FLOAT;
+    public static final GpuFormat DEFORM_META = GpuFormat.R32_UINT;
+    public static final GpuFormat MATERIAL_ID = GpuFormat.R32_UINT;
+    public static final GpuFormat MATERIAL_MAP_MASK = GpuFormat.R32_UINT;
+    public static final GpuFormat MATERIAL_SURFACE = GpuFormat.R32_UINT;
+
+}

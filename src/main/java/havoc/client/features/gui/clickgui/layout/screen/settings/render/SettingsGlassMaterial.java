@@ -1,0 +1,135 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Copyright (c) 2026 pivosos2007.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ */
+
+package havoc.client.features.gui.clickgui.layout.screen.settings.render;
+
+import havoc.client.features.gui.clickgui.ClickGuiRenderer;
+import havoc.client.features.gui.clickgui.layout.screen.settings.SettingsGuiPalette;
+import havoc.client.render.engine.animation.AnimationUtility;
+import havoc.client.render.engine.renderer.Renderer2D;
+
+/** Semantic material layers shared by Settings and its controls. */
+public enum SettingsGlassMaterial {
+    ;
+
+    public static void workspace(float x, float y, float w, float h, float scale, SettingsGuiPalette palette) {
+        float lifecycleAlpha = AnimationUtility.clamp(ClickGuiRenderer.getRenderAlphaMultiplier(), 0f, 1f);
+        workspace(x, y, w, h, 42.5f * scale, scale, palette, lifecycleAlpha, lifecycleAlpha);
+    }
+
+    public static void workspace(float x,
+                                 float y,
+                                 float w,
+                                 float h,
+                                 float scale,
+                                 SettingsGuiPalette palette,
+                                 float prismProgress) {
+        float lifecycleAlpha = AnimationUtility.clamp(ClickGuiRenderer.getRenderAlphaMultiplier(), 0f, 1f);
+        workspace(x, y, w, h, 42.5f * scale, scale, palette, lifecycleAlpha, prismProgress);
+    }
+
+    public static void pickerWorkspace(float x,
+                                       float y,
+                                       float w,
+                                       float h,
+                                       float railWidth,
+                                       float scale,
+                                       SettingsGuiPalette palette,
+                                       float transitionProgress) {
+        workspace(x, y, w, h, railWidth, scale, palette, transitionProgress, transitionProgress);
+    }
+
+    private static void workspace(float x,
+                                  float y,
+                                  float w,
+                                  float h,
+                                  float railWidth,
+                                  float scale,
+                                  SettingsGuiPalette palette,
+                                  float opacity,
+                                  float prismProgress) {
+        float radius = 8f * scale;
+        float lifecycleAlpha = AnimationUtility.clamp(opacity, 0f, 1f);
+        float blurAlpha = lifecycleAlpha;
+        drawBlur(x, y, w, h, radius, blurAlpha);
+        LayoutRender2D.roundedQuad(
+                x, y, w, h, radius,
+                LayoutRender2D.alpha(palette.menuWindowBgLeft(), 0.30f),
+                LayoutRender2D.alpha(palette.menuWindowBgRight(), 0.30f),
+                LayoutRender2D.alpha(palette.menuWindowBgRight(), 0.30f),
+                LayoutRender2D.alpha(palette.menuWindowBgLeft(), 0.30f)
+        );
+        float railW = Math.min(w, Math.max(0f, railWidth));
+        Renderer2D.COLOR.roundedRectCornersQuad(
+                x, y, railW, h,
+                radius, 0f, 0f, radius,
+                1.0f,
+                palette.workspaceWashLeft(),
+                palette.workspaceWashLeft(),
+                palette.workspaceWashRight(),
+                palette.workspaceWashRight()
+        );
+    }
+
+    private static void drawBlur(float x, float y, float w, float h, float radius, float blurAlpha) {
+        Renderer2D.COLOR.blurRect(
+                x, y, w, h, radius,
+                ClickGuiRenderer.clickGuiBlurQuality(),
+                1.0f,
+                blurAlpha,
+                0xFFFFFF
+        );
+    }
+
+    public static void navigation(float x, float y, float w, float h, float scale, SettingsGuiPalette palette) {
+        float radius = 7f * scale;
+        LayoutRender2D.roundedQuad(
+                x, y, w, h, radius,
+                palette.navigationPlaneTop(),
+                palette.navigationPlaneTop(),
+                palette.navigationPlaneBottom(),
+                palette.navigationPlaneBottom()
+        );
+        LayoutRender2D.roundedStroke(x, y, w, h, radius, 0.42f * scale, palette.glassEdgeSoft());
+    }
+
+    public static void content(float x, float y, float w, float h, float scale, SettingsGuiPalette palette) {
+        float radius = 7f * scale;
+        LayoutRender2D.roundedQuad(
+                x, y, w, h, radius,
+                palette.contentPlaneTop(),
+                palette.contentPlaneTop(),
+                palette.contentPlaneBottom(),
+                palette.contentPlaneBottom()
+        );
+        LayoutRender2D.roundedStroke(x, y, w, h, radius, 0.42f * scale, palette.glassEdgeSoft());
+    }
+
+    public static void elevated(float x, float y, float w, float h, float radius, float scale, SettingsGuiPalette palette) {
+        elevated(x, y, w, h, radius, scale, palette, 1f);
+    }
+
+    public static void elevated(float x, float y, float w, float h, float radius, float scale, SettingsGuiPalette palette, float alpha) {
+        float lifecycleAlpha = AnimationUtility.clamp(ClickGuiRenderer.getRenderAlphaMultiplier(), 0f, 1f);
+        float opacity = Math.max(0f, Math.min(1f, alpha)) * lifecycleAlpha;
+        float blurAlpha = AnimationUtility.clamp(opacity * 1.04f, 0f, 1f);
+        drawBlur(x, y, w, h, radius, blurAlpha);
+        // Existing blur already prepared: do not schedule a second scene capture and glass blur.
+        LayoutRender2D.rounded(x, y, w, h, radius, LayoutRender2D.alpha(palette.contentPlaneTop(), 0.30f * opacity));
+        LayoutRender2D.roundedStroke(x, y, w, h, radius, 0.42f * scale,
+                LayoutRender2D.alpha(palette.glassEdgeSoft(), opacity));
+    }
+
+    public static void control(float x, float y, float w, float h, float radius, int color, int edge) {
+        LayoutRender2D.rounded(x, y, w, h, radius, color);
+        LayoutRender2D.roundedStroke(x, y, w, h, radius, 0.45f, edge);
+    }
+
+    public static void selection(float x, float y, float w, float h, float radius, int left, int right) {
+        LayoutRender2D.roundedQuad(x, y, w, h, radius, left, right, right, left);
+    }
+}

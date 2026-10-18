@@ -1,0 +1,291 @@
+/*
+ * This file is part of the Havoc Client distribution.
+ * Havoc modifications copyright (c) 2026 pivosos2007.
+ *
+ * Portions of this file are based on, adapted from, or implemented
+ * with reference to Meteor Client
+ * (https://github.com/MeteorDevelopment/meteor-client).
+ * Copyright (c) Meteor Development.
+ *
+ * Licensed under the GNU General Public License v3.0.
+ * See THIRD_PARTY_NOTICES.md for details.
+ */
+
+package havoc.client.render.engine.text;
+
+import havoc.client.util.resources.asset.AssetLoad;
+import havoc.client.util.logging.DebugLog;
+
+import java.io.File;
+import java.util.*;
+
+public enum Fonts {
+    ;
+    public static final List<FontFamily> FONT_FAMILIES = new ArrayList<>();
+    private static final Map<FontInfo, TextRenderer> RENDERER_CACHE = new HashMap<>();
+    private static final Map<String, FontFamily> FAMILY_BY_NAME = new HashMap<>();
+    // Keyed by the caller's family string exactly as passed, one slot per FontInfo.Type. Text
+    // nodes resolve their face every frame; a hit is now a single lookup instead of normalising,
+    // lower-casing and concatenating a "name|type" key each time.
+    private static final Map<String, FontFace[]> FACE_CACHE = new HashMap<>();
+    private static final FontInfo.Type[] FACE_TYPES = FontInfo.Type.values();
+    private static final Map<String, String> NORMALIZED_CACHE = new HashMap<>();
+    private static final Map<String, String> FAMILY_ALIASES = new HashMap<>();
+    public static String DEFAULT_FONT_FAMILY;
+    public static FontFace DEFAULT_FONT;
+    public static CustomTextRenderer RENDERER;
+    private static TextRenderer DEFAULT_RENDERER;
+    private static volatile long GENERATION;
+
+    @AssetLoad(order = 100)
+    public static void refresh() {
+        destroyCachedRenderers();
+
+        FONT_FAMILIES.clear();
+        RENDERER_CACHE.clear();
+        FAMILY_BY_NAME.clear();
+        FACE_CACHE.clear();
+        NORMALIZED_CACHE.clear();
+        ensureAliases();
+
+        for (String builtin : FontUtils.getBuiltinFamilies()) {
+            FontUtils.loadBuiltin(FONT_FAMILIES, builtin);
+        }
+
+        for (String fontPath : FontUtils.getSearchPaths()) {
+            FontUtils.loadSystem(FONT_FAMILIES, new File(fontPath));
+        }
+
+        FONT_FAMILIES.sort(Comparator.comparing(FontFamily::getName));
+        for (FontFamily family : FONT_FAMILIES) {
+            if (family == null || family.getName() == null) continue;
+            FAMILY_BY_NAME.put(family.getName().toLowerCase(Locale.ROOT), family);
+        }
+
+        DEFAULT_FONT_FAMILY = FontUtils.primaryBuiltinFamily();
+        FontFamily defaultFamily = getFamily(DEFAULT_FONT_FAMILY);
+        if (defaultFamily == null) {
+            throw new IllegalStateException("No builtin font family discovered");
+        }
+        DEFAULT_FONT = defaultFamily.get(FontInfo.Type.Regular);
+        if (DEFAULT_FONT == null) {
+            throw new IllegalStateException("Default builtin font has no regular face: " + DEFAULT_FONT_FAMILY);
+        }
+
+        load(DEFAULT_FONT);
+        GENERATION++;
+    }
+
+    /** Monotonic font resource generation; cached UI bindings must refresh when this changes. */
+    public static long generation() {
+        return GENERATION;
+    }
+
+    public static void load(FontFace fontFace) {
+        if (fontFace == null) return;
+
+        if (RENDERER != null) {
+            if (RENDERER.fontFace.equals(fontFace)) return;
+            RENDERER.destroy();
+        }
+
+        try {
+            RENDERER = new CustomTextRenderer(fontFace);
+            DEFAULT_RENDERER = new LanguageFallbackTextRenderer(RENDERER);
+        } catch (Exception e) {
+            if (fontFace.equals(DEFAULT_FONT)) {
+                throw new RuntimeException("Failed to load default font: " + fontFace, e);
+            }
+            DebugLog.warnOnce(
+                    "font-load:" + fontFace.info,
+                    "Failed to load font %s; falling back to default",
+                    fontFace,
+                    e
+            );
+            load(DEFAULT_FONT);
+        }
+    }
+
+    public static int prewarmRenderers(Collection<FontInfo> fontInfos) {
+        if (fontInfos == null || fontInfos.isEmpty()) return 0;
+        int warmed = 0;
+        for (FontInfo info : fontInfos) {
+            if (info == null) continue;
+            FontFace face = resolveFace(info.family(), info.type());
+            if (face == null) {
+                DebugLog.warnOnce(
+                        "font-prewarm-missing:" + info,
+                        "Font prewarm skipped: unresolved font %s",
+                        info
+                );
+                continue;
+            }
+            try {
+                TextRenderer renderer = rendererExact(face);
+                CustomTextRenderer custom = LanguageFallbackTextRenderer.customPrimary(renderer);
+                if (custom == null) {
+                    DebugLog.warnOnce(
+                            "font-prewarm-noncustom:" + info,
+                            "Font prewarm did not materialize a custom renderer: %s",
+                            info
+                    );
+                    continue;
+                }
+                custom.prewarmBuffers();
+                warmed++;
+            } catch (RuntimeException failure) {
+                DebugLog.warnOnce(
+                        "font-prewarm-failed:" + info,
+                        "Failed to prewarm font %s",
+                        info,
+                        failure
+                );
+            }
+        }
+        return warmed;
+    }
+
+    private static void destroyCachedRenderers() {
+        for (TextRenderer renderer : RENDERER_CACHE.values()) {
+            CustomTextRenderer custom = LanguageFallbackTextRenderer.customPrimary(renderer);
+            if (custom != null && custom != RENDERER) {
+                try {
+                    custom.destroy();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    public static FontFamily getFamily(String name) {
+        if (name == null || name.isBlank()) return null;
+        return FAMILY_BY_NAME.get(name.toLowerCase(Locale.ROOT));
+    }
+
+    public static TextRenderer renderer(String family) {
+        return renderer(family, FontInfo.Type.Regular, TextRenderer.get());
+    }
+
+    public static TextRenderer renderer(String family, FontInfo.Type type) {
+        return renderer(family, type, TextRenderer.get());
+    }
+
+    public static TextRenderer renderer(String family, FontInfo.Type type, TextRenderer fallback) {
+        FontFace face = resolveFace(family, type);
+        return renderer(face, fallback);
+    }
+
+    public static TextRenderer renderer(FontInfo info, TextRenderer fallback) {
+        if (info == null) return fallback != null ? fallback : TextRenderer.get();
+        FontFace face = resolveFace(info.family(), info.type());
+        return renderer(face, fallback);
+    }
+
+    public static TextRenderer renderer(FontFace face, TextRenderer fallback) {
+        if (face == null) return fallback != null ? fallback : TextRenderer.get();
+        try {
+            return rendererExact(face);
+        } catch (RuntimeException failure) {
+            DebugLog.warnOnce(
+                    "font-renderer-create:" + face.info,
+                    "Failed to create renderer for font %s; using fallback",
+                    face.info,
+                    failure
+            );
+            return fallback != null ? fallback : TextRenderer.get();
+        }
+    }
+
+    private static TextRenderer rendererExact(FontFace face) {
+        if (face == null) throw new IllegalArgumentException("Font face cannot be null");
+        if (RENDERER != null && RENDERER.fontFace != null && RENDERER.fontFace.info.equals(face.info)) {
+            return defaultRenderer();
+        }
+        TextRenderer cached = RENDERER_CACHE.get(face.info);
+        if (cached != null) return cached;
+        TextRenderer created = new LanguageFallbackTextRenderer(new CustomTextRenderer(face));
+        RENDERER_CACHE.put(face.info, created);
+        return created;
+    }
+
+    static TextRenderer defaultRenderer() {
+        if (DEFAULT_RENDERER != null) return DEFAULT_RENDERER;
+        return RENDERER != null ? RENDERER : VanillaTextRenderer.INSTANCE;
+    }
+
+    private static FontFace resolveFace(String family, FontInfo.Type type) {
+        if (family == null) return null;
+        FontInfo.Type wanted = type != null ? type : FontInfo.Type.Regular;
+        FontFace[] faces = FACE_CACHE.get(family);
+        if (faces != null && faces[wanted.ordinal()] != null) return faces[wanted.ordinal()];
+
+        FontFace face = resolveFaceUncached(family, wanted);
+        if (face != null) {
+            if (faces == null) {
+                faces = new FontFace[FACE_TYPES.length];
+                FACE_CACHE.put(family, faces);
+            }
+            faces[wanted.ordinal()] = face;
+        }
+        return face;
+    }
+
+    private static FontFace resolveFaceUncached(String family, FontInfo.Type wanted) {
+        if (family.isBlank()) return null;
+        String name = normalizeFamily(family);
+        if (name == null || name.isBlank()) return null;
+        FontFamily fontFamily = getFamily(name);
+        if (fontFamily == null) return null;
+
+        FontFace face = fontFamily.get(wanted);
+        if (face != null) return face;
+        if (wanted != FontInfo.Type.Regular) {
+            face = fontFamily.get(FontInfo.Type.Regular);
+            if (face != null) return face;
+        }
+        return fontFamily.get(FontInfo.Type.Bold);
+    }
+
+    private static String normalizeFamily(String family) {
+        ensureAliases();
+        String cached = NORMALIZED_CACHE.get(family);
+        if (cached != null) return cached;
+        String key = family.trim();
+        String alias = FAMILY_ALIASES.get(key.toLowerCase(Locale.ROOT));
+        String out = alias != null ? alias : key;
+        NORMALIZED_CACHE.put(family, out);
+        return out;
+    }
+
+    private static void ensureAliases() {
+        if (!FAMILY_ALIASES.isEmpty()) return;
+        FAMILY_ALIASES.put("montserrat", "Monsterrat");
+        FAMILY_ALIASES.put("intermedium", "InterMedium");
+        FAMILY_ALIASES.put("inter medium", "InterMedium");
+        FAMILY_ALIASES.put("inter_medium", "InterMedium");
+        FAMILY_ALIASES.put("inter-medium", "InterMedium");
+        FAMILY_ALIASES.put("onestmedium", "OnestMedium");
+        FAMILY_ALIASES.put("onest medium", "OnestMedium");
+        FAMILY_ALIASES.put("onest_medium", "OnestMedium");
+        FAMILY_ALIASES.put("onest-medium", "OnestMedium");
+        FAMILY_ALIASES.put("iconsnur", "IconsNur");
+        FAMILY_ALIASES.put("vanillasymbols", "VanillaSymbols");
+        FAMILY_ALIASES.put("vanilla symbols", "VanillaSymbols");
+        FAMILY_ALIASES.put("vanilla_symbols", "VanillaSymbols");
+        FAMILY_ALIASES.put("vanilla-symbols", "VanillaSymbols");
+        FAMILY_ALIASES.put("mainmenuicons", "MainMenuIcons");
+        FAMILY_ALIASES.put("menuicons", "MainMenuIcons");
+        FAMILY_ALIASES.put("guiicons", "GuiIcons");
+        FAMILY_ALIASES.put("gui_icons", "GuiIcons");
+        FAMILY_ALIASES.put("richicons", "RichIcons");
+        FAMILY_ALIASES.put("rich_icons", "RichIcons");
+        FAMILY_ALIASES.put("onestbold", "OnestBold");
+        FAMILY_ALIASES.put("onest bold", "OnestBold");
+        FAMILY_ALIASES.put("onest_bold", "OnestBold");
+        FAMILY_ALIASES.put("onest-bold", "OnestBold");
+        FAMILY_ALIASES.put("onestlight", "OnestLight");
+        FAMILY_ALIASES.put("onest light", "OnestLight");
+        FAMILY_ALIASES.put("onest_light", "OnestLight");
+        FAMILY_ALIASES.put("onest-light", "OnestLight");
+    }
+}
