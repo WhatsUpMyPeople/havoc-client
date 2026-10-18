@@ -740,3 +740,7 @@ publishing {
 // Release profile packaging lives separately from the ordinary Loom build.
 ext.havocJavetVersion = javetVersion
 apply from: rootProject.file("gradle/release-distributions.gradle")
+
+// ProGuard obfuscation pass (opt-in via :obfuscateJar). Produces
+// build/libs/<base>-<version>-obf.jar alongside the clean remapJar.
+apply from: rootProject.file("gradle/obfuscation.gradle")
