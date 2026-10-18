@@ -1,0 +1,13 @@
+// Gradle init script: prints the main runtime classpath, one jar per line,
+// prefixed with "CP::" so the CI script can grep it out. Used by the
+// standalone ProGuard step to feed -libraryjars.
+
+allprojects {
+    tasks.register('printRuntimeClasspath') {
+        doLast {
+            def cp = []
+            try { cp = sourceSets.main.runtimeClasspath.files.collect { it.absolutePath } } catch (ignored) {}
+            cp.each { println "CP::${it}" }
+        }
+    }
+}

@@ -44,12 +44,65 @@ jobs:
           set -o pipefail
           ./gradlew.bat --no-daemon --stacktrace --info build 2>&1 | tee gradle.log
 
-      - name: Obfuscate jar (ProGuard)
+      - name: Obfuscate jar (ProGuard standalone)
         id: obf
         continue-on-error: true
+        env:
+          PROGUARD_VERSION: "7.6.1"
+          PROGUARD_CORE_VERSION: "9.1.10"
         run: |
           set -o pipefail
-          ./gradlew.bat --no-daemon --stacktrace --info obfuscateJar 2>&1 | tee -a gradle.log
+          VERSION="${{ steps.props.outputs.version }}"
+          BASE="${{ steps.props.outputs.base }}"
+          CLEAN="build/libs/${BASE}-${VERSION}.jar"
+          OBF="build/libs/${BASE}-${VERSION}-obf.jar"
+          if [ ! -f "$CLEAN" ]; then
+            echo "Clean jar missing; cannot obfuscate."; exit 1
+          fi
+
+          # Download ProGuard CLI jars from Maven Central
+          mkdir -p .proguard
+          BASEURL="https://repo1.maven.org/maven2/com/guardsquare"
+          curl -sSLf -o ".proguard/proguard-base-${PROGUARD_VERSION}.jar"      "${BASEURL}/proguard-base/${PROGUARD_VERSION}/proguard-base-${PROGUARD_VERSION}.jar"
+          curl -sSLf -o ".proguard/proguard-core-${PROGUARD_CORE_VERSION}.jar" "${BASEURL}/proguard-core/${PROGUARD_CORE_VERSION}/proguard-core-${PROGUARD_CORE_VERSION}.jar"
+
+          # Dump runtime classpath via a committed init script
+          ./gradlew.bat --no-daemon --init-script .ci/print-runtime-classpath.gradle -q printRuntimeClasspath \
+              > cp.raw 2>&1 || true
+          grep '^CP::' cp.raw | sed 's/^CP:://' > cp.txt
+          echo "Resolved $(wc -l < cp.txt) runtime jars for -libraryjars"
+
+          # Build libraryjars list (as a response file to avoid Windows command-line length limits)
+          : > pg.libs
+          while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            [ ! -e "$p" ] && continue
+            # Convert to native path for ProGuard
+            NATIVE="$(cygpath -w "$p" 2>/dev/null || echo "$p")"
+            printf -- '-libraryjars "%s"\n' "$NATIVE" >> pg.libs
+          done < cp.txt
+
+          # JDK jmods
+          JAVA_HOME_U="$(cygpath -u "$JAVA_HOME" 2>/dev/null || echo "$JAVA_HOME")"
+          for m in java.base java.desktop java.sql java.naming java.management java.logging java.net.http java.scripting java.xml jdk.unsupported jdk.jfr; do
+            JMOD_U="${JAVA_HOME_U}/jmods/${m}.jmod"
+            if [ -f "$JMOD_U" ]; then
+              JMOD_W="$(cygpath -w "$JMOD_U" 2>/dev/null || echo "$JMOD_U")"
+              printf -- '-libraryjars "%s"(!**.jar;!module-info.class)\n' "$JMOD_W" >> pg.libs
+            fi
+          done
+          echo "libraryjars entries: $(wc -l < pg.libs)"
+
+          # Classpath separator on Windows is ';'
+          PG_CP=".proguard/proguard-base-${PROGUARD_VERSION}.jar;.proguard/proguard-core-${PROGUARD_CORE_VERSION}.jar"
+
+          java -cp "$PG_CP" proguard.ProGuard \
+              @proguard.pro \
+              @pg.libs \
+              -injars  "$CLEAN" \
+              -outjars "$OBF" 2>&1 | tee -a gradle.log
+
+          echo "=== build/libs after obfuscation ==="
           ls -lh build/libs/
 
       - name: List build output
