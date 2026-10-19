@@ -239,16 +239,20 @@ jobs:
           [ -f "$OBF" ] && ASSETS+=("$OBF")
           [ -f "$LOG" ] && ASSETS+=("$LOG")
 
+          cat > release-notes.md <<RELEASE_NOTES_EOF
+          Build from commit ${GITHUB_SHA:0:7}.
+
+          **Install (new users):**
+          Drop BOTH into \`.minecraft/mods/\`:
+          - \`havoc-loader-${VERSION}.jar\` — the self-updater; install once, forever
+          - \`havoc-payload.jar\` — the actual client; the loader keeps this up to date
+
+          **Already have the loader?** You don't need to download anything — your loader will fetch the new payload on the next Minecraft launch and swap it in on the launch after that.
+
+          **Legacy single-jar install:** \`${BASE}-${VERSION}.jar\` is here for anyone not using the loader (and the ProGuard-obfuscated variant if the obf step succeeded).
+          RELEASE_NOTES_EOF
+
           gh release create "$TAG" "${ASSETS[@]}" \
             --target "$GITHUB_SHA" \
             --title "Havoc Client ${VERSION} (latest)" \
-            --notes "Build from commit ${GITHUB_SHA:0:7}.
-
-**Install (new users):**
-Drop BOTH into \`.minecraft/mods/\`:
-- \`havoc-loader-${VERSION}.jar\` (the self-updater; install once, forever)
-- \`havoc-payload.jar\` (the actual client; the loader keeps this up to date)
-
-**Already have the loader?** You don't need to download anything — your loader will fetch the new payload on the next Minecraft launch and swap it in on the launch after that.
-
-**Legacy single-jar install:** \`${BASE}-${VERSION}.jar\` is still here for anyone not using the loader (and the ProGuard-obfuscated variant if the obf step succeeded)."
+            --notes-file release-notes.md
