@@ -1,0 +1,97 @@
+# Skidfuscator CE 2.0.x config for Havoc Client — HOCON format.
+#
+# Written as HOCON directly instead of YAML because Skidfuscator's YAML->HOCON
+# migrator doesn't quote regex characters like * and + in exemption patterns,
+# producing an invalid HOCON file on migration.
+#
+# All exemption patterns are double-quoted strings so HOCON treats them as
+# plain values (otherwise *, + and ? are reserved tokens).
+
+output = "havoc-payload.jar"
+
+# ---- Transformers ----
+renamer {
+    enabled = true
+    keep-line-numbers = true    # preserve stack trace file info for crash reports
+}
+
+flow {
+    enabled = true              # control-flow flattening — main anti-decompile pass
+}
+
+string-encryption {
+    enabled = true
+}
+
+number-encryption {
+    enabled = true
+}
+
+trimming {
+    enabled = false             # risks dropping classes reached only via reflection
+}
+
+anti-tamper {
+    enabled = false             # collides with Fabric mixin bytecode rewriting
+}
+
+anti-debug {
+    enabled = false             # breaks the Minecraft crash reporter + launcher logs
+}
+
+watermark {
+    enabled = true
+    text = "Havoc Client — built from a public commit — see github.com/WhatsUpMyPeople/havoc-client"
+}
+
+# ---- Exemptions (keep rules) ----
+# Internal class names (slash form). Matched as regex.
+# EVERY entry must be a double-quoted string so HOCON doesn't trip on * + ? / \
+exemptions = [
+    # Fabric entrypoint — fabric.mod.json names this by FQN
+    "havoc/client/Havoc"
+
+    # Every mixin class — havoc.mixins.json lists them, Mixin resolves by name
+    "havoc/client/mixins/.*"
+
+    # Public addon API — third-party addons link against these FQNs
+    "havoc/client/api/.*"
+
+    # Annotation types + their consumers (reflection discovery)
+    "havoc/client/runtime/annotation/.*"
+    "havoc/client/events/.*"
+
+    # Module discovery — annotation processor fills the index with FQNs
+    "havoc/client/features/module/Module"
+    "havoc/client/features/module/ModuleCategory"
+    "havoc/client/features/module/ModuleSubcategory"
+    "havoc/client/features/module/ModuleInfo"
+    "havoc/client/features/command/.*"
+    "havoc/processor/.*"
+
+    # Config profile serialization reflects on class/field names
+    "havoc/client/config/.*"
+
+    # Loader + duplex courier sub-mods
+    "havoc/loader/.*"
+    "havoc/duplexcourier/.*"
+
+    # Non-havoc packages — we don't own these, don't rename them
+    "net/minecraft/.*"
+    "net/fabricmc/.*"
+    "org/spongepowered/.*"
+    "com/mojang/.*"
+    "io/netty/.*"
+    "org/lwjgl/.*"
+    "org/joml/.*"
+    "org/slf4j/.*"
+    "org/apache/.*"
+    "com/google/.*"
+    "com/caoccao/.*"
+    "javax/.*"
+    "java/.*"
+    "sun/.*"
+    "jdk/.*"
+    "it/unimi/.*"
+    "META-INF/.*"
+]

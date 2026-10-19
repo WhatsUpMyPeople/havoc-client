@@ -119,25 +119,24 @@ jobs:
           [ -f "$RT_JAR" ] && echo "runtime jar: $(ls -lh "$RT_JAR" | awk '{print $5}')" \
                            || echo "no runtime jar prepared"
 
-          # ---- Run Skidfuscator with the real CLI (from --help): ----
-          # obfuscate [-hV] [-dbg] [-fuckit] [-notrack] [-ph] [-cfg=<config>]
-          #           [-ex=<exempt>] [-li=<libFolder>] [-o=<output>]
-          #           [-rt=<runtime>] <input>
+          # ---- Run Skidfuscator with HOCON config (exemptions inline) ----
+          # The separate -ex exempt file is deprecated and Skidfuscator's auto-migrator
+          # from YAML to HOCON forgets to quote regex chars like * and +, producing
+          # invalid HOCON. We ship the config directly as .hocon with properly-quoted
+          # exemption patterns to bypass that whole path.
           echo ""
           echo "=== Skidfuscator CLI ==="
-          echo "cmd: java -jar .skid/skidfuscator.jar obfuscate -notrack -cfg=skidfuscator.yml -ex=skidfuscator-exempts.yml -li=.skid/libs -o=$OBF -rt=$RT_JAR $CLEAN"
+          echo "cmd: java -jar .skid/skidfuscator.jar obfuscate -notrack -cfg=skidfuscator.hocon -li=.skid/libs -o=$OBF -rt=$RT_JAR $CLEAN"
           if [ -f "$RT_JAR" ]; then
             java -jar .skid/skidfuscator.jar obfuscate -notrack \
-                 -cfg=skidfuscator.yml \
-                 -ex=skidfuscator-exempts.yml \
+                 -cfg=skidfuscator.hocon \
                  -li=.skid/libs \
                  -o="$OBF" \
                  -rt="$RT_JAR" \
                  "$CLEAN" 2>&1 | tee -a gradle.log
           else
             java -jar .skid/skidfuscator.jar obfuscate -notrack \
-                 -cfg=skidfuscator.yml \
-                 -ex=skidfuscator-exempts.yml \
+                 -cfg=skidfuscator.hocon \
                  -li=.skid/libs \
                  -o="$OBF" \
                  "$CLEAN" 2>&1 | tee -a gradle.log
