@@ -72,12 +72,11 @@ def svgMsdfGeneratedResources = layout.buildDirectory.dir("generated/resources/s
 def generatedUniformResources = layout.buildDirectory.dir("generated/resources/havocUniforms")
 def javetNativeGeneratedResources = layout.buildDirectory.dir("generated/resources/javetNatives")
 def javetVersion = "5.0.9"
-def targetJavaVersion = 25
-// Note: Skidfuscator 2.0.11's bundled ASM caps at class 68 and refuses our
-// class-69 Havoc jar. We tried targetJavaVersion = 24 to work around it; the
-// project uses at least one Java-25-only language feature so that regressed
-// the main compile. Revisit when Skidfuscator (or any Fabric-friendly obf)
-// ships with ASM >= 9.8.
+// targetJavaVersion = 24 so Skidfuscator's bundled ASM can read our bytecode.
+// First attempt regressed the main compile — some Java-25-exclusive feature is
+// in use somewhere. The ci-logs release now captures the gradle log on failure,
+// so this run surfaces the exact file/feature to patch.
+def targetJavaVersion = 24
 
 sourceSets {
     main {

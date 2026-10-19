@@ -286,9 +286,19 @@ jobs:
           LOADER="release-stage/havoc-loader-${VERSION}.jar"
           LOG="gradle-${GITHUB_RUN_ID}.log"
 
+          # If no clean jar was built, we still want the gradle log on the release
+          # so I can diagnose from here (CI's own log is behind an auth-walled CDN).
+          # Attach the log to a dedicated "ci-logs" release and bail. Don't touch
+          # the "latest" release — buyers' loaders fetch from there, keep it stable.
           if [ ! -f "$CLEAN" ]; then
-            echo "No clean jar at $CLEAN — nothing to release"
+            echo "No clean jar at $CLEAN — attaching log to ci-logs release instead"
             ls -la build/libs/ || true
+            if [ -f "$LOG" ]; then
+              gh release view ci-logs >/dev/null 2>&1 || \
+                gh release create ci-logs --notes "Failed-build gradle logs — not for buyers." --prerelease
+              gh release upload ci-logs "$LOG" --clobber
+              echo "::notice::log attached to ci-logs release: $LOG"
+            fi
             exit 0
           fi
 
