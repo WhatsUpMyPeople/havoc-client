@@ -38,72 +38,11 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "base=$BASE"       >> "$GITHUB_OUTPUT"
 
-      - name: Build jar + loader
+      - name: Build jar
         id: gradle
         run: |
           set -o pipefail
-          ./gradlew.bat --no-daemon --stacktrace --info build :havoc-loader:build 2>&1 | tee gradle.log
-
-      - name: Stage payload + loader + compute sha256
-        id: payload
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.props.outputs.version }}"
-          BASE="${{ steps.props.outputs.base }}"
-          CLIENT_JAR="build/libs/${BASE}-${VERSION}.jar"
-          LOADER_JAR="havoc-loader/build/libs/havoc-loader-${VERSION}.jar"
-
-          if [ ! -f "$CLIENT_JAR" ]; then
-            echo "::error::missing $CLIENT_JAR"; ls -la build/libs/; exit 1
-          fi
-          if [ ! -f "$LOADER_JAR" ]; then
-            echo "::error::missing $LOADER_JAR"; ls -la havoc-loader/build/libs/; exit 1
-          fi
-
-          mkdir -p release-stage
-          # The payload is the client jar renamed to a FIXED filename. The loader expects
-          # exactly this name under .minecraft/mods/.
-          cp "$CLIENT_JAR" release-stage/havoc-payload.jar
-          cp "$LOADER_JAR" "release-stage/havoc-loader-${VERSION}.jar"
-
-          SHA=$(sha256sum release-stage/havoc-payload.jar | cut -d' ' -f1)
-          echo "payload sha256: $SHA"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "loader_jar=release-stage/havoc-loader-${VERSION}.jar" >> "$GITHUB_OUTPUT"
-          echo "payload_jar=release-stage/havoc-payload.jar"           >> "$GITHUB_OUTPUT"
-          ls -lh release-stage/
-
-      - name: Update docs/latest.json for GitHub Pages manifest
-        if: github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.props.outputs.version }}"
-          SHA="${{ steps.payload.outputs.sha256 }}"
-          mkdir -p docs
-          cat > docs/latest.json <<EOF
-          {
-            "version": "${VERSION}",
-            "url": "https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/havoc-payload.jar",
-            "sha256": "${SHA}",
-            "notes": "Build ${GITHUB_SHA:0:7}"
-          }
-          EOF
-          cat docs/latest.json
-
-          git config user.email "actions@github.com"
-          git config user.name  "github-actions[bot]"
-          git add docs/latest.json
-          if git diff --cached --quiet; then
-            echo "manifest unchanged — nothing to commit"
-          else
-            git commit -m "ci: update update-manifest to ${VERSION} (${GITHUB_SHA:0:7}) [skip ci]"
-            for i in 1 2 3; do
-              git pull --rebase origin main && git push origin HEAD:main && break
-              echo "retry push ($i)"; sleep 2
-            done
-          fi
+          ./gradlew.bat --no-daemon --stacktrace --info build 2>&1 | tee gradle.log
 
       - name: Obfuscate jar (ProGuard standalone)
         id: obf
@@ -240,42 +179,21 @@ jobs:
         run: |
           set -eu
           TAG="latest"
-          VERSION="${{ steps.props.outputs.version }}"
-          BASE="${{ steps.props.outputs.base }}"
-          CLEAN="build/libs/${BASE}-${VERSION}.jar"
-          OBF="build/libs/${BASE}-${VERSION}-obf.jar"
-          PAYLOAD="release-stage/havoc-payload.jar"
-          LOADER="release-stage/havoc-loader-${VERSION}.jar"
+          CLEAN="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}.jar"
+          OBF="build/libs/${{ steps.props.outputs.base }}-${{ steps.props.outputs.version }}-obf.jar"
           LOG="gradle-${GITHUB_RUN_ID}.log"
-
           if [ ! -f "$CLEAN" ]; then
             echo "No clean jar at $CLEAN — nothing to release"
             ls -la build/libs/ || true
             exit 0
           fi
-
           gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
-
-          # The payload asset MUST be named 'havoc-payload.jar' — the loader downloads it
-          # by that exact filename from the latest release.
-          ASSETS=("$PAYLOAD" "$LOADER" "$CLEAN")
+          ASSETS=("$CLEAN")
           [ -f "$OBF" ] && ASSETS+=("$OBF")
           [ -f "$LOG" ] && ASSETS+=("$LOG")
-
-          cat > release-notes.md <<RELEASE_NOTES_EOF
-          Build from commit ${GITHUB_SHA:0:7}.
-
-          **Install (new users):**
-          Drop BOTH into \`.minecraft/mods/\`:
-          - \`havoc-loader-${VERSION}.jar\` — the self-updater; install once, forever
-          - \`havoc-payload.jar\` — the actual client; the loader keeps this up to date
-
-          **Already have the loader?** You don't need to download anything — your loader will fetch the new payload on the next Minecraft launch and swap it in on the launch after that.
-
-          **Legacy single-jar install:** \`${BASE}-${VERSION}.jar\` is here for anyone not using the loader (and the ProGuard-obfuscated variant if the obf step succeeded).
-          RELEASE_NOTES_EOF
-
+          STATE="clean"
+          [ -f "$OBF" ] && STATE="clean + ProGuard-obfuscated"
           gh release create "$TAG" "${ASSETS[@]}" \
             --target "$GITHUB_SHA" \
-            --title "Havoc Client ${VERSION} (latest)" \
-            --notes-file release-notes.md
+            --title "Havoc Client ${{ steps.props.outputs.version }} (latest)" \
+            --notes "Build from commit ${GITHUB_SHA:0:7}. Includes ${STATE} jar(s) and the gradle log for this run."

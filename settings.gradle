@@ -9,4 +9,6 @@ pluginManagement {
 }
 
 include 'registry-processor'
-include 'havoc-loader'
+// Loader subproject is on hold — Loom-in-subproject conflicts with the root Loom config.
+// See havoc-loader/ for the design. Phase 1 restart will move it to its own repo or sourceset.
+// include 'havoc-loader'
