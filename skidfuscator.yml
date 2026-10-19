@@ -1,0 +1,77 @@
+# Skidfuscator config for Havoc Client.
+#
+# Keep rules preserve every surface Fabric Loader, Mixin, and the addon API
+# reflect against. Internal utility, module, click-gui, rendering, and
+# scripting code gets name-mangled, control-flow flattened, and strings
+# encrypted. Non-Havoc packages (Minecraft, Fabric, Mojang, spongepowered,
+# netty, lwjgl, slf4j) stay untouched — we don't own them and shouldn't
+# touch their class names.
+#
+# Reference docs: https://github.com/terminalsin/skidfuscator-java-obfuscator
+
+output: "havoc-client-obf.jar"
+
+# ---- transformers (what gets applied) ----
+transformers:
+  renamer:
+    enabled: true
+    # Keep class/method NAMES intact for Fabric to find them; still rename
+    # internal methods/fields that aren't in exempt list below.
+  flow:
+    enabled: true
+  stringEncryption:
+    enabled: true
+  numberEncryption:
+    enabled: true
+  trimming:
+    enabled: false   # trimming unused code can accidentally drop reflected methods
+  antiTamper:
+    enabled: false   # anti-tamper collides with mixin bytecode rewriting
+  antiDebug:
+    enabled: false   # breaks the game log + Minecraft's own debug tooling
+
+# ---- exempt (keep rules — regex over internal class names) ----
+exempt:
+  # Fabric entrypoint — fabric.mod.json references by FQN
+  - "havoc/client/Havoc"
+
+  # Every mixin class (havoc.mixins.json lists them by name) + the plugin
+  - "havoc/client/mixins/.*"
+
+  # Public addon API — third-party addons link against these FQNs
+  - "havoc/client/api/.*"
+
+  # Annotation types + classes used reflectively via annotations
+  - "havoc/client/runtime/annotation/.*"
+  - "havoc/client/events/.*"
+
+  # Module discovery index — annotation processor fills this with FQNs
+  - "havoc/client/features/module/Module"
+  - "havoc/client/features/command/.*"
+  - "havoc/processor/.*"
+
+  # Config profile system reflects on field names for .cbcfg load/save
+  - "havoc/client/config/.*"
+
+  # Loader (shouldn't be in this jar anyway; defensive)
+  - "havoc/loader/.*"
+
+  # Duplex courier sub-entrypoint
+  - "havoc/duplexcourier/.*"
+
+  # Everything we don't own — leave intact
+  - "net/minecraft/.*"
+  - "net/fabricmc/.*"
+  - "org/spongepowered/.*"
+  - "com/mojang/.*"
+  - "io/netty/.*"
+  - "org/lwjgl/.*"
+  - "org/joml/.*"
+  - "org/slf4j/.*"
+  - "com/google/.*"
+  - "javax/.*"
+  - "java/.*"
+  - "sun/.*"
+  - "jdk/.*"
+  - "it/unimi/.*"
+  - "META-INF/.*"

@@ -44,6 +44,90 @@ jobs:
           set -o pipefail
           ./gradlew.bat --no-daemon --stacktrace --info build loaderJar 2>&1 | tee gradle.log
 
+      - name: Obfuscate jar (Skidfuscator)
+        id: obf
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          VERSION="${{ steps.props.outputs.version }}"
+          BASE="${{ steps.props.outputs.base }}"
+          CLEAN="build/libs/${BASE}-${VERSION}.jar"
+          OBF="build/libs/${BASE}-${VERSION}-obf.jar"
+          if [ ! -f "$CLEAN" ]; then
+            echo "Clean jar missing; cannot obfuscate."; exit 1
+          fi
+
+          # ---- Fetch latest Skidfuscator release ----
+          mkdir -p .skid
+          REL_JSON=$(curl -sSLf \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/terminalsin/skidfuscator-java-obfuscator/releases/latest")
+          echo "$REL_JSON" | head -c 2000; echo
+          SKID_TAG=$(echo "$REL_JSON" | python -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+          # Prefer a jar whose name contains "cli" (CLI entrypoint); fall back to first .jar
+          SKID_URL=$(echo "$REL_JSON" | python -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assets = [a for a in d['assets'] if a['name'].endswith('.jar')]
+          if not assets:
+              sys.exit('no jar assets in release')
+          cli = [a for a in assets if 'cli' in a['name'].lower()]
+          print((cli or assets)[0]['browser_download_url'])
+          ")
+          echo "Skidfuscator ${SKID_TAG}: ${SKID_URL}"
+          curl -sSLf -o .skid/skidfuscator.jar "$SKID_URL"
+          ls -lh .skid/
+
+          # ---- Resolve runtime libs (same init script ProGuard used) ----
+          ./gradlew.bat --no-daemon --init-script .ci/print-runtime-classpath.gradle -q printRuntimeClasspath \
+              > cp.raw 2>&1 || true
+          grep '^CP::' cp.raw | sed 's/^CP:://' > cp.txt
+          mkdir -p .skid/libs
+          while IFS= read -r p; do
+            [ -z "$p" ] && continue
+            [ ! -e "$p" ] && continue
+            cp "$p" ".skid/libs/$(basename "$p")" 2>/dev/null || true
+          done < cp.txt
+          JAVA_HOME_U="$(cygpath -u "$JAVA_HOME" 2>/dev/null || echo "$JAVA_HOME")"
+          cp "${JAVA_HOME_U}/jmods/java.base.jmod"    .skid/libs/ 2>/dev/null || true
+          cp "${JAVA_HOME_U}/jmods/java.desktop.jmod" .skid/libs/ 2>/dev/null || true
+          echo "lib jars staged: $(ls .skid/libs | wc -l)"
+
+          # ---- Run Skidfuscator ----
+          # Skidfuscator's CLI varies across releases. Try common invocations in order
+          # of likelihood; each attempt tees output to gradle.log for diagnosis.
+          attempt() {
+            local tag="$1"; shift
+            echo ""
+            echo "=== Skidfuscator attempt: ${tag} ==="
+            echo "cmd: java -jar .skid/skidfuscator.jar $*"
+            java -jar .skid/skidfuscator.jar "$@" 2>&1 | tee -a gradle.log
+            [ -f "$OBF" ] && return 0 || return 1
+          }
+
+          attempt "obfuscate subcommand (long flags)" \
+                  obfuscate --input "$CLEAN" --output "$OBF" \
+                  --libs .skid/libs --config skidfuscator.yml \
+          || attempt "legacy positional" \
+                  "$CLEAN" "$OBF" \
+                  --libs .skid/libs --config skidfuscator.yml \
+          || attempt "short flags" \
+                  -i "$CLEAN" -o "$OBF" \
+                  -l .skid/libs -c skidfuscator.yml \
+          || attempt "help only (for diagnostics)" --help \
+          || true
+
+          echo "=== build/libs after obfuscation ==="
+          ls -lh build/libs/ || true
+          if [ -f "$OBF" ]; then
+            echo "::notice::obfuscated jar built: $OBF ($(stat -c%s "$OBF") bytes)"
+          else
+            echo "::warning::no obfuscated jar produced — release will fall back to clean payload"
+          fi
+
       - name: Stage payload + loader, compute sha256, update docs/latest.json
         id: payload
         if: success()
@@ -53,22 +137,36 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.props.outputs.version }}"
           BASE="${{ steps.props.outputs.base }}"
-          CLIENT_JAR="build/libs/${BASE}-${VERSION}.jar"
+          CLEAN_JAR="build/libs/${BASE}-${VERSION}.jar"
+          OBF_JAR="build/libs/${BASE}-${VERSION}-obf.jar"
           LOADER_JAR="build/libs/havoc-loader-${VERSION}.jar"
 
-          if [ ! -f "$CLIENT_JAR" ]; then
-            echo "::error::missing $CLIENT_JAR"; ls -la build/libs/; exit 1
+          if [ ! -f "$CLEAN_JAR" ]; then
+            echo "::error::missing $CLEAN_JAR"; ls -la build/libs/; exit 1
           fi
           if [ ! -f "$LOADER_JAR" ]; then
             echo "::error::missing $LOADER_JAR"; ls -la build/libs/; exit 1
           fi
 
+          # Prefer the obfuscated jar as the distributed payload. Fall back to the clean
+          # jar if the obf step didn't produce one (continue-on-error on that step keeps
+          # releases shipping even when the obf config needs tweaking).
+          if [ -f "$OBF_JAR" ]; then
+            PAYLOAD_SRC="$OBF_JAR"
+            PAYLOAD_FLAVOR="obfuscated"
+          else
+            PAYLOAD_SRC="$CLEAN_JAR"
+            PAYLOAD_FLAVOR="clean (obfuscation step skipped or failed)"
+          fi
+          echo "Payload source: ${PAYLOAD_SRC} (${PAYLOAD_FLAVOR})"
+
           mkdir -p release-stage
-          cp "$CLIENT_JAR" release-stage/havoc-payload.jar
-          cp "$LOADER_JAR" "release-stage/havoc-loader-${VERSION}.jar"
+          cp "$PAYLOAD_SRC" release-stage/havoc-payload.jar
+          cp "$LOADER_JAR"  "release-stage/havoc-loader-${VERSION}.jar"
           SHA=$(sha256sum release-stage/havoc-payload.jar | cut -d' ' -f1)
           echo "payload sha256: $SHA"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"           >> "$GITHUB_OUTPUT"
+          echo "flavor=$PAYLOAD_FLAVOR" >> "$GITHUB_OUTPUT"
           ls -lh release-stage/
 
           # Only commit the manifest from the main branch so feature branches don't
@@ -97,81 +195,6 @@ jobs:
               done
             fi
           fi
-
-      - name: Obfuscate jar (ProGuard standalone)
-        id: obf
-        continue-on-error: true
-        env:
-          PROGUARD_VERSION: "7.6.1"
-          PROGUARD_CORE_VERSION: "9.1.10"
-          LOG4J_VERSION: "2.24.3"
-          GSON_VERSION: "2.11.0"
-        run: |
-          set -o pipefail
-          VERSION="${{ steps.props.outputs.version }}"
-          BASE="${{ steps.props.outputs.base }}"
-          CLEAN="build/libs/${BASE}-${VERSION}.jar"
-          OBF="build/libs/${BASE}-${VERSION}-obf.jar"
-          if [ ! -f "$CLEAN" ]; then
-            echo "Clean jar missing; cannot obfuscate."; exit 1
-          fi
-
-          # Download ProGuard + its runtime deps from Maven Central
-          mkdir -p .proguard
-          dl() {
-            local url="$1" dest="$2"
-            [ -f "$dest" ] && return 0
-            echo "fetch $url"
-            curl -sSLf -o "$dest" "$url"
-          }
-          GS="https://repo1.maven.org/maven2/com/guardsquare"
-          L4="https://repo1.maven.org/maven2/org/apache/logging/log4j"
-          GS2="https://repo1.maven.org/maven2/com/google/code/gson"
-          dl "${GS}/proguard-base/${PROGUARD_VERSION}/proguard-base-${PROGUARD_VERSION}.jar"       ".proguard/proguard-base.jar"
-          dl "${GS}/proguard-core/${PROGUARD_CORE_VERSION}/proguard-core-${PROGUARD_CORE_VERSION}.jar" ".proguard/proguard-core.jar"
-          dl "${L4}/log4j-api/${LOG4J_VERSION}/log4j-api-${LOG4J_VERSION}.jar"                     ".proguard/log4j-api.jar"
-          dl "${L4}/log4j-core/${LOG4J_VERSION}/log4j-core-${LOG4J_VERSION}.jar"                   ".proguard/log4j-core.jar"
-          dl "${GS2}/gson/${GSON_VERSION}/gson-${GSON_VERSION}.jar"                                ".proguard/gson.jar"
-          ls -lh .proguard/
-
-          # Dump runtime classpath via a committed init script
-          ./gradlew.bat --no-daemon --init-script .ci/print-runtime-classpath.gradle -q printRuntimeClasspath \
-              > cp.raw 2>&1 || true
-          grep '^CP::' cp.raw | sed 's/^CP:://' > cp.txt
-          echo "Resolved $(wc -l < cp.txt) runtime jars for -libraryjars"
-
-          # Build libraryjars list (as a response file to avoid Windows command-line length limits)
-          : > pg.libs
-          while IFS= read -r p; do
-            [ -z "$p" ] && continue
-            [ ! -e "$p" ] && continue
-            # Convert to native path for ProGuard
-            NATIVE="$(cygpath -w "$p" 2>/dev/null || echo "$p")"
-            printf -- '-libraryjars "%s"\n' "$NATIVE" >> pg.libs
-          done < cp.txt
-
-          # JDK jmods
-          JAVA_HOME_U="$(cygpath -u "$JAVA_HOME" 2>/dev/null || echo "$JAVA_HOME")"
-          for m in java.base java.desktop java.sql java.naming java.management java.logging java.net.http java.scripting java.xml jdk.unsupported jdk.jfr; do
-            JMOD_U="${JAVA_HOME_U}/jmods/${m}.jmod"
-            if [ -f "$JMOD_U" ]; then
-              JMOD_W="$(cygpath -w "$JMOD_U" 2>/dev/null || echo "$JMOD_U")"
-              printf -- '-libraryjars "%s"(!**.jar;!module-info.class)\n' "$JMOD_W" >> pg.libs
-            fi
-          done
-          echo "libraryjars entries: $(wc -l < pg.libs)"
-
-          # Classpath separator on Windows is ';'
-          PG_CP=".proguard/proguard-base.jar;.proguard/proguard-core.jar;.proguard/log4j-api.jar;.proguard/log4j-core.jar;.proguard/gson.jar"
-
-          java -cp "$PG_CP" proguard.ProGuard \
-              @proguard.pro \
-              @pg.libs \
-              -injars  "$CLEAN" \
-              -outjars "$OBF" 2>&1 | tee -a gradle.log
-
-          echo "=== build/libs after obfuscation ==="
-          ls -lh build/libs/
 
       - name: List build output
         if: always()
