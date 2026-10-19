@@ -89,6 +89,8 @@ public enum StaticHudElementRegistry {
                                        TextRenderer textRenderer,
                                        GuiGraphicsExtractor ctx,
                                        float tickDelta) {
+        // StreamerMode: suppress every static HUD element (tab, bars, tooltips) while active.
+        if (havoc.client.features.module.modules.misc.StreamerMode.shouldHideHud()) return;
         renderAllEngineInternal(phase, space, renderer, textRenderer, ctx, tickDelta, false);
     }
 
@@ -98,6 +100,7 @@ public enum StaticHudElementRegistry {
                                                  TextRenderer textRenderer,
                                                  GuiGraphicsExtractor ctx,
                                                  float tickDelta) {
+        if (havoc.client.features.module.modules.misc.StreamerMode.shouldHideHud()) return;
         renderAllEngineInternal(phase, space, renderer, textRenderer, ctx, tickDelta, true);
     }
 

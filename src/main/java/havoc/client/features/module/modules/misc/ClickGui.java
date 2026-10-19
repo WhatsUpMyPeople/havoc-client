@@ -35,7 +35,10 @@ public class ClickGui extends Module {
     private final NumberValue<Double> guiSoundVolume = num("gui_sound_volume", 0.75, 0.0, 2.0);
 
     {
-        setDefaultBind("RIGHT_SHIFT");
+        // Default moved off RIGHT_SHIFT to make room for the StreamerMode toggle,
+        // which is far more useful on the dominant idle-hand key. Rebind the
+        // ClickGUI in-game if you prefer the old key.
+        setDefaultBind("RIGHT_CONTROL");
     }
 
     public static boolean isSuppressScreenClose() {

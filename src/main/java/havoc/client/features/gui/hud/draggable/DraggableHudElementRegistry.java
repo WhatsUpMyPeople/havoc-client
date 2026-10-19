@@ -180,6 +180,12 @@ public enum DraggableHudElementRegistry {
             cancelDragging();
             return;
         }
+        // StreamerMode: suppress every draggable HUD element while active.
+        // Modules continue to run — they just don't draw.
+        if (havoc.client.features.module.modules.misc.StreamerMode.shouldHideHud()) {
+            cancelDragging();
+            return;
+        }
         Minecraft mc = Minecraft.getInstance();
         if (mc == null || mc.getWindow() == null) return;
         boolean allowOnlyModuleList = false;
@@ -245,6 +251,11 @@ public enum DraggableHudElementRegistry {
                                                  net.minecraft.client.gui.GuiGraphicsExtractor ctx,
                                                  float tickDelta) {
         if (!RuntimeGate.canRunHud()) {
+            cancelDragging();
+            return;
+        }
+        // StreamerMode: suppress foreground HUD draws as well.
+        if (havoc.client.features.module.modules.misc.StreamerMode.shouldHideHud()) {
             cancelDragging();
             return;
         }
