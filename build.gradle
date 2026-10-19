@@ -72,11 +72,12 @@ def svgMsdfGeneratedResources = layout.buildDirectory.dir("generated/resources/s
 def generatedUniformResources = layout.buildDirectory.dir("generated/resources/havocUniforms")
 def javetNativeGeneratedResources = layout.buildDirectory.dir("generated/resources/javetNatives")
 def javetVersion = "5.0.9"
-// targetJavaVersion = 24 so Skidfuscator's bundled ASM can read our bytecode.
-// First attempt regressed the main compile — some Java-25-exclusive feature is
-// in use somewhere. The ci-logs release now captures the gradle log on failure,
-// so this run surfaces the exact file/feature to patch.
-def targetJavaVersion = 24
+def targetJavaVersion = 25
+// Keeping class 69 even though Skidfuscator can't read it. Downgrading to class 68
+// breaks dep resolution: viafabricplus-api 4.6.0 was published as class 69 and
+// Gradle refuses to pull it when the project asks for JVM 24 compatibility.
+// Revisit obfuscation when Skidfuscator ships with ASM 9.8+ (handles class 69),
+// or switch to a commercial obfuscator (Allatori/Branchlock) that already does.
 
 sourceSets {
     main {
