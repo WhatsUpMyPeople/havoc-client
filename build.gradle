@@ -72,12 +72,12 @@ def svgMsdfGeneratedResources = layout.buildDirectory.dir("generated/resources/s
 def generatedUniformResources = layout.buildDirectory.dir("generated/resources/havocUniforms")
 def javetNativeGeneratedResources = layout.buildDirectory.dir("generated/resources/javetNatives")
 def javetVersion = "5.0.9"
-// Emit class-68 (Java 24) bytecode even though we still compile on JDK 25.
-// Reason: Skidfuscator 2.0.11's bundled ASM caps at class 68, so building the
-// Havoc jar at class 69 makes it unobfuscatable until the obfuscator ecosystem
-// catches up. JVM 25 reads class 68 bytecode fine, and the project uses no
-// Java 25-exclusive language features.
-def targetJavaVersion = 24
+def targetJavaVersion = 25
+// Note: Skidfuscator 2.0.11's bundled ASM caps at class 68 and refuses our
+// class-69 Havoc jar. We tried targetJavaVersion = 24 to work around it; the
+// project uses at least one Java-25-only language feature so that regressed
+// the main compile. Revisit when Skidfuscator (or any Fabric-friendly obf)
+// ships with ASM >= 9.8.
 
 sourceSets {
     main {
