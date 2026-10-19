@@ -81,44 +81,67 @@ jobs:
           curl -sSLf -o .skid/skidfuscator.jar "$SKID_URL"
           ls -lh .skid/
 
-          # ---- Resolve runtime libs (same init script ProGuard used) ----
+          # ---- Resolve runtime libs via Gradle init script ----
           ./gradlew.bat --no-daemon --init-script .ci/print-runtime-classpath.gradle -q printRuntimeClasspath \
               > cp.raw 2>&1 || true
           grep '^CP::' cp.raw | sed 's/^CP:://' > cp.txt
           mkdir -p .skid/libs
+          # Skidfuscator reads .jar files from the libs dir. Only copy jars; skip .jmod
+          # since Skidfuscator passes those through its runtime arg separately.
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             [ ! -e "$p" ] && continue
-            cp "$p" ".skid/libs/$(basename "$p")" 2>/dev/null || true
+            case "$p" in
+              *.jar) cp "$p" ".skid/libs/$(basename "$p")" 2>/dev/null || true ;;
+            esac
           done < cp.txt
+          echo "lib jars staged: $(ls .skid/libs 2>/dev/null | wc -l)"
+
+          # ---- Pick the Java runtime jar Skidfuscator needs for class resolution ----
+          # Skidfuscator wants a single runtime jar (classic rt.jar replacement). On
+          # Java 9+ the equivalent is jrt-fs.jar from the JDK or any jmod expanded to
+          # a jar. Simplest: convert java.base.jmod to a jar on the fly.
           JAVA_HOME_U="$(cygpath -u "$JAVA_HOME" 2>/dev/null || echo "$JAVA_HOME")"
-          cp "${JAVA_HOME_U}/jmods/java.base.jmod"    .skid/libs/ 2>/dev/null || true
-          cp "${JAVA_HOME_U}/jmods/java.desktop.jmod" .skid/libs/ 2>/dev/null || true
-          echo "lib jars staged: $(ls .skid/libs | wc -l)"
+          JMOD_BASE="${JAVA_HOME_U}/jmods/java.base.jmod"
+          RT_JAR=".skid/runtime.jar"
+          if [ -f "$JMOD_BASE" ]; then
+            # jmod extract puts classes/ in a dir; jar them up as a plain jar
+            mkdir -p .skid/rt-extract
+            (cd .skid/rt-extract && "${JAVA_HOME_U}/bin/jmod" extract "$JMOD_BASE") || true
+            if [ -d .skid/rt-extract/classes ]; then
+              (cd .skid/rt-extract/classes && "${JAVA_HOME_U}/bin/jar" cf "../../$(basename "$RT_JAR")" .) || true
+            fi
+          fi
+          # Fallback: pass jrt-fs.jar if the extract failed
+          if [ ! -f "$RT_JAR" ] && [ -f "${JAVA_HOME_U}/lib/jrt-fs.jar" ]; then
+            cp "${JAVA_HOME_U}/lib/jrt-fs.jar" "$RT_JAR"
+          fi
+          [ -f "$RT_JAR" ] && echo "runtime jar: $(ls -lh "$RT_JAR" | awk '{print $5}')" \
+                           || echo "no runtime jar prepared"
 
-          # ---- Run Skidfuscator ----
-          # Skidfuscator's CLI varies across releases. Try common invocations in order
-          # of likelihood; each attempt tees output to gradle.log for diagnosis.
-          attempt() {
-            local tag="$1"; shift
-            echo ""
-            echo "=== Skidfuscator attempt: ${tag} ==="
-            echo "cmd: java -jar .skid/skidfuscator.jar $*"
-            java -jar .skid/skidfuscator.jar "$@" 2>&1 | tee -a gradle.log
-            [ -f "$OBF" ] && return 0 || return 1
-          }
-
-          attempt "obfuscate subcommand (long flags)" \
-                  obfuscate --input "$CLEAN" --output "$OBF" \
-                  --libs .skid/libs --config skidfuscator.yml \
-          || attempt "legacy positional" \
-                  "$CLEAN" "$OBF" \
-                  --libs .skid/libs --config skidfuscator.yml \
-          || attempt "short flags" \
-                  -i "$CLEAN" -o "$OBF" \
-                  -l .skid/libs -c skidfuscator.yml \
-          || attempt "help only (for diagnostics)" --help \
-          || true
+          # ---- Run Skidfuscator with the real CLI (from --help): ----
+          # obfuscate [-hV] [-dbg] [-fuckit] [-notrack] [-ph] [-cfg=<config>]
+          #           [-ex=<exempt>] [-li=<libFolder>] [-o=<output>]
+          #           [-rt=<runtime>] <input>
+          echo ""
+          echo "=== Skidfuscator CLI ==="
+          echo "cmd: java -jar .skid/skidfuscator.jar obfuscate -notrack -cfg=skidfuscator.yml -ex=skidfuscator-exempts.yml -li=.skid/libs -o=$OBF -rt=$RT_JAR $CLEAN"
+          if [ -f "$RT_JAR" ]; then
+            java -jar .skid/skidfuscator.jar obfuscate -notrack \
+                 -cfg=skidfuscator.yml \
+                 -ex=skidfuscator-exempts.yml \
+                 -li=.skid/libs \
+                 -o="$OBF" \
+                 -rt="$RT_JAR" \
+                 "$CLEAN" 2>&1 | tee -a gradle.log
+          else
+            java -jar .skid/skidfuscator.jar obfuscate -notrack \
+                 -cfg=skidfuscator.yml \
+                 -ex=skidfuscator-exempts.yml \
+                 -li=.skid/libs \
+                 -o="$OBF" \
+                 "$CLEAN" 2>&1 | tee -a gradle.log
+          fi || true
 
           echo "=== build/libs after obfuscation ==="
           ls -lh build/libs/ || true

@@ -1,0 +1,62 @@
+# Skidfuscator exempt rules for Havoc Client.
+#
+# Each entry is a regex matched against the internal class/method/field name
+# (slash form, e.g. havoc/client/Havoc). An entry that matches a class
+# protects the entire class including its members.
+#
+# Covered reflection + framework surface:
+#   - Fabric Loader entrypoint (fabric.mod.json names it by FQN)
+#   - Every mixin class (havoc.mixins.json lists them, Mixin resolves by name)
+#   - Addon API — third-party addons link against these FQNs
+#   - Annotation types + annotated classes/members (reflection discovery)
+#   - Config profiles (.cbcfg save/load reflects on field names)
+#   - Annotation-processor-generated module index (loads by FQN)
+#   - All non-havoc packages (Minecraft, Fabric, Mojang, netty, lwjgl, …)
+
+exempt:
+  # ---- Fabric entrypoint ----
+  - "havoc/client/Havoc"
+
+  # ---- Mixins + their plugin ----
+  - "havoc/client/mixins/.*"
+
+  # ---- Public addon API ----
+  - "havoc/client/api/.*"
+
+  # ---- Annotation types + their consumers ----
+  - "havoc/client/runtime/annotation/.*"
+  - "havoc/client/events/.*"
+
+  # ---- Module & command discovery (annotation processor fills by FQN) ----
+  - "havoc/client/features/module/Module"
+  - "havoc/client/features/module/ModuleCategory"
+  - "havoc/client/features/module/ModuleSubcategory"
+  - "havoc/client/features/module/ModuleInfo"
+  - "havoc/client/features/command/.*"
+  - "havoc/processor/.*"
+
+  # ---- Config profile serialization reflects on class/field names ----
+  - "havoc/client/config/.*"
+
+  # ---- Loader + duplex courier sub-mods ----
+  - "havoc/loader/.*"
+  - "havoc/duplexcourier/.*"
+
+  # ---- Minecraft, Fabric, and all third-party packages ----
+  - "net/minecraft/.*"
+  - "net/fabricmc/.*"
+  - "org/spongepowered/.*"
+  - "com/mojang/.*"
+  - "io/netty/.*"
+  - "org/lwjgl/.*"
+  - "org/joml/.*"
+  - "org/slf4j/.*"
+  - "org/apache/.*"
+  - "com/google/.*"
+  - "com/caoccao/.*"
+  - "javax/.*"
+  - "java/.*"
+  - "sun/.*"
+  - "jdk/.*"
+  - "it/unimi/.*"
+  - "META-INF/.*"
