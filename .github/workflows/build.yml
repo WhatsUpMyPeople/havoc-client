@@ -199,6 +199,29 @@ jobs:
             ls -lh "gradle-${GITHUB_RUN_ID}.log"
           fi
 
+      - name: Push gradle log into repo on failure
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if [ ! -f "gradle-${GITHUB_RUN_ID}.log" ]; then
+            echo "no log to push"; exit 0
+          fi
+          mkdir -p _ci
+          cp "gradle-${GITHUB_RUN_ID}.log" "_ci/gradle-${GITHUB_RUN_ID}.log"
+          git config user.email "actions@github.com"
+          git config user.name  "github-actions[bot]"
+          git add "_ci/gradle-${GITHUB_RUN_ID}.log"
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: log for failed run ${GITHUB_RUN_ID} [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase origin main && git push origin HEAD:main && break
+              echo "retry push ($i)"; sleep 2
+            done
+          fi
+
       - name: Upload jar artifact
         if: success()
         uses: actions/upload-artifact@v4
