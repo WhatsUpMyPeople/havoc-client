@@ -120,6 +120,18 @@ public class AutoCrystal extends Module {
 
     public void onCrystalsRemoved() { /* no-op */ }
 
+    /** TargetHud status string: shown on the HUD under the current target. */
+    public String getTargetHudStatus(LivingEntity hudTarget) {
+        if (!isEnabled() || hudTarget == null) return null;
+        if (currentTarget == null || hudTarget != currentTarget) return null;
+        if (mc.player == null || mc.level == null) return "Idle";
+        if (!isMacroActive()) return "Waiting";
+
+        long cooldown = Math.max(0L, placeDelayMs.get() - (System.currentTimeMillis() - lastPlaceMs));
+        if (cooldown > 0L) return "Place in " + cooldown + "ms";
+        return "Hunting";
+    }
+
     // ------------------------------------------------------------------
     //                         Lifecycle
     // ------------------------------------------------------------------
