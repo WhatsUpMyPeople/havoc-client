@@ -81,12 +81,23 @@ public class AutoCrystal extends Module {
             num("autocrystalPlaceRange", "place_range", 4.5, 1.0, 6.0);
     private final NumberValue<Double> hitRange =
             num("autocrystalHitRange", "hit_range", 4.0, 2.0, 6.0);
+    // Default lowered from 6.0 to 2.0 — the previous threshold rejected most
+    // spots on crowded servers. Users who want harder picks can raise it.
     private final NumberValue<Double> minDamage =
-            num("autocrystalMinDamage", "min_damage", 6.0, 0.5, 20.0);
+            num("autocrystalMinDamage", "min_damage", 2.0, 0.5, 20.0);
     private final NumberValue<Double> maxSelfDamage =
             num("autocrystalMaxSelfDamage", "max_self_damage", 8.0, 0.5, 20.0);
     private final NumberValue<Integer> placeDelayMs =
             num("autocrystalPlaceDelay", "place_delay_ms", 200, 0, 1000);
+
+    // Face-place: when target HP+absorption is low, ignore min_damage and just
+    // place against them. Ported from Anubis CrystalAura.
+    private final BooleanValue facePlace =
+            bool("autocrystalFacePlace", "face_place", true);
+    private final NumberValue<Double> facePlaceHealth =
+            num("autocrystalFacePlaceHealth", "face_place_health", 10.0, 0.0, 40.0);
+    private final KeyBindValue forceFacePlace =
+            bind("autocrystalForceFacePlace", "force_face_place_key", "NONE", BindMode.HOLD);
 
     private final BooleanValue autoSwitch =
             bool("autocrystalAutoSwitch", "auto_switch", true);
@@ -211,25 +222,29 @@ public class AutoCrystal extends Module {
         }
 
         double tdist = Math.sqrt(player.distanceToSqr(currentTarget));
+        float tHp = currentTarget.getHealth() + currentTarget.getAbsorptionAmount();
+        boolean face = (facePlace.get() && tHp <= facePlaceHealth.get().floatValue())
+                || isComboHeld(forceFacePlace.get());
+        String tgtName = currentTarget.getName().getString()
+                + " (" + String.format("%.1f", tdist) + "b, " + String.format("%.1f", tHp) + "hp"
+                + (face ? ", FACE" : "") + ")";
 
         // Attack first (free damage), place only if nothing to hit.
         if (attackBestCrystal(player)) {
-            debugStatus("hit crystal on " + currentTarget.getName().getString()
-                    + " (" + String.format("%.1f", tdist) + "b)");
+            debugStatus("hit crystal " + tgtName);
             return;
         }
 
         int placed = tryPlaceCrystal(player, level);
         if (placed == 1) {
-            debugStatus("placed on " + currentTarget.getName().getString()
-                    + " (" + String.format("%.1f", tdist) + "b)");
+            debugStatus("placed " + tgtName);
         } else if (placed == -1) {
             long cd = Math.max(0L, placeDelayMs.get() - (System.currentTimeMillis() - lastPlaceMs));
-            debugStatus("place cooldown " + cd + "ms");
+            debugStatus("place cooldown " + cd + "ms " + tgtName);
         } else if (placed == -2) {
-            debugStatus("no good spot vs " + currentTarget.getName().getString());
+            debugStatus("no spot vs " + tgtName);
         } else if (placed == -3) {
-            debugStatus("no end crystal in hotbar");
+            debugStatus("no end crystal in hotbar vs " + tgtName);
         }
     }
 
@@ -343,8 +358,17 @@ public class AutoCrystal extends Module {
         boolean walls = ignoreWalls.get();
         double place = placeRange.get();
 
+        // Face-place: when enemy HP+absorption is low, OR user holds the force
+        // key, drop the min_damage threshold and score by proximity to the
+        // target instead. This is what wins fights against low-HP players.
+        float targetHp = target.getHealth() + target.getAbsorptionAmount();
+        boolean forceHeld = isComboHeld(forceFacePlace.get());
+        boolean faceMode = (facePlace.get() && targetHp <= facePlaceHealth.get().floatValue()) || forceHeld;
+
         Placement best = null;
-        float bestDamage = Math.max(minDamage.get().floatValue(), 0.0F);
+        float bestDamage = faceMode ? -1.0F : Math.max(minDamage.get().floatValue(), 0.0F);
+        double bestProximitySq = Double.MAX_VALUE;
+        Vec3 targetCenter = target.getBoundingBox().getCenter();
 
         for (BlockPos pos : BlockPos.betweenClosed(
                 playerPos.offset(-r, -2, -r),
@@ -364,12 +388,28 @@ public class AutoCrystal extends Module {
             if (!selfDamageAllowed(player, selfDamage)) continue;
 
             float damage = explosionDamage(target, explosion);
-            if (damage <= bestDamage) continue;
 
-            best = new Placement(pos.immutable(), explosion);
-            bestDamage = damage;
+            if (faceMode) {
+                // Rank by closeness to the target, not damage. Still prefers
+                // higher damage as tiebreaker.
+                double proximitySq = explosion.distanceToSqr(targetCenter);
+                if (proximitySq > bestProximitySq) continue;
+                if (proximitySq == bestProximitySq && damage <= bestDamage) continue;
+                best = new Placement(pos.immutable(), explosion);
+                bestProximitySq = proximitySq;
+                bestDamage = damage;
+            } else {
+                if (damage <= bestDamage) continue;
+                best = new Placement(pos.immutable(), explosion);
+                bestDamage = damage;
+            }
         }
         return best;
+    }
+
+    private static boolean isComboHeld(String combo) {
+        if (combo == null || combo.isEmpty() || combo.equalsIgnoreCase("NONE")) return false;
+        return KeyManager.isComboHeldAllowScreen(combo);
     }
 
     private boolean canPlaceCrystal(ClientLevel level, BlockPos pos) {
