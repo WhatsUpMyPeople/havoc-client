@@ -163,8 +163,8 @@ public class AutoCrystal extends Module {
             lastDebugLine = line;
             // Also push to chat so it's visible even when the notifications HUD
             // is disabled or StreamerMode is hiding it.
-            if (mc.player != null) {
-                mc.player.displayClientMessage(Component.literal("[AC] " + line), false);
+            if (mc.gui != null && mc.gui.getChat() != null) {
+                mc.gui.getChat().addMessage(Component.literal("[AC] " + line));
             }
         }
     }
