@@ -38,6 +38,7 @@ import havoc.client.util.combat.RubberHandUseUtil;
 import havoc.client.util.item.FoodUtil;
 import havoc.client.util.entity.simulation.PositionExtrapolation;
 import havoc.client.util.player.inventory.InventorySearchScope;
+import havoc.client.util.input.KeyManager;
 import havoc.client.util.player.inventory.InventorySwap;
 import havoc.client.util.player.inventory.InventorySwapVisibility;
 import havoc.client.util.player.simulation.PlayerSimulationCache;
@@ -78,6 +79,13 @@ public class AutoAnchor extends Module {
     private static final double TEXT_SCALE = 1.0;
     private static final double TEXT_GAP_SCALE = 1.0;
     private final Minecraft mc = Minecraft.getInstance();
+
+    // Macro key: hold-to-act gating. When this bind is NONE (default) the module
+    // runs normally whenever enabled. When set, the module only places/explodes
+    // anchors while the key is held — AutoAnchor becomes a burst macro you tap
+    // on demand instead of a background always-fires module.
+    private final KeyBindValue macroKey =
+            bind("autoanchorMacroKey", "macro_key", "NONE", BindMode.HOLD);
 
     private final BooleanValue placeEnabled = boolCommon("autoanchorPlace", CommonSettingSchemas.PLACE, true);
     private final BooleanValue explodeEnabled = boolCommon("autoanchorExplode", CommonSettingSchemas.EXPLODE, true);
@@ -298,9 +306,21 @@ public class AutoAnchor extends Module {
         TargetManager.setAutoAnchorTarget(null);
     }
 
+    /**
+     * Burst-macro gate. Returns true when the module should actually perform
+     * work this tick: either no macro key is bound (always on while enabled)
+     * or the bound macro key is currently held.
+     */
+    private boolean isMacroActive() {
+        String combo = macroKey.get();
+        if (combo == null || combo.isEmpty() || combo.equalsIgnoreCase("NONE")) return true;
+        return KeyManager.isComboHeldAllowScreen(combo);
+    }
+
     @Override
     public void onTick() {
         if (!isEnabled()) return;
+        if (!isMacroActive()) return;
         renderTick++;
         InventorySwap.INSTANCE.tick();
         purgeExpiredRenderPositions();
@@ -316,6 +336,11 @@ public class AutoAnchor extends Module {
             return;
         }
         if (!isEnabled()) return;
+        if (!isMacroActive()) {
+            clearCombatState();
+            TargetManager.setAutoAnchorTarget(null);
+            return;
+        }
 
         if (mc.player == null || mc.level == null || mc.gameMode == null) {
             clearCombatState();
@@ -338,6 +363,7 @@ public class AutoAnchor extends Module {
             return;
         }
         if (!isEnabled() || timing.get() != Timing.SEQUENTIAL) return;
+        if (!isMacroActive()) return;
         runCombatCycle();
     }
 

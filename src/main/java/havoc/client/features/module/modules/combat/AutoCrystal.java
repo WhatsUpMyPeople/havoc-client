@@ -56,6 +56,7 @@ import havoc.client.util.combat.ExplosionRenderUtil;
 import havoc.client.util.combat.RubberHandUseUtil;
 import havoc.client.util.item.FoodUtil;
 import havoc.client.util.entity.simulation.PositionExtrapolation;
+import havoc.client.util.input.KeyManager;
 import havoc.client.util.player.inventory.InventorySwap;
 import havoc.client.util.player.simulation.PlayerSimulationCache;
 import havoc.client.util.target.TargetManager;
@@ -88,6 +89,14 @@ public class AutoCrystal extends Module {
     private static final double TARGET_SEARCH_RANGE = 12.0;
 
     private final Minecraft mc = Minecraft.getInstance();
+
+    // Macro key: hold-to-act gating. When this bind is NONE (default) the module
+    // runs normally whenever enabled. When set, the module only places/attacks
+    // while the key is held, so AutoCrystal becomes a burst macro you tap on
+    // demand without having to toggle the module every fight. Overrides the
+    // base-action toggle for the duration of a hold.
+    private final KeyBindValue macroKey =
+            bind("autocrystalMacroKey", "macro_key", "NONE", BindMode.HOLD);
 
     private final BooleanValue renderEnabled =
             boolCommon(
@@ -387,9 +396,21 @@ public class AutoCrystal extends Module {
         TargetManager.setAutoCrystalTarget(null);
     }
 
+    /**
+     * Burst-macro gate. Returns true when the module should actually perform
+     * work this tick: either no macro key is bound (always on while enabled)
+     * or the bound macro key is currently held.
+     */
+    private boolean isMacroActive() {
+        String combo = macroKey.get();
+        if (combo == null || combo.isEmpty() || combo.equalsIgnoreCase("NONE")) return true;
+        return KeyManager.isComboHeldAllowScreen(combo);
+    }
+
     @Override
     public void onTick() {
         if (!isEnabled()) return;
+        if (!isMacroActive()) return;
         renderTick++;
         if (isActionPressedOnce(ACTION_BASE)) {
             baseActive = !baseActive;
@@ -436,6 +457,10 @@ public class AutoCrystal extends Module {
         }
 
         if (!isEnabled()) return;
+        if (!isMacroActive()) {
+            clearPlacementState();
+            return;
+        }
         if (mc.player == null || mc.level == null || mc.gameMode == null) {
             clearPlacementState();
             TargetManager.setAutoCrystalTarget(null);

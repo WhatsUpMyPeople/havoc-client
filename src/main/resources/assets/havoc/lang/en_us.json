@@ -4382,6 +4382,8 @@
   "notification.autoreconnect.invalid_address": "The last server address is invalid; reconnect stopped.",
   "module.autosell.description": "Runs a server-side sell command on a timer or when the inventory fills up. Default is /sell all; set the command for your server's shop plugin.",
   "module.streamermode.description": "Hides every visible Havoc rendering surface (HUD, world ESP/Chams/Tracers, ClickGUI branding, chat prefix, notifications) while every module keeps running underneath. Default bind: Right Shift.",
+  "setting.autocrystal.macro_key": "Macro key (hold to act)",
+  "setting.autoanchor.macro_key": "Macro key (hold to act)",
   "setting.streamermode.hide_hud": "Hide HUD overlay",
   "setting.streamermode.hide_world_effects": "Hide world visuals (ESP, Chams, Tracers)",
   "setting.streamermode.hide_clickgui_branding": "Hide ClickGUI branding",
