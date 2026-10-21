@@ -36,8 +36,8 @@ import havoc.client.features.module.ModuleInfo;
 import havoc.client.features.module.ModuleSubcategory;
 import havoc.client.features.module.Notifier;
 import havoc.client.mixins.accessors.PlayerInventoryAccessor;
+import havoc.client.util.LegacyHudNotifier;
 import havoc.client.util.input.KeyManager;
-import net.minecraft.network.chat.Component;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -161,12 +161,12 @@ public class AutoCrystal extends Module {
         if (!line.equals(lastDebugLine)) {
             Notifier.update("autocrystal_status", line);
             lastDebugLine = line;
-            // Also push to chat so it's visible even when the notifications HUD
-            // is disabled or StreamerMode is hiding it.
-            if (mc.gui != null && mc.gui.getChat() != null) {
-                mc.gui.getChat().addMessage(Component.literal("[AC] " + line));
-            }
         }
+        // Push every tick to the vanilla overlay (above hotbar) so it stays
+        // visible even without the notifications HUD element enabled, and
+        // regardless of StreamerMode. Vanilla ignores back-to-back identical
+        // messages, so the overlay doesn't flicker.
+        LegacyHudNotifier.show("[AC] " + line);
     }
 
     private void resetState() {
