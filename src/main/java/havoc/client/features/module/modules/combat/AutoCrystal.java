@@ -34,6 +34,7 @@ import havoc.client.features.module.Module;
 import havoc.client.features.module.ModuleCategory;
 import havoc.client.features.module.ModuleInfo;
 import havoc.client.features.module.ModuleSubcategory;
+import havoc.client.features.module.Notifier;
 import havoc.client.mixins.accessors.PlayerInventoryAccessor;
 import havoc.client.util.input.KeyManager;
 import net.minecraft.client.Minecraft;
@@ -96,6 +97,10 @@ public class AutoCrystal extends Module {
             bool("autocrystalIgnoreWalls", "ignore_walls", false);
     private final BooleanValue swingHand =
             bool("autocrystalSwing", "swing_hand", true);
+    private final BooleanValue rotate =
+            bool("autocrystalRotate", "rotate", true);
+    private final BooleanValue debug =
+            bool("autocrystalDebug", "debug", true);
 
     // Hold-to-act macro. NONE = act whenever enabled; bound = only while held.
     private final KeyBindValue macroKey =
@@ -108,6 +113,8 @@ public class AutoCrystal extends Module {
     private LivingEntity currentTarget;
     private int restoreSlot = -1;
     private long lastPlaceMs = 0L;
+    private int debugTicker = 0;
+    private String lastDebugLine = "";
 
     // ------------------------------------------------------------------
     //                      Mixin-callback shims
@@ -139,11 +146,21 @@ public class AutoCrystal extends Module {
     @Override
     public void onEnable() {
         resetState();
+        if (debug.get()) Notifier.info("AutoCrystal armed");
     }
 
     @Override
     public void onDisable() {
         resetState();
+        if (debug.get()) Notifier.clear("autocrystal_status");
+    }
+
+    private void debugStatus(String line) {
+        if (!debug.get()) return;
+        if (!line.equals(lastDebugLine)) {
+            Notifier.update("autocrystal_status", line);
+            lastDebugLine = line;
+        }
     }
 
     private void resetState() {
@@ -162,11 +179,17 @@ public class AutoCrystal extends Module {
     @Override
     public void onTick() {
         if (!isEnabled()) return;
-        if (!isMacroActive()) return;
+        if (!isMacroActive()) {
+            debugStatus("waiting on macro key");
+            return;
+        }
 
         LocalPlayer player = mc.player;
         ClientLevel level = mc.level;
-        if (player == null || level == null || mc.gameMode == null) return;
+        if (player == null || level == null || mc.gameMode == null) {
+            debugStatus("no player/level");
+            return;
+        }
 
         // Restore hotbar slot from a prior silent swap if the user has not
         // meanwhile picked a different slot themselves.
@@ -176,11 +199,31 @@ public class AutoCrystal extends Module {
         }
 
         currentTarget = findTarget(player, level);
-        if (currentTarget == null) return;
+        if (currentTarget == null) {
+            debugStatus("no target in " + targetRange.get().intValue() + " blocks");
+            return;
+        }
+
+        double tdist = Math.sqrt(player.distanceToSqr(currentTarget));
 
         // Attack first (free damage), place only if nothing to hit.
-        if (!attackBestCrystal(player)) {
-            tryPlaceCrystal(player, level);
+        if (attackBestCrystal(player)) {
+            debugStatus("hit crystal on " + currentTarget.getName().getString()
+                    + " (" + String.format("%.1f", tdist) + "b)");
+            return;
+        }
+
+        int placed = tryPlaceCrystal(player, level);
+        if (placed == 1) {
+            debugStatus("placed on " + currentTarget.getName().getString()
+                    + " (" + String.format("%.1f", tdist) + "b)");
+        } else if (placed == -1) {
+            long cd = Math.max(0L, placeDelayMs.get() - (System.currentTimeMillis() - lastPlaceMs));
+            debugStatus("place cooldown " + cd + "ms");
+        } else if (placed == -2) {
+            debugStatus("no good spot vs " + currentTarget.getName().getString());
+        } else if (placed == -3) {
+            debugStatus("no end crystal in hotbar");
         }
     }
 
@@ -238,6 +281,8 @@ public class AutoCrystal extends Module {
 
         if (best == null) return false;
 
+        if (rotate.get()) aimAt(player, best.position());
+
         mc.gameMode.attack(player, best);
         if (swingHand.get()) player.swing(InteractionHand.MAIN_HAND);
         return true;
@@ -247,13 +292,18 @@ public class AutoCrystal extends Module {
     //                         Place crystals
     // ------------------------------------------------------------------
 
-    private void tryPlaceCrystal(LocalPlayer player, ClientLevel level) {
-        if (System.currentTimeMillis() - lastPlaceMs < placeDelayMs.get()) return;
+    /**
+     * @return  1 = placed; -1 = on cooldown; -2 = no safe/damaging spot; -3 = no crystal in hotbar.
+     */
+    private int tryPlaceCrystal(LocalPlayer player, ClientLevel level) {
+        if (System.currentTimeMillis() - lastPlaceMs < placeDelayMs.get()) return -1;
 
         Placement placement = findBestPlacement(player, level);
-        if (placement == null) return;
+        if (placement == null) return -2;
 
-        if (!switchToCrystal(player)) return;
+        if (!switchToCrystal(player)) return -3;
+
+        if (rotate.get()) aimAt(player, placement.facePoint);
 
         BlockHitResult hit = new BlockHitResult(placement.facePoint, Direction.UP, placement.support, false);
         mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, hit);
@@ -261,6 +311,21 @@ public class AutoCrystal extends Module {
 
         finishSwitch(player);
         lastPlaceMs = System.currentTimeMillis();
+        return 1;
+    }
+
+    /** Snap yaw/pitch to look at the given world point so the server accepts the next interaction. */
+    private static void aimAt(LocalPlayer player, Vec3 point) {
+        double dx = point.x - player.getX();
+        double dy = point.y - (player.getY() + player.getEyeHeight());
+        double dz = point.z - player.getZ();
+        double horizontal = Math.sqrt(dx * dx + dz * dz);
+        float yaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90.0F;
+        float pitch = (float) (-Math.toDegrees(Math.atan2(dy, horizontal)));
+        player.setYRot(yaw);
+        player.setXRot(pitch);
+        player.yHeadRot = yaw;
+        player.yBodyRot = yaw;
     }
 
     private Placement findBestPlacement(LocalPlayer player, ClientLevel level) {
