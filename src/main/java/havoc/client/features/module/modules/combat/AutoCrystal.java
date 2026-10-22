@@ -34,10 +34,12 @@ import havoc.client.features.module.Module;
 import havoc.client.features.module.ModuleCategory;
 import havoc.client.features.module.ModuleInfo;
 import havoc.client.features.module.ModuleSubcategory;
+import havoc.client.features.gui.chat.BetterChatStoreManager;
 import havoc.client.features.module.Notifier;
 import havoc.client.mixins.accessors.PlayerInventoryAccessor;
 import havoc.client.util.LegacyHudNotifier;
 import havoc.client.util.input.KeyManager;
+import net.minecraft.network.chat.Component;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
@@ -158,20 +160,32 @@ public class AutoCrystal extends Module {
     @Override
     public void onEnable() {
         resetState();
-        if (debug.get()) Notifier.info("AutoCrystal armed");
+        if (debug.get()) {
+            Notifier.info("AutoCrystal armed");
+            BetterChatStoreManager.addMessage(Component.literal("[AC] module enabled"));
+            LegacyHudNotifier.show("[AC] module enabled");
+        }
     }
 
     @Override
     public void onDisable() {
         resetState();
-        if (debug.get()) Notifier.clear("autocrystal_status");
+        if (debug.get()) {
+            Notifier.clear("autocrystal_status");
+            BetterChatStoreManager.addMessage(Component.literal("[AC] module disabled"));
+        }
     }
 
     private void debugStatus(String line) {
         if (!debug.get()) return;
-        if (!line.equals(lastDebugLine)) {
+        boolean changed = !line.equals(lastDebugLine);
+        if (changed) {
             Notifier.update("autocrystal_status", line);
             lastDebugLine = line;
+            // Push to Havoc's chat buffer so it persists in the chat window
+            // even after the overlay fades. Only on change, so chat doesn't
+            // flood tick-by-tick.
+            BetterChatStoreManager.addMessage(Component.literal("[AC] " + line));
         }
         // Push every tick to the vanilla overlay (above hotbar) so it stays
         // visible even without the notifications HUD element enabled, and
